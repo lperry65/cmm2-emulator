@@ -1,0 +1,15 @@
+# Local reference material: not redistributable, never commit
+docs/
+firmware/
+*.bin
+*.pdf
+*.zip
+
+# Rust
+target/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
