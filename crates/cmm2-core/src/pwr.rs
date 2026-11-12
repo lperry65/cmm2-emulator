@@ -2,7 +2,7 @@
 //! ready flags, so they read as set as soon as what they wait for is enabled.
 
 use crate::peripheral::StubRegisters;
-use crate::registers::{Registers, WordAccess};
+use crate::registers::{Registers, WordAccess, follow};
 use crate::svd::Svd;
 
 pub const PWR_BASE: u32 = 0x5802_4800;
@@ -28,15 +28,6 @@ const USB33RDY: u32 = 1 << 26; // PWR_CR3
 #[derive(Debug)]
 pub struct PwrRegisters {
     stored: StubRegisters,
-}
-
-/// `flag` is set in `value` exactly when `enable` is.
-fn follow(value: u32, enable: u32, flag: u32) -> u32 {
-    if value & enable != 0 {
-        value | flag
-    } else {
-        value & !flag
-    }
 }
 
 impl Registers for PwrRegisters {

@@ -7,6 +7,7 @@ mod machine;
 mod memory;
 mod peripheral;
 mod pwr;
+mod rcc;
 mod registers;
 mod svd;
 
@@ -19,5 +20,6 @@ pub use memory::{
 };
 pub use peripheral::{Peripheral, PeripheralAccess, RegisterStub, StubRegisters};
 pub use pwr::{PWR_BASE, PWR_SIZE, Pwr, PwrRegisters};
+pub use rcc::{RCC_BASE, RCC_SIZE, Rcc, RccRegisters};
 pub use registers::{Registers, WordAccess};
 pub use svd::{Field, Lookup, Svd, SvdError};

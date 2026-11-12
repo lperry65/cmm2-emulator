@@ -3,6 +3,7 @@
 
 use crate::memory::MemoryMap;
 use crate::pwr::{PWR_BASE, PWR_SIZE, Pwr};
+use crate::rcc::{RCC_BASE, RCC_SIZE, Rcc};
 
 pub fn cmm2_memory() -> MemoryMap {
     let mut memory = MemoryMap::new();
@@ -10,6 +11,9 @@ pub fn cmm2_memory() -> MemoryMap {
     memory
         .map_peripheral(PWR_BASE, PWR_SIZE, Box::new(Pwr::new()))
         .expect("PWR window is clear of RAM");
+    memory
+        .map_peripheral(RCC_BASE, RCC_SIZE, Box::new(Rcc::new()))
+        .expect("RCC window is clear of RAM");
     memory
         .map_unmodelled_peripherals()
         .expect("stub windows are clear of RAM");
@@ -27,9 +31,17 @@ mod tests {
     }
 
     #[test]
-    fn rcc_is_served_by_the_stub() {
+    fn rcc_is_served_by_the_model() {
         let mut m = cmm2_memory();
-        assert_eq!(m.read32(0x5802_4400), 0x83); // RCC_CR
+        m.write32(0x5802_4400, 1 << 16); // RCC_CR: HSEON
+        assert_eq!(m.read32(0x5802_4400) & 1 << 17, 1 << 17); // HSERDY
+    }
+
+    #[test]
+    fn the_stub_next_to_the_models_still_reads_its_reset_values() {
+        let mut m = cmm2_memory();
+        assert_eq!(m.read32(0x5802_4C00), 0xFFFF_FFFF); // CRC_DR, just after PWR
+        assert!(m.take_unmapped().is_empty());
     }
 
     #[test]

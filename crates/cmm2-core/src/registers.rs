@@ -13,6 +13,15 @@ pub trait Registers {
     fn write(&mut self, offset: u32, value: u32, mask: u32);
 }
 
+/// `flag` is set in `value` exactly when `enable` is.
+pub(crate) fn follow(value: u32, enable: u32, flag: u32) -> u32 {
+    if value & enable != 0 {
+        value | flag
+    } else {
+        value & !flag
+    }
+}
+
 /// Turns the 1, 2 and 4 byte accesses of a `Peripheral` into word operations on `R`. An
 /// access that crosses a 4-byte boundary becomes two.
 #[derive(Debug, Default)]
@@ -71,6 +80,13 @@ impl<R: Registers> Peripheral for WordAccess<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_sets_the_flag_with_the_enable_and_clears_it_without() {
+        assert_eq!(follow(0b001, 0b001, 0b100), 0b101);
+        assert_eq!(follow(0b100, 0b001, 0b100), 0);
+        assert_eq!(follow(0b110, 0b001, 0b100), 0b010);
+    }
 
     // Four words that remember what they were asked.
     #[derive(Default)]

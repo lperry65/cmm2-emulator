@@ -78,3 +78,27 @@ fn real_firmware_passes_the_pwr_voltage_waits() {
     assert!(reads("PWR_CSR1") < 100, "{}", reads("PWR_CSR1"));
     assert!(reads("PWR_D3CR") < 100, "{}", reads("PWR_D3CR"));
 }
+
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_passes_the_rcc_clock_waits() {
+    let firmware = firmware();
+    let mut memory = cmm2_memory();
+    let trace = Rc::new(RefCell::new(Vec::<PeripheralAccess>::new()));
+    let sink = trace.clone();
+    memory.set_peripheral_trace(Some(Box::new(move |access| {
+        sink.borrow_mut().push(*access)
+    })));
+    let mut cpu = Cpu::new(&firmware, memory, Irqs::new()).unwrap();
+
+    let stop = cpu.run(3_000_000);
+    assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
+
+    let svd = Svd::stm32h743();
+    let cr_reads = trace
+        .borrow()
+        .iter()
+        .filter(|a| !a.write && svd.lookup(a.addr).is_some_and(|l| l.name == "RCC_CR"))
+        .count();
+    assert!(cr_reads < 200, "{cr_reads}");
+}

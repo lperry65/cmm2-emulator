@@ -34,6 +34,14 @@ after 60 million instructions the firmware is polling `RTC_ISR` (`0x5800400C`), 
 reset value `0x0003FF5F` every time: 5,026,089 reads. The clock controller and the RTC are the next
 two models.
 
+**Then, with the clock controller modelled as well:** the clock waits pass (`RCC_CR` is read 37
+times in the 3 million instruction run, not hundreds of thousands). The 60 million instruction run
+spends its end polling `RTC_ISR` bit 5 (`RSF`, registers synchronised) in a loop at `0x08007AEC`,
+5.4 million reads, with a 1000 tick timeout. The tick is advancing: with the PLL configured the
+firmware sets SysTick for 1 ms at 480 MHz, so a tick now takes about 232,000 emulated instructions
+(it was about 29,000 at the start-up clock), and the timeout would need about 232 million
+instructions to fire. The RTC model is next.
+
 ## What happens before it
 
 | Instruction | What |

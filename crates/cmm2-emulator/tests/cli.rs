@@ -300,7 +300,7 @@ fn trace_mmio_prints_peripheral_accesses() {
     let out = stdout(&output);
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines[0], "    W RCC_CR 0x58024400 size 4 = 0x0000002A");
-    assert_eq!(lines[1], "    R RCC_CR 0x58024400 size 4 = 0x0000002A");
+    assert_eq!(lines[1], "    R RCC_CR 0x58024400 size 4 = 0x0000C02A");
     assert!(lines[2].starts_with("stopped: "), "{out}");
 }
 
@@ -311,7 +311,7 @@ fn trace_mmio_names_an_address_inside_a_register() {
     let output = run_program("mmio-offset", &code, &["--trace-mmio", "--run", "3"]);
 
     assert!(
-        stdout(&output).starts_with("    R RCC_CR +1 0x58024401 size 1 = 0x00000000\n"),
+        stdout(&output).starts_with("    R RCC_CR +1 0x58024401 size 1 = 0x000000C1\n"),
         "{}",
         stdout(&output)
     );
@@ -361,7 +361,7 @@ fn trace_file_holds_the_accesses_after_their_instruction() {
     assert!(lines[store + 2].starts_with("0x08000106  "), "{text}");
     assert_eq!(
         lines[store + 3],
-        "    R RCC_CR 0x58024400 size 4 = 0x0000002A"
+        "    R RCC_CR 0x58024400 size 4 = 0x0000C02A"
     );
 }
 
