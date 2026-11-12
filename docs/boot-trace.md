@@ -104,6 +104,27 @@ interrupt is raised yet, so nothing reaches `TDR` and the console stays empty. T
 `RXNEIE` in `CR1` as it polls (9 million `CR1` accesses in 400 million instructions). The next step is the
 USART interrupts (transmit empty, transmission complete, receive) and a way for the host to type.
 
+**Then, with the USART interrupt raised:** the serial driver works, and the firmware's own start-up text
+comes out of the emulated chip. About 196.5 million instructions in (roughly 10 seconds of wall time
+today, most of it spent in millisecond delays and polling) it sends, with the terminal escape codes
+`ESC[?25h ESC[37m ESC[m` first:
+
+```
+504MHz Colour Maximite 2
+MMBasic Version 7.00.00b5
+Copyright 2011-2026 Geoff Graham
+Copyright 2016-2026 Peter Mather
+Copyright 2025-2026 Gerry Allardice
+
+Initial setup - all parameters can be changed later
+Keyboard type: 1=UK, 2=US, 3=DE , 4=FR, 5=ES , 6=BE ?
+```
+
+and waits for a key. A `1` pushed into the console is echoed and answered with
+`Enter time (24hr clock) HH:MM:SS ? `, the next first-boot question. Two lines differ from the real
+board, whose `OPTION LIST` begins `480MHz Colour Maximite 2 G2`: the firmware here reports 504 MHz and
+no `G2`. How it works out the clock and the board generation is the next thing to find out.
+
 ## What happens before it
 
 | Instruction | What |

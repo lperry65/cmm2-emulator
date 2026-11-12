@@ -224,8 +224,33 @@ fn real_firmware_passes_the_usart1_waits() {
         .count();
     assert!((1..100).contains(&isr_reads), "{isr_reads}");
 
-    // Measured: nothing reaches USART1_TDR, even in a 400 million instruction run. The firmware
-    // queues its text and sets TCIE, and the interrupt handler that would send it never runs
-    // because no USART interrupt is raised yet.
-    assert!(console.take_output().is_empty());
+    // The firmware queues its text and sets TCIE, and the USART1 interrupt handler sends it.
+    // Measured: the text starts at about 196.5 million instructions and the first prompt is
+    // complete by 197.6 million.
+    let stop = cpu.run(190_000_000);
+    assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
+    let output = String::from_utf8_lossy(&console.take_output()).into_owned();
+    assert!(output.contains("Keyboard type"), "{output:?}");
+}
+
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_receives_a_key_from_the_console() {
+    let firmware = firmware();
+    let irqs = Irqs::new();
+    let memory = cmm2_memory(&irqs);
+    let console = memory.console();
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
+
+    let stop = cpu.run(200_000_000);
+    assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
+    let before = String::from_utf8_lossy(&console.take_output()).into_owned();
+    assert!(before.contains("Keyboard type"), "{before:?}");
+
+    console.push_input(b"1");
+    let stop = cpu.run(20_000_000);
+    assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
+    let after = String::from_utf8_lossy(&console.take_output()).into_owned();
+    // Measured: the key is echoed and the next setup prompt follows.
+    assert!(after.contains("Enter time (24hr clock)"), "{after:?}");
 }

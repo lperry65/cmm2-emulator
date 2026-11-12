@@ -301,7 +301,7 @@ impl Cpu {
 mod tests {
     use super::*;
     use crate::{AccessKind, FLASH_BASE, Firmware, PeripheralAccess, Svd, UnmappedAccess};
-    use crate::{FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController};
+    use crate::{Console, FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController, cmm2_memory};
     use crate::{TIM16_BASE, TIMER_SIZE, Timer};
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -772,6 +772,80 @@ mod tests {
         cpu.run(200);
         assert_eq!(cpu.memory().read32(0x2400_0000), 1);
         assert_eq!(cpu.memory().read32(SR2), 0);
+    }
+
+    /// Enables USART1's interrupt (IRQ 37) in the NVIC, then stores `cr1` in USART1_CR1 and
+    /// spins.
+    fn usart_main(cr1: u16) -> Vec<u16> {
+        assemble(
+            &[
+                Load(0, 0),
+                Raw(0x2120), // movs r1,#0x20
+                Raw(0x6001), // str r1,[r0]
+                Raw(0xB662), // cpsie i
+                Load(0, 1),
+                Raw(0x2100 | cr1), // movs r1,#cr1
+                Raw(0x6001),
+                Raw(SPIN_HERE),
+            ],
+            &[0xE000_E104, 0x4001_1000],
+        )
+    }
+
+    fn usart_cpu(main: Vec<u16>, handler: Vec<u16>) -> (Cpu, Console) {
+        let irqs = Irqs::new();
+        let memory = cmm2_memory(&irqs);
+        let console = memory.console();
+        let offset = 2 * main.len() as u32;
+        let code = [main, handler].concat();
+        let cpu = Cpu::new(&image(&code, &[(37, offset)]), memory, irqs).unwrap();
+        (cpu, console)
+    }
+
+    #[test]
+    fn the_usart1_transmit_interrupt_sends_a_byte() {
+        // CR1 = UE | TE | TCIE. The handler stops the interrupt, then sends 'A'.
+        let handler = assemble(
+            &[
+                Load(2, 0),
+                Raw(0x2109), // movs r1,#9 (TCIE off)
+                Raw(0x6011), // str r1,[r2]
+                Load(0, 1),
+                Raw(0x2141), // movs r1,#'A'
+                Raw(0x6001), // str r1,[r0]
+                Raw(0x4770), // bx lr
+            ],
+            &[0x4001_1000, 0x4001_1028],
+        );
+        let (mut cpu, console) = usart_cpu(usart_main(0x49), handler);
+        cpu.run(200);
+        assert_eq!(console.take_output(), b"A");
+    }
+
+    #[test]
+    fn the_usart1_receive_interrupt_delivers_a_byte_once() {
+        // CR1 = UE | RE | RXNEIE. The handler reads RDR into AXI SRAM and counts in the next
+        // word.
+        let handler = assemble(
+            &[
+                Load(0, 0),
+                Raw(0x6801), // ldr r1,[r0]
+                Load(2, 1),
+                Raw(0x6011), // str r1,[r2]
+                Raw(0x6853), // ldr r3,[r2,#4]
+                Raw(0x3301), // adds r3,#1
+                Raw(0x6053), // str r3,[r2,#4]
+                Raw(0x4770), // bx lr
+            ],
+            &[0x4001_1024, 0x2400_0000],
+        );
+        let (mut cpu, console) = usart_cpu(usart_main(0x25), handler);
+        cpu.run(100);
+        assert_eq!(cpu.memory().read32(0x2400_0004), 0);
+        console.push_input(b"1");
+        cpu.run(200);
+        assert_eq!(cpu.memory().read32(0x2400_0000), u32::from(b'1'));
+        assert_eq!(cpu.memory().read32(0x2400_0004), 1);
     }
 
     #[test]

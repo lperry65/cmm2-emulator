@@ -2,15 +2,21 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use crate::irq::Irqs;
+
 /// The text channel between the guest's console USART and the host. A cheap handle: clones
 /// share the queues, so the USART model and the front end each keep one.
 #[derive(Clone, Debug, Default)]
-pub struct Console(Rc<RefCell<Queues>>);
+pub struct Console(Rc<RefCell<State>>);
 
 #[derive(Debug, Default)]
-struct Queues {
+struct State {
     output: Vec<u8>,
     input: VecDeque<u8>,
+    // The line to raise when input arrives, once the USART has attached it, and whether the
+    // USART has the receive interrupt enabled.
+    interrupt: Option<(Irqs, u16)>,
+    rx_interrupt: bool,
 }
 
 impl Console {
@@ -23,9 +29,31 @@ impl Console {
         std::mem::take(&mut self.0.borrow_mut().output)
     }
 
-    /// Queues bytes for the guest to receive.
+    /// Queues bytes for the guest to receive. If that gives a USART with its receive
+    /// interrupt enabled something to read, the interrupt is raised.
     pub fn push_input(&self, bytes: &[u8]) {
-        self.0.borrow_mut().input.extend(bytes);
+        let line = {
+            let mut state = self.0.borrow_mut();
+            let was_empty = state.input.is_empty();
+            state.input.extend(bytes);
+            if was_empty && !state.input.is_empty() && state.rx_interrupt {
+                state.interrupt.clone()
+            } else {
+                None
+            }
+        };
+        // Raised after the borrow ends, so nothing that reacts can find the console locked.
+        if let Some((irqs, line)) = line {
+            irqs.raise(line);
+        }
+    }
+
+    pub(crate) fn attach_interrupt(&self, irqs: Irqs, line: u16) {
+        self.0.borrow_mut().interrupt = Some((irqs, line));
+    }
+
+    pub(crate) fn set_rx_interrupt(&self, enabled: bool) {
+        self.0.borrow_mut().rx_interrupt = enabled;
     }
 
     pub(crate) fn write(&self, byte: u8) {
@@ -75,6 +103,15 @@ mod tests {
         assert!(console.has_input());
         console.read();
         assert!(!console.has_input());
+    }
+
+    #[test]
+    fn pushing_input_with_no_interrupt_attached_is_harmless() {
+        let console = Console::new();
+        console.set_rx_interrupt(true);
+        console.push_input(b"x");
+        console.push_input(b"");
+        assert!(console.has_input());
     }
 
     #[test]

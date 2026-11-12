@@ -50,7 +50,7 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
         .map_peripheral(
             USART1_BASE,
             USART_SIZE,
-            Box::new(Usart::new(USART1_BASE, memory.console())),
+            Box::new(Usart::new(USART1_BASE, memory.console(), irqs.clone())),
         )
         .expect("USART1 window is clear of RAM");
     let flash = FlashController::new(irqs.clone(), memory.flash_ops());

@@ -6,12 +6,12 @@ const LINES: u16 = 240;
 
 /// Interrupt lines from peripherals to the CPU. A cheap handle: clones share the same
 /// pending set, so a peripheral keeps one and the CPU another.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Irqs {
     shared: Rc<Shared>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Shared {
     any: Cell<bool>,
     pending: RefCell<[u32; 8]>,
