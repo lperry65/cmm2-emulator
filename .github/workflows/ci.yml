@@ -16,7 +16,7 @@ jobs:
           rustup toolchain install stable --profile minimal -c rustfmt -c clippy
           rustup default stable
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --exclude zmu_cortex_m --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --exclude zmu_cortex_m --all-targets --locked --no-deps -- -D warnings
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
       - run: python3 -m unittest discover -s tools -v

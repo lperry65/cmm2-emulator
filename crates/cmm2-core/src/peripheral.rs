@@ -22,6 +22,8 @@ pub struct PeripheralAccess {
     /// What the peripheral returned for a read, or what was written, masked to `size` bytes.
     /// Only the trace is masked: the device is handed the written value as it came in.
     pub value: u32,
+    /// Address of the instruction that made the access.
+    pub pc: u32,
 }
 
 /// For peripherals that are not modelled: every register just remembers what was written.

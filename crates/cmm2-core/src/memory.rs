@@ -4,7 +4,9 @@
 //! writes to those windows are unmapped as far as this map is concerned. The flash base is
 //! `FLASH_BASE`, in the firmware module.
 
+use std::cell::Cell;
 use std::fmt;
+use std::rc::Rc;
 
 use crate::peripheral::{Peripheral, PeripheralAccess, RegisterStub};
 
@@ -74,6 +76,8 @@ pub struct UnmappedAccess {
     pub addr: u32,
     pub size: u8,
     pub kind: AccessKind,
+    /// Address of the instruction that made the access.
+    pub pc: u32,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -115,6 +119,7 @@ pub struct MemoryMap {
     trace: Option<Trace>,
     unmapped: Vec<UnmappedAccess>,
     dropped: u64,
+    pc: Rc<Cell<u32>>,
 }
 
 impl Default for MemoryMap {
@@ -138,7 +143,14 @@ impl MemoryMap {
             trace: None,
             unmapped: Vec::new(),
             dropped: 0,
+            pc: Rc::new(Cell::new(0)),
         }
+    }
+
+    /// The address of the instruction that is running, which the CPU keeps up to date. It is
+    /// 0 until a CPU is attached.
+    pub fn pc_cell(&self) -> Rc<Cell<u32>> {
+        self.pc.clone()
     }
 
     pub fn read8(&mut self, addr: u32) -> u8 {
@@ -264,6 +276,7 @@ impl MemoryMap {
                 size,
                 write,
                 value,
+                pc: self.pc.get(),
             });
         }
     }
@@ -328,6 +341,7 @@ impl MemoryMap {
                 addr,
                 size: size as u8,
                 kind,
+                pc: self.pc.get(),
             });
         } else {
             self.dropped += 1;
@@ -474,7 +488,8 @@ mod tests {
             [UnmappedAccess {
                 addr: 0x4000_0000,
                 size: 2,
-                kind: AccessKind::Read
+                kind: AccessKind::Read,
+                pc: 0,
             }]
         );
     }
@@ -488,7 +503,8 @@ mod tests {
             [UnmappedAccess {
                 addr: 0xE000_ED00,
                 size: 4,
-                kind: AccessKind::Write(0xCAFE_F00D)
+                kind: AccessKind::Write(0xCAFE_F00D),
+                pc: 0,
             }]
         );
         assert_eq!(m.read32(0xE000_ED00), 0);
@@ -503,7 +519,8 @@ mod tests {
             [UnmappedAccess {
                 addr: 0xD1FF_FFFE,
                 size: 4,
-                kind: AccessKind::Write(0x4433_2211)
+                kind: AccessKind::Write(0x4433_2211),
+                pc: 0,
             }]
         );
         // The two bytes inside SDRAM were written.
@@ -517,7 +534,8 @@ mod tests {
             [UnmappedAccess {
                 addr: 0xD1FF_FFFE,
                 size: 4,
-                kind: AccessKind::Read
+                kind: AccessKind::Read,
+                pc: 0,
             }]
         );
     }
@@ -768,7 +786,8 @@ mod tests {
             [UnmappedAccess {
                 addr: 0x4000_10FE,
                 size: 4,
-                kind: AccessKind::Write(0x4433_2211)
+                kind: AccessKind::Write(0x4433_2211),
+                pc: 0,
             }]
         );
         assert_eq!(m.read32(0x4000_10FE), 0);
@@ -898,13 +917,15 @@ mod tests {
                     addr: 0x5802_4400,
                     size: 4,
                     write: true,
-                    value: 0xAB
+                    value: 0xAB,
+                    pc: 0,
                 },
                 PeripheralAccess {
                     addr: 0x5802_4400,
                     size: 2,
                     write: false,
-                    value: 0xAB
+                    value: 0xAB,
+                    pc: 0,
                 },
             ]
         );
@@ -976,15 +997,34 @@ mod tests {
                     addr: 0x4000_1000,
                     size: 4,
                     write: false,
-                    value: 1
+                    value: 1,
+                    pc: 0,
                 },
                 PeripheralAccess {
                     addr: 0x4000_1004,
                     size: 4,
                     write: true,
-                    value: 7
+                    value: 7,
+                    pc: 0,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn records_carry_the_shared_pc() {
+        let mut m = MemoryMap::new();
+        m.map_unmodelled_peripherals().unwrap();
+        let (log, trace) = events();
+        m.set_peripheral_trace(trace);
+        let pc = m.pc_cell();
+
+        pc.set(0x0800_1234);
+        m.write32(0x6000_0000, 1);
+        pc.set(0x0800_5678);
+        m.read32(0x4000_0000);
+
+        assert_eq!(m.take_unmapped()[0].pc, 0x0800_1234);
+        assert_eq!(log.borrow()[0].pc, 0x0800_5678);
     }
 }

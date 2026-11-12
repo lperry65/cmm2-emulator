@@ -31,6 +31,7 @@ name = "cmm2-core"
 version = "0.1.0"
 dependencies = [
  "roxmltree",
+ "zmu_cortex_m",
 ]
 
 [[package]]
