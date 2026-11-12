@@ -42,6 +42,13 @@ firmware sets SysTick for 1 ms at 480 MHz, so a tick now takes about 232,000 emu
 (it was about 29,000 at the start-up clock), and the timeout would need about 232 million
 instructions to fire. The RTC model is next.
 
+**Then, with the RTC modelled:** both RTC waits pass (22 accesses in the 3 million instruction
+run). The firmware now ends in a tight poll of a RAM byte at `0x08094DD6`: `cbz`, `ldrb`, `and`,
+`cmp`, `beq`, about 228,000 instructions in and for the rest of the 250 million instruction run,
+touching no peripheral. An earlier spike identified the same loop as the flash sector erase wait:
+the firmware starts an erase of the option or program sector and waits for the flash interrupt
+handler to set the byte. The flash controller is the next model.
+
 ## What happens before it
 
 | Instruction | What |
