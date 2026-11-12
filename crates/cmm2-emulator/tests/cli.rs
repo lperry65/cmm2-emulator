@@ -26,7 +26,7 @@ fn unknown_argument_is_rejected() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "cmm2-emulator: unknown argument '--bogus'\nusage: cmm2-emulator --version | --firmware <file>\n"
+        "cmm2-emulator: unknown argument '--bogus'\nusage: cmm2-emulator --version | --firmware <file> | --lookup <address>\n"
     );
 }
 
@@ -40,11 +40,11 @@ fn no_arguments_prints_usage() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "usage: cmm2-emulator --version | --firmware <file>\n"
+        "usage: cmm2-emulator --version | --firmware <file> | --lookup <address>\n"
     );
 }
 
-const USAGE: &str = "usage: cmm2-emulator --version | --firmware <file>";
+const USAGE: &str = "usage: cmm2-emulator --version | --firmware <file> | --lookup <address>";
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
@@ -107,6 +107,76 @@ fn firmware_implausible_file_fails() {
 #[test]
 fn firmware_without_path_is_a_usage_error() {
     let output = run(&["--firmware"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!("{USAGE}\n")
+    );
+}
+
+#[test]
+fn lookup_prints_register_and_fields() {
+    let output = run(&["--lookup", "0x58024400"]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("RCC_CR 0x58024400"));
+    assert!(stdout.contains("\n  HSION bit 0\n"), "{stdout}");
+    assert!(stdout.contains("\n  HSIDIV bits 3-4\n"), "{stdout}");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn lookup_finds_a_register_in_another_peripheral() {
+    let output = run(&["--lookup", "0x5200414C"]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("FMC_SDTR2 0x5200414C\n"), "{stdout}");
+    assert!(stdout.contains("\n  TMRD bits 0-3\n"), "{stdout}");
+}
+
+#[test]
+fn lookup_inside_a_register_shows_the_byte_offset() {
+    let output = run(&["--lookup", "0x58024401"]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("RCC_CR 0x58024400 +1\n"), "{stdout}");
+}
+
+#[test]
+fn lookup_of_an_unknown_address_is_not_an_error() {
+    let output = run(&["--lookup", "0x12345678"]);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "unknown address 0x12345678\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn lookup_with_a_malformed_address_is_a_usage_error() {
+    for bad in ["nope", "58024400", "0x", "0x1ffffffff"] {
+        let output = run(&["--lookup", bad]);
+
+        assert_eq!(output.status.code(), Some(2), "{bad}");
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("cmm2-emulator: bad address '{bad}'\n{USAGE}\n")
+        );
+    }
+}
+
+#[test]
+fn lookup_without_an_address_is_a_usage_error() {
+    let output = run(&["--lookup"]);
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());

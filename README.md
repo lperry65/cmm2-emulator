@@ -54,6 +54,9 @@ Geoff Graham's. This project is independent and is not affiliated with or endors
 The emulator is built from ST's register descriptions (SVD), the published schematic and
 observation of the firmware on real hardware. It does not copy MMBasic source code.
 
+The register description in `crates/cmm2-core/data/STM32H743.svd` is © STMicroelectronics, used
+unmodified under the Apache License 2.0.
+
 ## Licence
 
 GPL-3.0. See [LICENSE](LICENSE).
