@@ -134,6 +134,16 @@ billion instructions, with no fault and no `>` prompt: it accepts the date and t
 emulator does not provide yet. The time and date are probably written to the clock chip, which the board has
 as a DS3231 on an I2C bus, so I2C is the first suspect.
 
+**Corrected: the firmware reboots itself.** I2C was the wrong guess. A trace taken from instruction 230
+million (the new `--trace-from` option, with the scripted dialogue) shows only a two instruction loop,
+`nop` and `b .` at `0x0809AE34`, and the code just before it is the standard `NVIC_SystemReset()`: `dsb`, read
+`SCB->AIRCR`, keep `PRIGROUP`, or in `0x05FA0004` (the key and `SYSRESETREQ`), write it back, `dsb`, then wait
+in `nop` for the reset. After the date prompt the firmware saves its options and asks the chip to reset, so it
+restarts with the options it just stored. The core stores the `AIRCR` write and does nothing with
+`SYSRESETREQ`, so the emulated chip never restarts. A reset has to restart the CPU from the vector table and
+reset the peripherals, but not the flash, the RAM, the RTC or the backup domain, and the reset cause the
+firmware reads from `RCC_RSR` (`PINRSTF`, `PORRSTF`, `SFTRSTF`) has to say what happened.
+
 ## What happens before it
 
 | Instruction | What |

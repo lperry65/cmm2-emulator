@@ -190,15 +190,8 @@ struct Machine {
 fn build_machine(path: &str, options: &RunOptions) -> Result<Machine, RunError> {
     let firmware = Firmware::load(path)?;
     let irqs = Irqs::new();
-    let mut memory = cmm2_memory(&irqs);
+    let memory = cmm2_memory(&irqs);
     let trace = trace_out(options)?;
-    if let (Some(trace), true) = (&trace, options.trace_mmio) {
-        let sink = trace.clone();
-        memory.set_peripheral_trace(Some(Box::new(move |access| {
-            sink.borrow_mut()
-                .line(format_args!("{}", access_line(access)));
-        })));
-    }
     let console = memory.console();
     let cpu = Cpu::new(&firmware, memory, irqs)?;
     Ok(Machine {
@@ -217,15 +210,8 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
     } = build_machine(path, options)?;
 
     let limit = options.run.unwrap_or(u64::MAX);
-    let stop = match (&options.trace, &trace) {
-        (Some(_), Some(sink)) => cpu.run_traced(limit, options.stop_at, |pc, text| {
-            sink.borrow_mut().line(format_args!("{pc:#010X}  {text}"));
-        }),
-        _ => cpu.run_until(limit, options.stop_at),
-    };
-    if let Some(trace) = trace {
-        trace.borrow_mut().finish().map_err(RunError::Write)?;
-    }
+    let stop = run_slice(&mut cpu, options, trace.as_ref(), limit);
+    finish_trace(trace)?;
 
     let ok = !matches!(stop, Stop::Fault(_));
     print_summary(&mut cpu, &stop);
@@ -235,29 +221,82 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
 
 /// Runs with the console on the host terminal until the quit key, the limit, `--stop-at` or a
 /// fault. The summary is left out, as the screen belongs to the guest.
-fn run_console(path: &str, options: RunOptions) -> Result<bool, RunError> {
+fn run_console(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
     let Machine {
-        mut cpu, console, ..
+        mut cpu,
+        console,
+        trace,
     } = build_machine(path, &options)?;
     let _raw = RawMode::enable();
     let keys = read_stdin();
-    let mut script = Script::new(options.on);
+    let mut script = Script::new(std::mem::take(&mut options.on));
     let limit = options.run.unwrap_or(u64::MAX);
     let mut stdout = io::stdout();
 
-    loop {
+    let result = loop {
         let budget = limit.saturating_sub(cpu.instruction_count()).min(SLICE);
-        let stop = cpu.run_until(budget, options.stop_at);
-        show_output(&console, &mut script, &mut stdout).map_err(RunError::Console)?;
+        let stop = run_slice(&mut cpu, &options, trace.as_ref(), budget);
+        if let Err(err) = show_output(&console, &mut script, &mut stdout) {
+            break Err(RunError::Console(err));
+        }
         match stop {
-            Stop::Fault(fault) => return Err(RunError::Fault(fault.description)),
-            Stop::Address(_) => return Ok(true),
-            Stop::InstructionLimit if cpu.instruction_count() >= limit => return Ok(true),
+            Stop::Fault(fault) => break Err(RunError::Fault(fault.description)),
+            Stop::Address(_) => break Ok(true),
+            Stop::InstructionLimit if cpu.instruction_count() >= limit => break Ok(true),
             Stop::InstructionLimit => {}
         }
         if !send_keys(&console, &keys) {
-            return Ok(true);
+            break Ok(true);
         }
+    };
+    finish_trace(trace)?;
+    result
+}
+
+/// Runs up to `budget` instructions. The traces start at `--trace-from`; until then this is a
+/// plain run, so a slice that crosses that point is split in two. The peripheral trace is only
+/// hooked in at that point, so it cannot write earlier.
+fn run_slice(
+    cpu: &mut Cpu,
+    options: &RunOptions,
+    trace: Option<&Rc<RefCell<TraceOut>>>,
+    budget: u64,
+) -> Stop {
+    let Some(sink) = trace else {
+        return cpu.run_until(budget, options.stop_at);
+    };
+    let untraced = options
+        .trace_from
+        .unwrap_or(0)
+        .saturating_sub(cpu.instruction_count())
+        .min(budget);
+    if untraced > 0 {
+        let stop = cpu.run_until(untraced, options.stop_at);
+        if stop != Stop::InstructionLimit || untraced == budget {
+            return stop;
+        }
+    }
+    let budget = budget - untraced;
+    if options.trace_mmio {
+        let sink = sink.clone();
+        cpu.memory()
+            .set_peripheral_trace(Some(Box::new(move |access| {
+                sink.borrow_mut()
+                    .line(format_args!("{}", access_line(access)));
+            })));
+    }
+    if options.trace.is_none() {
+        return cpu.run_until(budget, options.stop_at);
+    }
+    cpu.run_traced(budget, options.stop_at, |pc, text| {
+        sink.borrow_mut().line(format_args!("{pc:#010X}  {text}"));
+    })
+}
+
+fn finish_trace(trace: Option<Rc<RefCell<TraceOut>>>) -> Result<(), RunError> {
+    match trace {
+        Some(trace) => trace.borrow_mut().finish().map_err(RunError::Write),
+        None => Ok(()),
     }
 }
 

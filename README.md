@@ -50,7 +50,14 @@ cargo run --release -- --firmware /path/to/CMM2_MMBasic_7.00.00b5.bin --run 1000
 
 `--stop-at 0x<address>` stops before the instruction at that address instead, and
 `--trace <file>` writes every executed instruction (and, with `--trace-mmio`, the peripheral
-accesses after it) to a file.
+accesses after it) to a file. `--trace-from <count>` starts the traces only once that many
+instructions have run, so a long run is fast until the part you want to see:
+
+```
+cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --run 232000000 --trace t.txt --trace-from 230000000
+```
+
+`--console` can write the trace to a file in the same way (`--trace-mmio` there needs `--trace`).
 
 To use it interactively, connect the console to your terminal:
 

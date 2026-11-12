@@ -47,7 +47,7 @@ fn no_arguments_prints_usage() {
     );
 }
 
-const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--console] [--on <text> <keys>]";
+const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>]";
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
@@ -442,8 +442,22 @@ fn trace_file_that_cannot_be_created_fails() {
 
 #[test]
 fn bad_run_options_are_usage_errors() {
-    let cases: [(&[&str], &str); 10] = [
+    let cases: [(&[&str], &str); 15] = [
         (&["--run", "10"], "--run needs --firmware"),
+        (&["--trace-from", "5"], "--trace-from needs --firmware"),
+        (&["--firmware", "f", "--trace-from"], ""),
+        (
+            &["--firmware", "f", "--trace-from", "abc"],
+            "bad count 'abc'",
+        ),
+        (
+            &["--firmware", "f", "--run", "9", "--trace-from", "5"],
+            "--trace-from needs --trace or --trace-mmio",
+        ),
+        (
+            &["--firmware", "f", "--trace-from", "5"],
+            "--trace-from needs --trace or --trace-mmio",
+        ),
         (&["--stop-at", "0x1000"], "--stop-at needs --firmware"),
         (&["--trace-mmio"], "--trace-mmio needs --firmware"),
         (&["--firmware", "f", "--run"], ""),
@@ -625,7 +639,7 @@ fn piped_keys_reach_the_guest_and_the_quit_key_ends_the_run() {
 
 #[test]
 fn bad_console_options_are_usage_errors() {
-    let cases: [(&[&str], &str); 7] = [
+    let cases: [(&[&str], &str); 6] = [
         (&["--console"], "--console needs --firmware"),
         (&["--on", "a", "b"], "--on needs --firmware"),
         (
@@ -633,12 +647,8 @@ fn bad_console_options_are_usage_errors() {
             "--on needs --console",
         ),
         (
-            &["--firmware", "f", "--console", "--trace", "t"],
-            "--console cannot be traced, the screen belongs to the guest",
-        ),
-        (
             &["--firmware", "f", "--console", "--trace-mmio"],
-            "--console cannot be traced, the screen belongs to the guest",
+            "--console with --trace-mmio needs --trace, the screen belongs to the guest",
         ),
         (
             &["--firmware", "f", "--console", "--on", "a", "\\q"],
@@ -661,5 +671,94 @@ fn bad_console_options_are_usage_errors() {
             expected,
             "{args:?}"
         );
+    }
+}
+
+// Runs the program with a trace file and returns the output and the file's lines.
+fn run_traced_program(name: &str, code: &[u16], args: &[&str]) -> (Output, Vec<String>) {
+    let trace = temp_path(name, "txt");
+    let mut all = vec!["--trace", trace.to_str().unwrap()];
+    all.extend_from_slice(args);
+    let output = run_program(name, code, &all);
+    let text = std::fs::read_to_string(&trace).unwrap();
+    std::fs::remove_file(&trace).unwrap();
+    (output, text.lines().map(str::to_string).collect())
+}
+
+#[test]
+fn trace_from_starts_the_trace_at_that_instruction() {
+    let (output, lines) =
+        run_traced_program("from-loop", &THREE, &["--trace-from", "5", "--run", "10"]);
+
+    assert!(output.status.success());
+    assert!(stdout(&output).contains("\ninstructions 10\n"));
+    // Instructions 0 to 2 are the movs, the rest is the loop at +6.
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert!(lines[0].starts_with("0x08000106  "), "{lines:?}");
+    assert!(lines.iter().all(|line| line == &lines[0]), "{lines:?}");
+}
+
+#[test]
+fn trace_from_can_start_in_the_straight_line_code() {
+    let (_, lines) = run_traced_program("from-two", &THREE, &["--trace-from", "0x2", "--run", "4"]);
+
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0], "0x08000104  mov r2, #3");
+    assert!(lines[1].starts_with("0x08000106  "), "{lines:?}");
+}
+
+#[test]
+fn trace_from_leaves_out_the_accesses_before_it() {
+    // The store (instruction 2) writes RCC_CR, the load (instruction 3) reads it back.
+    let (_, lines) = run_traced_program(
+        "from-mmio",
+        &RCC,
+        &["--trace-mmio", "--trace-from", "3", "--run", "6"],
+    );
+
+    assert!(lines[0].starts_with("0x08000106  "), "{lines:?}");
+    assert_eq!(lines[1], "    R RCC_CR 0x58024400 size 4 = 0x0000C02A");
+    assert!(!lines.iter().any(|line| line.contains(" W ")), "{lines:?}");
+}
+
+#[test]
+fn trace_from_after_the_end_traces_nothing() {
+    let (output, lines) = run_traced_program(
+        "from-late",
+        &RCC,
+        &["--trace-mmio", "--trace-from", "100", "--run", "6"],
+    );
+
+    assert!(output.status.success());
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
+#[test]
+fn trace_from_with_the_console_keeps_the_screen_clean() {
+    // Instruction 3 is in the first slice, 60000 in the second.
+    for from in [3, 60_000] {
+        let (output, lines) = run_traced_program(
+            "from-console",
+            &ECHO,
+            &[
+                "--console",
+                "--on",
+                "ready",
+                "ab",
+                "--trace-mmio",
+                "--trace-from",
+                &from.to_string(),
+                "--run",
+                "70000",
+            ],
+        );
+
+        assert!(output.status.success(), "{from}");
+        assert_eq!(stdout(&output), "ready\r\nbc", "{from}");
+        let instructions = lines.iter().filter(|line| !line.starts_with(' ')).count();
+        assert_eq!(instructions, 70_000 - from, "{from}");
+        if from == 3 {
+            assert!(lines[0].starts_with("0x08000106  "), "{from}");
+        }
     }
 }

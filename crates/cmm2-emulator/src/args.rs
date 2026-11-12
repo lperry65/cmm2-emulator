@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--console] [--on <text> <keys>]";
+pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -23,6 +23,8 @@ pub struct RunOptions {
     pub stop_at: Option<u32>,
     pub trace: Option<String>,
     pub trace_mmio: bool,
+    /// The instruction count at which the traces start; without it they start at once.
+    pub trace_from: Option<u64>,
     pub console: bool,
     pub on: Vec<OnRule>,
 }
@@ -43,7 +45,8 @@ pub enum ArgError {
     BadAddress(String),
     NeedsFirmware(String),
     NeedsConsole(String),
-    ConsoleWithTrace,
+    ConsoleMmioNeedsFile,
+    TraceFromNeedsTrace,
     BadKeys(String),
     NothingToRun,
 }
@@ -61,9 +64,13 @@ impl fmt::Display for ArgError {
             ArgError::NeedsConsole(option) => {
                 writeln!(f, "cmm2-emulator: {option} needs --console")?
             }
-            ArgError::ConsoleWithTrace => writeln!(
+            ArgError::ConsoleMmioNeedsFile => writeln!(
                 f,
-                "cmm2-emulator: --console cannot be traced, the screen belongs to the guest"
+                "cmm2-emulator: --console with --trace-mmio needs --trace, the screen belongs to the guest"
+            )?,
+            ArgError::TraceFromNeedsTrace => writeln!(
+                f,
+                "cmm2-emulator: --trace-from needs --trace or --trace-mmio"
             )?,
             ArgError::BadKeys(arg) => writeln!(f, "cmm2-emulator: bad keys '{arg}'")?,
             ArgError::NothingToRun => {
@@ -92,13 +99,15 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, ArgError
                 return Ok(Command::Vectors(firmware));
             }
             check_console(&options)?;
+            check_trace_from(&options)?;
             if !options.console && options.run.is_none() && options.stop_at.is_none() {
                 return Err(ArgError::NothingToRun);
             }
             Ok(Command::Run { firmware, options })
         }
         Some(
-            option @ ("--run" | "--stop-at" | "--trace" | "--trace-mmio" | "--console" | "--on"),
+            option @ ("--run" | "--stop-at" | "--trace" | "--trace-mmio" | "--trace-from"
+            | "--console" | "--on"),
         ) => Err(ArgError::NeedsFirmware(option.to_string())),
         Some(arg) => Err(ArgError::Unknown(arg.to_string())),
     }
@@ -114,6 +123,9 @@ fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOption
             }
             "--trace" => options.trace = Some(args.next().ok_or(ArgError::Usage)?),
             "--trace-mmio" => options.trace_mmio = true,
+            "--trace-from" => {
+                options.trace_from = Some(parse_count(&args.next().ok_or(ArgError::Usage)?)?)
+            }
             "--console" => options.console = true,
             "--on" => {
                 let text = args.next().ok_or(ArgError::Usage)?;
@@ -127,11 +139,18 @@ fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOption
 }
 
 fn check_console(options: &RunOptions) -> Result<(), ArgError> {
-    if options.console && (options.trace.is_some() || options.trace_mmio) {
-        return Err(ArgError::ConsoleWithTrace);
+    if options.console && options.trace_mmio && options.trace.is_none() {
+        return Err(ArgError::ConsoleMmioNeedsFile);
     }
     if !options.console && !options.on.is_empty() {
         return Err(ArgError::NeedsConsole("--on".to_string()));
+    }
+    Ok(())
+}
+
+fn check_trace_from(options: &RunOptions) -> Result<(), ArgError> {
+    if options.trace_from.is_some() && options.trace.is_none() && !options.trace_mmio {
+        return Err(ArgError::TraceFromNeedsTrace);
     }
     Ok(())
 }
@@ -336,13 +355,70 @@ mod tests {
         );
     }
 
-    #[test]
-    fn console_cannot_be_traced() {
-        for trace in [&["--trace", "t"][..], &["--trace-mmio"][..]] {
-            let mut args = vec!["--firmware", "f", "--console"];
-            args.extend_from_slice(trace);
-            assert_eq!(parse_args(&args), Err(ArgError::ConsoleWithTrace));
+    fn run_options(args: &[&str]) -> RunOptions {
+        let mut all = vec!["--firmware", "f"];
+        all.extend_from_slice(args);
+        match parse_args(&all) {
+            Ok(Command::Run { options, .. }) => options,
+            other => panic!("not a run: {other:?}"),
         }
+    }
+
+    #[test]
+    fn console_can_write_the_trace_to_a_file() {
+        let options = run_options(&["--console", "--trace", "t"]);
+        assert!(options.console);
+        assert_eq!(options.trace.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn console_traces_the_peripherals_only_into_a_file() {
+        let options = run_options(&["--console", "--trace", "t", "--trace-mmio"]);
+        assert!(options.trace_mmio);
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--console", "--trace-mmio"]),
+            Err(ArgError::ConsoleMmioNeedsFile)
+        );
+    }
+
+    #[test]
+    fn trace_from_is_decimal_or_hex() {
+        assert_eq!(
+            run_options(&["--run", "9", "--trace", "t", "--trace-from", "230000000"]).trace_from,
+            Some(230_000_000)
+        );
+        assert_eq!(
+            run_options(&["--run", "9", "--trace-mmio", "--trace-from", "0x10"]).trace_from,
+            Some(16)
+        );
+        assert_eq!(
+            run_options(&["--run", "9", "--trace", "t"]).trace_from,
+            None
+        );
+    }
+
+    #[test]
+    fn trace_from_needs_a_valid_count() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--trace-from"]),
+            Err(ArgError::Usage)
+        );
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--trace-from", "x"]),
+            Err(ArgError::BadCount("x".into()))
+        );
+    }
+
+    #[test]
+    fn trace_from_needs_a_trace() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--run", "9", "--trace-from", "5"]),
+            Err(ArgError::TraceFromNeedsTrace)
+        );
+        assert_eq!(
+            parse_args(&["--trace-from", "5"]),
+            Err(ArgError::NeedsFirmware("--trace-from".into()))
+        );
     }
 
     #[test]
