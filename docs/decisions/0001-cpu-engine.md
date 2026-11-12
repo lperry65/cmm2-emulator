@@ -50,9 +50,11 @@ counting instructions costs a hook that takes much of the speed advantage back.
 
 - **It needs a fork.** The bus is hardwired (one flash at address 0, one RAM, one device), it supports 32
   interrupts where the STM32H7 needs about 150, a device cannot raise an interrupt itself, and ITCM, MPU and
-  cache registers are missing. My spike patch is 228 added lines across 17 files, and it fixed four real bugs
-  the firmware hit within the first 800,000 instructions: LDR literal decoding, LDR to PC not branching,
-  zero-divide always trapping, and the NVIC register decode.
+  cache registers are missing. My spike patch is about 215 added lines across 16 files, and it fixed four real
+  bugs the firmware hit within the first 800,000 instructions: LDR literal decoding, LDR to PC not branching,
+  zero-divide always trapping, and the NVIC register decode. Reviewing the import turned up a fifth, the same
+  wrong shift in the NVIC clear-pending scan. That is five bugs in code the firmware actually runs, in a core
+  with a passing test suite, so I expect more.
 - **It is not on crates.io.** The repo is the only source, so it is vendored.
 - **Instructions are still missing.** From a scan of the whole image: `vrint*`, `vfnma`, `vmaxnm`,
   `orn` with an immediate, `uxtah`, `sxtah`, `pkhbt` and a few more. The firmware hasn't executed them
