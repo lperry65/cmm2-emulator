@@ -3,6 +3,8 @@
 
 use std::collections::HashMap;
 
+use crate::svd::Svd;
+
 /// A device mapped into the address space. `offset` is the byte offset from the start of
 /// the window the device is mapped at, and `size` is 1, 2 or 4 bytes. The access is passed
 /// whole, never split into bytes.
@@ -28,15 +30,45 @@ pub struct PeripheralAccess {
 
 /// For peripherals that are not modelled: every register just remembers what was written.
 /// Registers are 32 bits wide; narrower accesses read and merge into the word they fall in.
+/// A word starts at zero, or at the reset values from the SVD if the stub has them.
 #[derive(Debug, Default)]
 pub struct RegisterStub {
     // Keyed by the offset of the word, which is a multiple of 4.
     words: HashMap<u32, u32>,
+    // The absolute address the stub is mapped at, and the registers found there.
+    resets: Option<(u32, &'static Svd)>,
 }
 
 impl RegisterStub {
     pub fn new() -> RegisterStub {
         RegisterStub::default()
+    }
+
+    /// `base` is the absolute address of the start of the window the stub is mapped at.
+    /// Bytes that no register in the SVD covers start at zero.
+    pub fn with_reset_values(base: u32, svd: &'static Svd) -> RegisterStub {
+        RegisterStub {
+            resets: Some((base, svd)),
+            ..RegisterStub::default()
+        }
+    }
+
+    // The word at `offset` (a multiple of 4), set to its reset value the first time it is
+    // touched so that polling a register does not look it up again.
+    fn word(&mut self, offset: u32) -> &mut u32 {
+        let resets = self.resets;
+        self.words.entry(offset).or_insert_with(|| {
+            let Some((base, svd)) = resets else {
+                return 0;
+            };
+            (0..4).fold(0, |word, i| {
+                let addr = base.wrapping_add(offset).wrapping_add(i);
+                let byte = svd
+                    .lookup(addr)
+                    .map_or(0, |found| found.reset_value >> (8 * found.offset) & 0xFF);
+                word | byte << (8 * i)
+            })
+        })
     }
 }
 
@@ -59,8 +91,7 @@ impl Peripheral for RegisterStub {
         let (base, shift, words) = Self::span(offset, size);
         let mut combined = 0u64;
         for i in 0..words {
-            let word = self.words.get(&base.wrapping_add(4 * i)).copied();
-            combined |= u64::from(word.unwrap_or(0)) << (32 * i);
+            combined |= u64::from(*self.word(base.wrapping_add(4 * i))) << (32 * i);
         }
         (combined >> shift) as u32 & (u32::MAX >> (32 - 8 * u32::from(size)))
     }
@@ -70,7 +101,7 @@ impl Peripheral for RegisterStub {
         let mask = u64::from(u32::MAX >> (32 - 8 * u32::from(size))) << shift;
         let bits = (u64::from(value) << shift) & mask;
         for i in 0..words {
-            let word = self.words.entry(base.wrapping_add(4 * i)).or_insert(0);
+            let word = self.word(base.wrapping_add(4 * i));
             *word = (*word & !((mask >> (32 * i)) as u32)) | (bits >> (32 * i)) as u32;
         }
     }
@@ -79,6 +110,7 @@ impl Peripheral for RegisterStub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::svd::Svd;
 
     #[test]
     fn unwritten_registers_read_zero() {
@@ -193,5 +225,82 @@ mod tests {
         assert_eq!(s.words.len(), 1);
         s.write(0x23, 2, 1);
         assert_eq!(s.words.len(), 2);
+    }
+
+    // Registers at 0x1000: R32 (reset 0x11223344) at 0, R16A (0xAABB) at 4, R16B (0xCCDD) at 6,
+    // R8 (0x5E) at 9. Bytes 8, 10 and 11 are not covered.
+    fn with_resets() -> RegisterStub {
+        let reg = |name: &str, offset: u32, bits: u32, reset: u32| {
+            format!(
+                "<register><name>{name}</name><addressOffset>{offset}</addressOffset>\
+                 <size>{bits}</size><resetValue>{reset}</resetValue></register>"
+            )
+        };
+        let xml = format!(
+            "<device><peripherals><peripheral><name>P</name><baseAddress>0x1000</baseAddress>\
+             <registers>{}{}{}{}</registers></peripheral></peripherals></device>",
+            reg("R32", 0, 32, 0x1122_3344),
+            reg("R16A", 4, 16, 0xAABB),
+            reg("R16B", 6, 16, 0xCCDD),
+            reg("R8", 9, 8, 0x5E),
+        );
+        let svd: &'static Svd = Box::leak(Box::new(Svd::parse(&xml).unwrap()));
+        // Mapped at 0x1000 - 0x100, so the registers sit at offset 0x100 in the window.
+        RegisterStub::with_reset_values(0xF00, svd)
+    }
+
+    #[test]
+    fn unwritten_register_reads_its_reset_value() {
+        let mut s = with_resets();
+        assert_eq!(s.read(0x100, 4), 0x1122_3344);
+    }
+
+    #[test]
+    fn written_register_reads_back_without_the_reset_value() {
+        let mut s = with_resets();
+        s.write(0x100, 4, 0x0000_00FF);
+        assert_eq!(s.read(0x100, 4), 0x0000_00FF);
+    }
+
+    #[test]
+    fn byte_write_keeps_the_rest_of_the_reset_value() {
+        let mut s = with_resets();
+        s.write(0x101, 1, 0x99);
+        assert_eq!(s.read(0x100, 4), 0x1122_9944);
+    }
+
+    #[test]
+    fn registers_sharing_a_word_both_read_right() {
+        let mut s = with_resets();
+        assert_eq!(s.read(0x104, 2), 0xAABB);
+        assert_eq!(s.read(0x106, 2), 0xCCDD);
+        assert_eq!(s.read(0x104, 4), 0xCCDD_AABB);
+    }
+
+    #[test]
+    fn uncovered_bytes_read_zero() {
+        let mut s = with_resets();
+        assert_eq!(s.read(0x108, 4), 0x0000_5E00);
+        assert_eq!(s.read(0x110, 4), 0);
+    }
+
+    #[test]
+    fn halfword_read_of_the_upper_half_of_a_reset_word() {
+        let mut s = with_resets();
+        assert_eq!(s.read(0x102, 2), 0x1122);
+    }
+
+    #[test]
+    fn reset_value_is_looked_up_once_per_word() {
+        let mut s = with_resets();
+        let first = s.read(0x100, 4);
+        assert_eq!(s.read(0x100, 4), first);
+        assert_eq!(s.words.len(), 1);
+    }
+
+    #[test]
+    fn address_outside_every_register_reads_zero() {
+        let mut s = with_resets();
+        assert_eq!(s.read(0, 4), 0);
     }
 }

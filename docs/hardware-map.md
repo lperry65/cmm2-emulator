@@ -93,7 +93,7 @@ names are from the SVD. These are the values the iteration 2 peripheral models h
 
 | Register | Value | What it says |
 |---|---|---|
-| `PWR_D3CR` | `0x0000E000` | `VOS` = 3 (highest voltage scale) and `VOSRDY` (bit 13) set. The emulator's stub reads back `0xC000`, so the firmware's wait never ends |
+| `PWR_D3CR` | `0x0000E000` | `VOS` = 3 (highest voltage scale) and `VOSRDY` (bit 13) set. The emulator’s stub reads back the reset value `0x4000` and whatever the firmware writes (`0xC000`), so bit 13 never sets and the firmware’s wait never ends |
 | `PWR_CSR1` | `0x0000E000` | `ACTVOS` = 3 and `ACTVOSRDY` set: the same state, as the active status |
 | `PWR_CR1` | `0xF000C100` | `DBP` (backup domain write enable) set, `SVOS` = 3; the top four bits are set and unnamed in the SVD |
 | `PWR_CR2` | `0x00010001` | `BREN` (backup regulator on) and `BRRDY` (ready, bit 16) set |

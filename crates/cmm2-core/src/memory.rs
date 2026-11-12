@@ -9,6 +9,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::peripheral::{Peripheral, PeripheralAccess, RegisterStub};
+use crate::svd::Svd;
 
 /// DTCM RAM. Owned by the CPU core, like the flash.
 pub const DTCM_BASE: u32 = 0x2000_0000;
@@ -212,7 +213,8 @@ impl MemoryMap {
     /// error of the first window that cannot be mapped; a window mapped before it stays.
     pub fn map_unmodelled_peripherals(&mut self) -> Result<(), MemoryError> {
         for (base, size) in [(0x4000_0000, 0x2000_0000), (0xE000_0000, 0x10_0000)] {
-            self.map_peripheral(base, size, Box::new(RegisterStub::new()))?;
+            let stub = RegisterStub::with_reset_values(base, Svd::stm32h743());
+            self.map_peripheral(base, size, Box::new(stub))?;
         }
         Ok(())
     }
@@ -847,6 +849,25 @@ mod tests {
         assert_eq!(values, [0xAB, 0x1234]);
         // The device is given the value as it came in.
         assert_eq!(*seen.borrow(), [(4, 1, Some(0xAB)), (4, 2, Some(0x1234))]);
+    }
+
+    #[test]
+    fn unmodelled_peripherals_read_their_reset_values() {
+        let mut m = MemoryMap::new();
+        m.map_unmodelled_peripherals().unwrap();
+        assert_eq!(m.read32(0x5802_4400), 0x0000_0083); // RCC_CR
+        assert_eq!(m.read32(0x5802_4818), 0x0000_4000); // PWR_D3CR
+        assert_eq!(m.read32(0x4001_101C), 0x0000_00C0); // USART1_ISR
+        assert_eq!(m.read32(0x5FFF_FFFC), 0);
+        assert_eq!(m.read32(0xE000_ED14), 0);
+    }
+
+    #[test]
+    fn unmodelled_peripheral_write_replaces_the_reset_value() {
+        let mut m = MemoryMap::new();
+        m.map_unmodelled_peripherals().unwrap();
+        m.write32(0x5802_4400, 0x1234_5678);
+        assert_eq!(m.read32(0x5802_4400), 0x1234_5678);
     }
 
     #[test]

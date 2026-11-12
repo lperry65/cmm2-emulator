@@ -18,6 +18,7 @@ struct Register {
     peripheral: String,
     start: u32,
     bytes: u32,
+    reset_value: u32,
     fields: Vec<Field>,
 }
 
@@ -36,6 +37,11 @@ pub struct Lookup<'a> {
     pub start: u32,
     /// How far the looked-up address is into the register.
     pub offset: u32,
+    /// What the register holds after reset, in its low `size` bits. Taken from the register,
+    /// else its peripheral, else the device. GPIOB to GPIOK are derived from GPIOA in the
+    /// SVD and so share its reset values, which is wrong for those ports on the chip. The
+    /// values are not guaranteed to match the reference manual everywhere.
+    pub reset_value: u32,
     pub fields: &'a [Field],
 }
 
@@ -65,6 +71,10 @@ impl Svd {
             Some(_) => number(device, "size", "device")?,
             None => 32,
         };
+        let default_reset = match child(device, "resetValue") {
+            Some(_) => number(device, "resetValue", "device")?,
+            None => 0,
+        };
         let peripherals: Vec<Node> = child(device, "peripherals")
             .ok_or_else(|| missing("peripherals", "device"))?
             .children()
@@ -91,8 +101,13 @@ impl Svd {
             let Some(list) = child(source, "registers") else {
                 continue;
             };
+            let source_name = text(source, "name", "peripheral")?;
+            let reset = match child(source, "resetValue") {
+                Some(_) => number(source, "resetValue", &format!("peripheral {source_name}"))?,
+                None => default_reset,
+            };
             for node in list.children().filter(|n| n.has_tag_name("register")) {
-                registers.push(parse_register(node, name, base, default_bits)?);
+                registers.push(parse_register(node, name, base, default_bits, reset)?);
             }
         }
         // The sort is stable, so for registers at the same address the first in the
@@ -117,6 +132,7 @@ impl Svd {
             peripheral: &register.peripheral,
             start: register.start,
             offset,
+            reset_value: register.reset_value,
             fields: &register.fields,
         })
     }
@@ -161,6 +177,7 @@ fn parse_register(
     peripheral: &str,
     base: u32,
     default_bits: u32,
+    default_reset: u32,
 ) -> Result<Register, SvdError> {
     let name = format!(
         "{peripheral}_{}",
@@ -180,6 +197,11 @@ fn parse_register(
         None => default_bits,
     };
 
+    let reset_value = match child(node, "resetValue") {
+        Some(_) => number(node, "resetValue", &whereabouts)?,
+        None => default_reset,
+    };
+
     let mut fields = Vec::new();
     if let Some(list) = child(node, "fields") {
         for field in list.children().filter(|n| n.has_tag_name("field")) {
@@ -197,6 +219,7 @@ fn parse_register(
         peripheral: peripheral.to_string(),
         start,
         bytes: bits.div_ceil(8),
+        reset_value,
         fields,
     })
 }
@@ -452,5 +475,90 @@ mod tests {
     #[test]
     fn embedded_svd_parses() {
         let _ = Svd::stm32h743();
+    }
+
+    // Reset values.
+
+    fn reg_with_reset(name: &str, offset: &str, reset: Option<&str>) -> String {
+        let reset = reset.map_or(String::new(), |r| format!("<resetValue>{r}</resetValue>"));
+        format!(
+            "<register><name>{name}</name><addressOffset>{offset}</addressOffset>{reset}</register>"
+        )
+    }
+
+    fn reset_of(svd: &Svd, addr: u32) -> u32 {
+        svd.lookup(addr).unwrap().reset_value
+    }
+
+    #[test]
+    fn register_reset_value_wins() {
+        let xml = "<device><resetValue>0x1</resetValue><peripherals><peripheral><name>P</name>\
+                   <baseAddress>0x1000</baseAddress><resetValue>0x2</resetValue><registers>"
+            .to_string()
+            + &reg_with_reset("R", "0", Some("0x00C0"))
+            + "</registers></peripheral></peripherals></device>";
+        assert_eq!(reset_of(&Svd::parse(&xml).unwrap(), 0x1000), 0xC0);
+    }
+
+    #[test]
+    fn peripheral_reset_value_is_inherited() {
+        let xml = "<device><resetValue>0x1</resetValue><peripherals><peripheral><name>P</name>\
+                   <baseAddress>0x1000</baseAddress><resetValue>0x2</resetValue><registers>"
+            .to_string()
+            + &reg_with_reset("R", "0", None)
+            + "</registers></peripheral></peripherals></device>";
+        assert_eq!(reset_of(&Svd::parse(&xml).unwrap(), 0x1000), 2);
+    }
+
+    #[test]
+    fn device_reset_value_is_the_default() {
+        let xml = "<device><resetValue>0x5</resetValue><peripherals>".to_string()
+            + &peripheral("P", "0x1000", &reg_with_reset("R", "0", None))
+            + "</peripherals></device>";
+        assert_eq!(reset_of(&Svd::parse(&xml).unwrap(), 0x1000), 5);
+    }
+
+    #[test]
+    fn no_reset_value_anywhere_is_zero() {
+        let svd = parse(&peripheral("P", "0x1000", &reg_with_reset("R", "0", None)));
+        assert_eq!(reset_of(&svd, 0x1000), 0);
+    }
+
+    #[test]
+    fn derived_peripheral_takes_the_reset_values_of_its_base() {
+        let xml = "<device><peripherals><peripheral><name>A</name><baseAddress>0x1000</baseAddress>\
+                   <resetValue>0x7</resetValue><registers>"
+            .to_string()
+            + &reg_with_reset("X", "0", None)
+            + &reg_with_reset("Y", "4", Some("0x9"))
+            + "</registers></peripheral>\
+               <peripheral derivedFrom=\"A\"><name>B</name><baseAddress>0x2000</baseAddress>\
+               <resetValue>0x3</resetValue></peripheral></peripherals></device>";
+        let svd = Svd::parse(&xml).unwrap();
+        assert_eq!(reset_of(&svd, 0x2000), 7);
+        assert_eq!(reset_of(&svd, 0x2004), 9);
+    }
+
+    #[test]
+    fn bad_reset_value_is_an_error() {
+        let xml = device(&peripheral(
+            "P",
+            "0x1000",
+            &reg_with_reset("R", "0", Some("0xQ")),
+        ));
+        let err = Svd::parse(&xml).unwrap_err();
+        assert_eq!(err.to_string(), "register P_R: bad resetValue '0xQ'");
+    }
+
+    #[test]
+    fn embedded_reset_values() {
+        let svd = Svd::stm32h743();
+        assert_eq!(reset_of(svd, 0x5802_4400), 0x0000_0083); // RCC_CR
+        assert_eq!(reset_of(svd, 0x5802_4410), 0); // RCC_CFGR
+        assert_eq!(reset_of(svd, 0x5802_4800), 0xF000_C000); // PWR_CR1
+        assert_eq!(reset_of(svd, 0x5802_480C), 0x0000_0006); // PWR_CR3
+        assert_eq!(reset_of(svd, 0x5802_4818), 0x0000_4000); // PWR_D3CR
+        assert_eq!(reset_of(svd, 0x5802_0000), 0xABFF_FFFF); // GPIOA_MODER
+        assert_eq!(reset_of(svd, 0x4001_101C), 0x0000_00C0); // USART1_ISR
     }
 }
