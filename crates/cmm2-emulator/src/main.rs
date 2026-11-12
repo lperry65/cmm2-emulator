@@ -1,20 +1,39 @@
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: cmm2-emulator --version";
+use cmm2_core::Firmware;
+
+const USAGE: &str = "usage: cmm2-emulator --version | --firmware <file>";
 
 fn main() -> ExitCode {
-    match std::env::args().nth(1).as_deref() {
-        Some("--version") => {
+    let mut args = std::env::args().skip(1);
+    match (args.next().as_deref(), args.next()) {
+        (Some("--version"), _) => {
             println!("cmm2-emulator {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Some(arg) => {
+        (Some("--firmware"), Some(path)) => show_vectors(&path),
+        (Some("--firmware"), None) | (None, _) => {
+            eprintln!("{USAGE}");
+            ExitCode::from(2)
+        }
+        (Some(arg), _) => {
             eprintln!("cmm2-emulator: unknown argument '{arg}'\n{USAGE}");
             ExitCode::from(2)
         }
-        None => {
-            eprintln!("{USAGE}");
-            ExitCode::from(2)
+    }
+}
+
+fn show_vectors(path: &str) -> ExitCode {
+    match Firmware::load(path) {
+        Ok(firmware) => {
+            let vectors = firmware.vector_table();
+            println!("initial SP {:#010X}", vectors.initial_sp);
+            println!("reset handler {:#010X}", vectors.reset_handler);
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("cmm2-emulator: {err}");
+            ExitCode::from(1)
         }
     }
 }

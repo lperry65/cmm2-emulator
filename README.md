@@ -33,6 +33,13 @@ cargo build
 cargo test
 ```
 
+One test checks the vector table of the real firmware, so it is ignored by default. To run it, point
+`CMM2_FIRMWARE` at your copy of the `.bin`:
+
+```
+CMM2_FIRMWARE=/path/to/CMM2_MMBasic_7.00.00b5.bin cargo test -- --ignored
+```
+
 ## Firmware and documentation are not included
 
 You supply your own copy of the official firmware. This repository does not contain the firmware
