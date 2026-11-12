@@ -1,6 +1,7 @@
 //! The emulation core. It has no UI dependency: the front end lives in cmm2-emulator.
 
 mod clock;
+mod console;
 mod cpu;
 mod firmware;
 mod flash;
@@ -16,8 +17,10 @@ mod registers;
 mod rtc;
 mod svd;
 mod timer;
+mod usart;
 
 pub use clock::Clock;
+pub use console::Console;
 pub use cpu::{Cpu, CpuError, Fault, Stop};
 pub use firmware::{FLASH_BASE, FLASH_SIZE, Firmware, FirmwareError, VectorTable};
 pub use flash::{FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController, FlashRegisters};
@@ -35,3 +38,4 @@ pub use registers::{Registers, WordAccess};
 pub use rtc::{RTC_BASE, RTC_SIZE, Rtc, RtcRegisters};
 pub use svd::{Field, Lookup, Svd, SvdError};
 pub use timer::{TIM5_BASE, TIM16_BASE, TIMER_SIZE, Timer, TimerRegisters};
+pub use usart::{USART_SIZE, USART1_BASE, Usart, UsartRegisters};

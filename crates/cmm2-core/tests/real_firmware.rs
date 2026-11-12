@@ -186,13 +186,46 @@ fn real_firmware_passes_the_pb13_loop() {
     assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
 
     // The firmware reads GPIOB_IDR bit 13, with a pull-up on. While it read low the firmware
-    // waited 300 ms in the delay function at 0x0809ADE0 and tried again.
-    let pc = cpu.pc();
-    assert!(!(0x0809_ADE0..=0x0809_ADFA).contains(&pc), "{pc:#010x}");
-    let idr_reads = trace
+    // waited 300 ms in the delay function at 0x0809ADE0 and tried again. It is the same delay
+    // that the later SDRAM start-up uses, so the pc says nothing: check what the firmware read.
+    let idr: Vec<u32> = trace
         .borrow()
         .iter()
         .filter(|a| !a.write && a.addr == 0x5802_0410)
+        .map(|a| a.value)
+        .collect();
+    assert!(!idr.is_empty());
+    assert_ne!(idr.last().unwrap() & 1 << 13, 0, "{idr:x?}");
+}
+
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_passes_the_usart1_waits() {
+    let firmware = firmware();
+    let irqs = Irqs::new();
+    let mut memory = cmm2_memory(&irqs);
+    let console = memory.console();
+    let trace = Rc::new(RefCell::new(Vec::<PeripheralAccess>::new()));
+    let sink = trace.clone();
+    memory.set_peripheral_trace(Some(Box::new(move |access| {
+        sink.borrow_mut().push(*access)
+    })));
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
+
+    let stop = cpu.run(10_000_000);
+    assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
+
+    // The wait at 0x08009D2A used to read USART1_ISR 36 million times in a 400 million
+    // instruction run. Measured: the firmware reads it 4 times in the whole run.
+    let isr_reads = trace
+        .borrow()
+        .iter()
+        .filter(|a| !a.write && a.addr == 0x4001_101C)
         .count();
-    assert!(idr_reads >= 1, "{idr_reads}");
+    assert!((1..100).contains(&isr_reads), "{isr_reads}");
+
+    // Measured: nothing reaches USART1_TDR, even in a 400 million instruction run. The firmware
+    // queues its text and sets TCIE, and the interrupt handler that would send it never runs
+    // because no USART interrupt is raised yet.
+    assert!(console.take_output().is_empty());
 }

@@ -91,6 +91,11 @@ const RCC: [u16; 8] = [
 ];
 // movs r0,#1; str r0,[0x6000_0000] (the str is at +6)
 const UNMAPPED: [u16; 5] = [0xF04F, 0x41C0, 0x2001, 0x6008, 0xE7FE];
+// Sets UE and TE in USART1_CR1 (the str, at +4), then sends "Hi!" through USART1_TDR; the
+// address is the literal at +20.
+const CONSOLE: [u16; 12] = [
+    0x4804, 0x2109, 0x6001, 0x2248, 0x6282, 0x2269, 0x6282, 0x2221, 0x6282, 0xE7FE, 0x1000, 0x4001,
+];
 const UNDEFINED: [u16; 1] = [0xDE00]; // udf #0
 
 // Runs the program with `args` after `--firmware <image>`, and removes the image.
@@ -240,6 +245,17 @@ fn run_stops_at_the_instruction_limit() {
         "stopped: instruction limit\ninstructions 10\npc 0x08000100\n"
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn console_output_follows_the_summary() {
+    let output = run_program("console", &CONSOLE, &["--run", "10"]);
+
+    assert!(output.status.success());
+    assert_eq!(
+        stdout(&output),
+        "stopped: instruction limit\ninstructions 10\npc 0x08000112\nconsole output (3 bytes):\nHi!\n"
+    );
 }
 
 #[test]

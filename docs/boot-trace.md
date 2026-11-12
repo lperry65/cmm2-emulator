@@ -92,6 +92,18 @@ With both in, the 400 million instruction run has no fault. It ends in the UART 
 reads `0xC0` (`TXE` and `TC`), where the real board reads `0x08E210D0` with `TEACK` and `REACK` set:
 36 million reads of it in the run. USART1 is the next model.
 
+**Then, with USART1 modelled:** the `TEACK` and `REACK` wait passes at once (`USART1_ISR` is read 4
+times) and the firmware reaches its first-boot setup. Our flash starts erased, like a freshly
+flashed board, so it prints "Initial setup - all parameters can be changed later" and "Keyboard type:
+1=UK, 2=US, 3=DE, 4=FR, 5=ES, 6=BE ?" and waits for a key. The wait is a loop at `0x0809CB5A` to
+`0x0809CB66` around the get-character routine at `0x0809A894`, which returns -1 while nothing is queued;
+it accepts `1` to `6`. Each character is printed to the video (`0x0807A8E0`) and, when bit 0 of the byte at
+`0x20000ABC` is set (it reads 3), to the serial port: the routine at `0x08098DC8` puts the byte in a ring
+buffer and sets `TCIE` in `USART1_CR1`, and the USART1 interrupt handler writes `USART1_TDR`. No USART
+interrupt is raised yet, so nothing reaches `TDR` and the console stays empty. The firmware toggles
+`RXNEIE` in `CR1` as it polls (9 million `CR1` accesses in 400 million instructions). The next step is the
+USART interrupts (transmit empty, transmission complete, receive) and a way for the host to type.
+
 ## What happens before it
 
 | Instruction | What |

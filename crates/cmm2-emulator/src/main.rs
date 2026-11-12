@@ -9,8 +9,8 @@ use std::rc::Rc;
 
 use args::{Command, RunOptions};
 use cmm2_core::{
-    AccessKind, Cpu, CpuError, Firmware, FirmwareError, Irqs, MemoryError, PeripheralAccess, Stop,
-    Svd, cmm2_memory,
+    AccessKind, Console, Cpu, CpuError, Firmware, FirmwareError, Irqs, MemoryError,
+    PeripheralAccess, Stop, Svd, cmm2_memory,
 };
 
 /// How many unmapped accesses the summary lists; the count covers all of them.
@@ -171,6 +171,7 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
                 .line(format_args!("{}", access_line(access)));
         })));
     }
+    let console = memory.console();
     let mut cpu = Cpu::new(&firmware, memory, irqs)?;
 
     let limit = options.run.unwrap_or(u64::MAX);
@@ -186,7 +187,22 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
 
     let ok = !matches!(stop, Stop::Fault(_));
     print_summary(&mut cpu, &stop);
+    print_console(&console);
     Ok(ok)
+}
+
+/// What the guest sent to its console, until there is an interactive one.
+fn print_console(console: &Console) {
+    let output = console.take_output();
+    if output.is_empty() {
+        return;
+    }
+    println!("console output ({} bytes):", output.len());
+    let text = String::from_utf8_lossy(&output);
+    print!("{text}");
+    if !text.ends_with('\n') {
+        println!();
+    }
 }
 
 fn print_summary(cpu: &mut Cpu, stop: &Stop) {

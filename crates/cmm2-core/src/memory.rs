@@ -9,6 +9,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::clock::Clock;
+use crate::console::Console;
 use crate::flash_ops::FlashOps;
 use crate::peripheral::{Peripheral, PeripheralAccess, RegisterStub};
 use crate::svd::Svd;
@@ -127,6 +128,7 @@ pub struct MemoryMap {
     pc: Rc<Cell<u32>>,
     flash_ops: FlashOps,
     clock: Clock,
+    console: Console,
 }
 
 impl Default for MemoryMap {
@@ -154,6 +156,7 @@ impl MemoryMap {
             pc: Rc::new(Cell::new(0)),
             flash_ops: FlashOps::new(),
             clock: Clock::new(),
+            console: Console::new(),
         }
     }
 
@@ -171,6 +174,11 @@ impl MemoryMap {
     /// The machine's time, which the CPU keeps up to date. It is 0 until a CPU is attached.
     pub fn clock(&self) -> Clock {
         self.clock.clone()
+    }
+
+    /// The text channel of the console USART, shared with the front end.
+    pub fn console(&self) -> Console {
+        self.console.clone()
     }
 
     pub fn read8(&mut self, addr: u32) -> u8 {

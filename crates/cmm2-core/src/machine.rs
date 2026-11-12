@@ -9,6 +9,7 @@ use crate::pwr::{PWR_BASE, PWR_SIZE, Pwr};
 use crate::rcc::{RCC_BASE, RCC_SIZE, Rcc};
 use crate::rtc::{RTC_BASE, RTC_SIZE, Rtc};
 use crate::timer::{TIM5_BASE, TIM16_BASE, TIMER_SIZE, Timer};
+use crate::usart::{USART_SIZE, USART1_BASE, Usart};
 
 pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
     let mut memory = MemoryMap::new();
@@ -45,6 +46,13 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
             )
             .expect("GPIO window is clear of RAM");
     }
+    memory
+        .map_peripheral(
+            USART1_BASE,
+            USART_SIZE,
+            Box::new(Usart::new(USART1_BASE, memory.console())),
+        )
+        .expect("USART1 window is clear of RAM");
     let flash = FlashController::new(irqs.clone(), memory.flash_ops());
     memory
         .map_peripheral(FLASH_REGS_BASE, FLASH_REGS_SIZE, Box::new(flash))
@@ -99,6 +107,22 @@ mod tests {
     fn unmodelled_addresses_read_their_reset_values() {
         let mut m = cmm2_memory(&Irqs::new());
         assert_eq!(m.read32(0x4001_101C), 0xC0); // USART1_ISR
+        assert!(m.take_unmapped().is_empty());
+    }
+
+    #[test]
+    fn usart1_is_served_by_the_model_and_usart2_by_the_stub() {
+        let mut m = cmm2_memory(&Irqs::new());
+        let console = m.console();
+        m.write32(0x4001_1000, 0x9); // USART1_CR1: UE, TE
+        assert_eq!(m.read32(0x4001_101C), 0x0020_00C0); // USART1_ISR: TEACK
+        m.write32(0x4001_1028, 0x41); // USART1_TDR
+        assert_eq!(console.take_output(), b"A");
+
+        m.write32(0x4000_4400, 0x9); // USART2_CR1
+        assert_eq!(m.read32(0x4000_441C), 0xC0); // USART2_ISR: reset value only
+        m.write32(0x4000_4428, 0x42); // USART2_TDR
+        assert!(console.take_output().is_empty());
         assert!(m.take_unmapped().is_empty());
     }
 
