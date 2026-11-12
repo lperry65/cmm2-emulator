@@ -2,6 +2,7 @@
 //! mapped here; everything else in the peripheral space is a register stub.
 
 use crate::flash::{FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController};
+use crate::gpio::{GPIO_BASE, GPIO_PORT_SIZE, GPIO_PORTS, Gpio};
 use crate::irq::Irqs;
 use crate::memory::MemoryMap;
 use crate::pwr::{PWR_BASE, PWR_SIZE, Pwr};
@@ -35,6 +36,15 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
             Box::new(Timer::new(TIM16_BASE, 16, memory.clock())),
         )
         .expect("TIM16 window is clear of RAM");
+    for port in 0..GPIO_PORTS {
+        memory
+            .map_peripheral(
+                GPIO_BASE + port as u32 * GPIO_PORT_SIZE,
+                GPIO_PORT_SIZE,
+                Box::new(Gpio::new(port)),
+            )
+            .expect("GPIO window is clear of RAM");
+    }
     let flash = FlashController::new(irqs.clone(), memory.flash_ops());
     memory
         .map_peripheral(FLASH_REGS_BASE, FLASH_REGS_SIZE, Box::new(flash))
@@ -120,6 +130,13 @@ mod tests {
         m.write32(0x4000_0024, 77); // TIM2_CNT
         m.clock().set(100_000);
         assert_eq!(m.read32(0x4000_0024), 77);
+    }
+
+    #[test]
+    fn the_gpio_ports_are_served_by_the_model() {
+        let mut m = cmm2_memory(&Irqs::new());
+        assert_eq!(m.read32(0x5802_0400), 0xFFFF_FEBF); // GPIOB_MODER, not the SVD's
+        assert_eq!(m.read32(0x5802_2800), 0xFFFF_FFFF); // GPIOK_MODER
     }
 
     #[test]

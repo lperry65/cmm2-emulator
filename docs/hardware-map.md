@@ -112,3 +112,35 @@ names are from the SVD. These are the values the iteration 2 peripheral models h
 | `FLASH_CR1` / `FLASH_SR1` | `0x00000030` / `0x00040000` | `FLASH_SR1` bit 18 set (unchecked which flag) |
 
 Reading `0xE000E100` (the NVIC) from BASIC gives `Address`, so the private bus cannot be probed this way.
+
+## GPIO pin states, as the board reads them at the prompt [board]
+
+Read on 2026-11-12 with `tools/cmm2_regs.py`, firmware 7.00.00b5, a USB keyboard attached, board idle
+at the `>` prompt. `MODER` 0 = input, 1 = output, 2 = alternate function, 3 = analog.
+
+| Port | `MODER` | `PUPDR` | `IDR` | `ODR` |
+|---|---|---|---|---|
+| A | `0xEAABFFFF` | `0x24140000` | `0x00002600` | `0` |
+| B | `0xFFFFFFFB` | `0` | `0` | `0` |
+| C | `0xFD1FFFFE` | `0x00400000` | `0x00001800` | `0x00001000` |
+| D | `0xAFEAE51A` | `0x00000540` | `0x00008034` | `0x00000034` |
+| E | `0xAAAAABFA` | `0` | `0x0000AA80` | `0` |
+| F | `0xAAA3FAAA` | `0x00040000` | `0x00000C00` | `0` |
+| G | `0xBEAEEA2A` | `0x00000080` | `0x00008131` | `0` |
+| H | `0xB8EAABAF` | `0x01000000` | `0x000000E0` | `0` |
+| I | `0xFF6BAAEA` | `0` | `0` | `0` |
+
+What they show (worked out by hand from the values):
+
+- **Input pins:** C11 (pull-up) reads 1; D3 (pull-up), F9 (pull-up), H12 (pull-up) and G3 (pull-down)
+  read 0. So the board itself holds D3, F9 and H12 low even though their pull-ups are on. The firmware
+  polls F9 1000 times at start-up, and D and H on every SysTick.
+- **Outputs read back their `ODR` bit:** C10 0, C12 1, D2, D4 and D5 1, I11 0.
+- **Alternate-function pins that read high** (the level the peripheral drives, such as the idle USART1
+  lines on A9 and A10): A9, A10, A13; D15; E7, E9, E11, E13, E15; F10, F11; G0, G4, G5, G8, G15; H5, H6, H7.
+- **Analog pins read 0:** PB13 is in analog mode at the prompt (the firmware only uses it as an input with a
+  pull-up while it boots), so its level at boot cannot be read from here. An undriven pin with a pull-up
+  reads high, and the boot behaves as if it does.
+
+These are the tables in `gpio.rs`. They describe this board with this keyboard attached: pins that depend
+on what is plugged in (the held-low pins are the likely ones) may read differently on another set-up.

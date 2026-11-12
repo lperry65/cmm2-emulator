@@ -171,7 +171,7 @@ fn real_firmware_passes_the_flash_erase_wait() {
 
 #[test]
 #[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
-fn real_firmware_leaves_the_tim16_delay() {
+fn real_firmware_passes_the_pb13_loop() {
     let firmware = firmware();
     let irqs = Irqs::new();
     let mut memory = cmm2_memory(&irqs);
@@ -182,19 +182,17 @@ fn real_firmware_leaves_the_tim16_delay() {
     })));
     let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
 
-    // The microsecond delay at 0x0809ADE2 spins on TIM16_CNT until 1000 ticks have passed,
-    // then goes on at 0x0809ADFA. The firmware then calls it again (a retry wait of 300 ms
-    // for a pin that stays low), so the end of the run is still inside it; leaving it once
-    // is the thing to check. Before the timer counted, it never left.
-    let stop = cpu.run_until(3_000_000, Some(0x0809_ADFA));
-    assert_eq!(stop, Stop::Address(0x0809_ADFA));
+    let stop = cpu.run(3_000_000);
+    assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
 
-    // 1000 ticks of 504 cycles, at about 8 cycles a round, is about 63,000 reads. It is 62,862
-    // as measured; before the timer counted it was about 600,000 per 3M instructions.
-    let cnt_reads = trace
+    // The firmware reads GPIOB_IDR bit 13, with a pull-up on. While it read low the firmware
+    // waited 300 ms in the delay function at 0x0809ADE0 and tried again.
+    let pc = cpu.pc();
+    assert!(!(0x0809_ADE0..=0x0809_ADFA).contains(&pc), "{pc:#010x}");
+    let idr_reads = trace
         .borrow()
         .iter()
-        .filter(|a| !a.write && a.addr == 0x4001_4424)
+        .filter(|a| !a.write && a.addr == 0x5802_0410)
         .count();
-    assert!((1_000..100_000).contains(&cnt_reads), "{cnt_reads}");
+    assert!(idr_reads >= 1, "{idr_reads}");
 }

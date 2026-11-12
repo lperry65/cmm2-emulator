@@ -5,6 +5,7 @@ mod cpu;
 mod firmware;
 mod flash;
 mod flash_ops;
+mod gpio;
 mod irq;
 mod machine;
 mod memory;
@@ -21,6 +22,7 @@ pub use cpu::{Cpu, CpuError, Fault, Stop};
 pub use firmware::{FLASH_BASE, FLASH_SIZE, Firmware, FirmwareError, VectorTable};
 pub use flash::{FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController, FlashRegisters};
 pub use flash_ops::{FlashOp, FlashOps};
+pub use gpio::{GPIO_BASE, GPIO_PORT_SIZE, GPIO_PORTS, Gpio, GpioRegisters};
 pub use irq::Irqs;
 pub use machine::cmm2_memory;
 pub use memory::{

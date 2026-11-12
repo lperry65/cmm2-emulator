@@ -74,6 +74,24 @@ board has a programming jumper); another is a core bug. The first thing to try i
 that reads the way the board does, so the next model is the GPIO ports, with the input levels the
 board really has.
 
+**Resolved: the GPIO ports, and a core bug.** The pin is GPIOB pin 13, set up as an input with a
+pull-up (`GPIOB_PUPDR` `0x04100000`, `GPIOB_MODER` `0xA0BABABE`) just before the retry loop.
+Undriven it reads high, so with the GPIO ports modelled (`docs/hardware-map.md` has the board's pin
+levels) the loop exits at once and the 300 ms retries are gone. The hard fault was not about that pin,
+and it was not a peripheral at all. It is a bug in the zmu core. When SysTick arrived right after an
+`ite` instruction, the core neither saved the Thumb IT state in the stacked xPSR nor cleared it for the
+handler, so the handler's first instruction (`push {R3, LR}` in the vector stub at `0x2B8`) was skipped as
+the else part of the interrupted block while its `pop` ran, loaded a bogus return address, and execution
+ran off into peripheral memory. With the long waits gone it shows up at about 6 million instructions
+(it was the same bug, which just needed a SysTick at the wrong instruction, at 288.8 million before).
+The core now saves the IT state on exception entry and restores it on return, as the architecture says.
+
+With both in, the 400 million instruction run has no fault. It ends in the UART wait-on-flag helper at
+`0x08009D2A` (it tests `flags wanted AND NOT ISR` and loops), called from `0x08009DE2` with the
+`TEACK` bit (bit 21) of `USART1_ISR` as the flag and a timeout of about 33 million ticks. `USART1_ISR`
+reads `0xC0` (`TXE` and `TC`), where the real board reads `0x08E210D0` with `TEACK` and `REACK` set:
+36 million reads of it in the run. USART1 is the next model.
+
 ## What happens before it
 
 | Instruction | What |
