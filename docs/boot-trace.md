@@ -235,3 +235,12 @@ and `0x08120000` (the program area).
 - The cache maintenance registers need to answer sensibly (size ID reads), and the SVD does not name them.
 - Polling reads of `GPIOH_IDR`, `GPIOD_IDR` and `TIM5_CNT` are going to dominate the idle
   loops, so the cost of a peripheral read matters (see the speed ticket).
+
+## Where it blocks now
+
+With the counting RTC the firmware reaches the second-boot `>` prompt (about 612 million
+instructions) and reads typed keys into its ring buffer, but does not run them. The main thread
+loops at `0x0809A508` to `0x0809A50C`, storing 0 to the byte at `0x20015584` and spinning until
+it is non-zero. The function at `0x08097DD4` sets it, and its object looks like the LTDC line-event
+callback (IRQ 88). That is my reading, not yet confirmed. Nothing models the LTDC, so the next
+step is the LTDC model (issue 35).
