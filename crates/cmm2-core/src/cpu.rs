@@ -11,6 +11,8 @@ use zmu_cortex_m::core::fault;
 use zmu_cortex_m::core::fault::FaultTrapMode;
 use zmu_cortex_m::core::register::{BaseReg, Reg};
 use zmu_cortex_m::core::reset::Reset;
+use zmu_cortex_m::core::thumb::ThumbCode;
+use zmu_cortex_m::decoder::Decoder;
 use zmu_cortex_m::executor::Executor;
 use zmu_cortex_m::peripheral::nvic::NVIC;
 
@@ -47,6 +49,8 @@ pub struct Fault {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stop {
     InstructionLimit,
+    /// The next instruction is at this address and has not run.
+    Address(u32),
     Fault(Fault),
 }
 
@@ -168,15 +172,58 @@ impl Cpu {
         })
     }
 
-    /// Steps until `max_instructions` more have run or a fault stops it.
+    /// Steps until `max_instructions` more have run, the next instruction is at `stop_at` (the
+    /// Thumb bit is ignored) or a fault stops it.
+    pub fn run_until(&mut self, max_instructions: u64, stop_at: Option<u32>) -> Stop {
+        self.run_loop(max_instructions, stop_at, |_, _| {})
+    }
+
     pub fn run(&mut self, max_instructions: u64) -> Stop {
+        self.run_until(max_instructions, None)
+    }
+
+    /// Like `run_until`, and calls `trace` with the address and disassembly of each instruction
+    /// just before it runs. Only this method pays for the disassembly.
+    pub fn run_traced(
+        &mut self,
+        max_instructions: u64,
+        stop_at: Option<u32>,
+        mut trace: impl FnMut(u32, &str),
+    ) -> Stop {
+        self.run_loop(max_instructions, stop_at, |cpu, pc| {
+            trace(pc, &cpu.describe_next());
+        })
+    }
+
+    fn run_loop(
+        &mut self,
+        max_instructions: u64,
+        stop_at: Option<u32>,
+        mut before: impl FnMut(&mut Cpu, u32),
+    ) -> Stop {
         let limit = self.instruction_count().saturating_add(max_instructions);
         while self.instruction_count() < limit {
+            let pc = self.pc();
+            if stop_at.is_some_and(|addr| addr & !1 == pc & !1) {
+                return Stop::Address(pc);
+            }
+            before(self, pc);
             if let Some(fault) = self.step() {
                 return Stop::Fault(fault);
             }
         }
         Stop::InstructionLimit
+    }
+
+    /// The disassembly of the instruction at the pc. Fetching goes through the memory map like
+    /// the core's own fetch does, so a pc outside flash is logged there as an access.
+    pub fn describe_next(&mut self) -> String {
+        let pc = self.pc();
+        match self.processor.fetch_code(pc) {
+            Ok(ThumbCode::Undefined) => "undefined".to_string(),
+            Ok(code) => self.processor.decode(code).to_string(),
+            Err(_) => "fetch fault".to_string(),
+        }
     }
 
     /// The address of the next instruction.
@@ -248,6 +295,10 @@ mod tests {
     // Adds one to the word at 0x2400_0000 and returns.
     const COUNT_IN_AXI: [u16; 6] = [0xF04F, 0x5110, 0x6808, 0x3001, 0x6008, 0x4770];
     const UNDEFINED: [u16; 1] = [0xDE00]; // udf #0
+    // movs r0,#1; movs r1,#2; movs r2,#3; b .
+    const THREE: [u16; 4] = [0x2001, 0x2102, 0x2203, 0xE7FE];
+    // ldr r0,[pc,#4]; bx r0 into 0xE000_0000, which the core cannot fetch from.
+    const JUMP_TO_NOWHERE: [u16; 6] = [0x4801, 0x4700, 0xE7FE, 0x0000, 0x0001, 0xE000];
 
     /// A vector table (initial SP, reset into `code`, then `handlers` as (irq, offset into
     /// `code`)) followed by the code at `CODE`.
@@ -386,6 +437,99 @@ mod tests {
         // No fault handlers are set up, so the usage fault escalates to a hard fault.
         assert!(fault.description.contains("UndefInstr"));
         assert!(fault.description.contains("HardFault"));
+    }
+
+    #[test]
+    fn run_until_stops_before_the_instruction_at_the_address() {
+        let mut cpu = cpu(&THREE);
+        assert_eq!(cpu.run_until(100, Some(CODE + 4)), Stop::Address(CODE + 4));
+        assert_eq!(cpu.instruction_count(), 2);
+        assert_eq!(cpu.reg(0), 1);
+        assert_eq!(cpu.reg(1), 2);
+        assert_eq!(cpu.reg(2), 0);
+    }
+
+    #[test]
+    fn run_until_ignores_the_thumb_bit_of_the_address() {
+        let mut cpu = cpu(&THREE);
+        assert_eq!(
+            cpu.run_until(100, Some((CODE + 4) | 1)),
+            Stop::Address(CODE + 4)
+        );
+        assert_eq!(cpu.instruction_count(), 2);
+    }
+
+    #[test]
+    fn run_until_an_address_never_reached_hits_the_limit() {
+        let mut cpu = cpu(&THREE);
+        assert_eq!(cpu.run_until(10, Some(CODE + 0x80)), Stop::InstructionLimit);
+        assert_eq!(cpu.instruction_count(), 10);
+    }
+
+    #[test]
+    fn run_until_at_the_address_already_runs_nothing() {
+        let mut cpu = cpu(&THREE);
+        cpu.run_until(100, Some(CODE + 4));
+        assert_eq!(cpu.run_until(100, Some(CODE + 4)), Stop::Address(CODE + 4));
+        assert_eq!(cpu.instruction_count(), 2);
+    }
+
+    #[test]
+    fn run_traced_reports_each_instruction_before_it_runs() {
+        let mut cpu = cpu(&THREE);
+        let mut seen = Vec::new();
+        let stop = cpu.run_traced(4, None, |pc, text| seen.push((pc, text.to_string())));
+        assert_eq!(stop, Stop::InstructionLimit);
+        let pcs: Vec<u32> = seen.iter().map(|(pc, _)| *pc).collect();
+        assert_eq!(pcs, [CODE, CODE + 2, CODE + 4, CODE + 6]);
+        assert!(seen.iter().all(|(_, text)| !text.is_empty()));
+        assert_eq!(seen[0].1, "mov r0, #1");
+        assert_eq!(seen.len() as u64, cpu.instruction_count());
+    }
+
+    #[test]
+    fn run_traced_stops_at_the_address_without_tracing_it() {
+        let mut cpu = cpu(&THREE);
+        let mut pcs = Vec::new();
+        let stop = cpu.run_traced(100, Some(CODE + 4), |pc, _| pcs.push(pc));
+        assert_eq!(stop, Stop::Address(CODE + 4));
+        assert_eq!(pcs, [CODE, CODE + 2]);
+    }
+
+    #[test]
+    fn run_traced_includes_the_interrupt_handler() {
+        let mut cpu = with_handler(&ENABLE_AND_COUNT);
+        cpu.run(20);
+        cpu.irqs().raise(5);
+        let handler = CODE + 2 * ENABLE_AND_COUNT.len() as u32;
+        let mut pcs = Vec::new();
+        cpu.run_traced(50, None, |pc, _| pcs.push(pc));
+        assert!(pcs.contains(&handler), "{pcs:x?}");
+        assert!(pcs.contains(&(handler + 10)), "{pcs:x?}");
+        assert_eq!(pcs.len(), 50);
+    }
+
+    #[test]
+    // zmu prints no "s" on the flag-setting forms, so this is `mov` for a `movs`.
+    fn describe_next_reads_the_instruction_at_the_pc() {
+        let mut cpu = cpu(&THREE);
+        assert_eq!(cpu.describe_next(), "mov r0, #1");
+        cpu.step();
+        assert_eq!(cpu.describe_next(), "mov r1, #2");
+    }
+
+    #[test]
+    fn describe_next_names_an_undefined_instruction() {
+        let mut cpu = cpu(&UNDEFINED);
+        assert!(cpu.describe_next().contains("udf"));
+    }
+
+    #[test]
+    fn describe_next_survives_a_fetch_fault() {
+        let mut cpu = cpu(&JUMP_TO_NOWHERE);
+        cpu.run(2);
+        assert_eq!(cpu.pc(), 0xE000_0000);
+        assert_eq!(cpu.describe_next(), "fetch fault");
     }
 
     #[test]

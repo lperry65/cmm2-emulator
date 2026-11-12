@@ -26,7 +26,7 @@ fn unknown_argument_is_rejected() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "cmm2-emulator: unknown argument '--bogus'\nusage: cmm2-emulator --version | --firmware <file> | --lookup <address>\n"
+        format!("cmm2-emulator: unknown argument '--bogus'\n{USAGE}\n")
     );
 }
 
@@ -40,11 +40,11 @@ fn no_arguments_prints_usage() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "usage: cmm2-emulator --version | --firmware <file> | --lookup <address>\n"
+        format!("{USAGE}\n")
     );
 }
 
-const USAGE: &str = "usage: cmm2-emulator --version | --firmware <file> | --lookup <address>";
+const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio]";
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
@@ -53,14 +53,58 @@ fn run(args: &[&str]) -> Output {
         .expect("failed to run cmm2-emulator")
 }
 
+fn temp_path(name: &str, extension: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "cmm2-cli-{}-{name}.{extension}",
+        std::process::id()
+    ))
+}
+
 // Writes a file with the given vector table words to a unique temp path.
 fn temp_firmware(name: &str, sp: u32, reset: u32) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("cmm2-cli-{}-{name}.bin", std::process::id()));
+    let path = temp_path(name, "bin");
     let mut bytes = vec![0; 64];
     bytes[..4].copy_from_slice(&sp.to_le_bytes());
     bytes[4..8].copy_from_slice(&reset.to_le_bytes());
     std::fs::write(&path, bytes).unwrap();
     path
+}
+
+const CODE: u32 = 0x0800_0100;
+
+// Writes a firmware image whose reset handler is `code` at CODE, as Thumb halfwords.
+fn temp_program(name: &str, code: &[u16]) -> PathBuf {
+    let path = temp_path(name, "bin");
+    let mut bytes = vec![0; 0x100];
+    bytes[..4].copy_from_slice(&0x2000_8000u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&(CODE | 1).to_le_bytes());
+    bytes.extend(code.iter().flat_map(|half| half.to_le_bytes()));
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+// movs r0,#1; movs r1,#2; movs r2,#3; b .
+const THREE: [u16; 4] = [0x2001, 0x2102, 0x2203, 0xE7FE];
+// Writes 42 to RCC_CR (the str, at +4), then reads it back (the ldr, at +6).
+const RCC: [u16; 8] = [
+    0x4902, 0x202A, 0x6008, 0x680A, 0xE7FE, 0x0000, 0x4400, 0x5802,
+];
+// movs r0,#1; str r0,[0x6000_0000] (the str is at +6)
+const UNMAPPED: [u16; 5] = [0xF04F, 0x41C0, 0x2001, 0x6008, 0xE7FE];
+const UNDEFINED: [u16; 1] = [0xDE00]; // udf #0
+
+// Runs the program with `args` after `--firmware <image>`, and removes the image.
+fn run_program(name: &str, code: &[u16], args: &[&str]) -> Output {
+    let path = temp_program(name, code);
+    let mut all = vec!["--firmware", path.to_str().unwrap()];
+    all.extend_from_slice(args);
+    let output = run(&all);
+    std::fs::remove_file(&path).unwrap();
+    output
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[test]
@@ -184,4 +228,243 @@ fn lookup_without_an_address_is_a_usage_error() {
         String::from_utf8_lossy(&output.stderr),
         format!("{USAGE}\n")
     );
+}
+
+#[test]
+fn run_stops_at_the_instruction_limit() {
+    let output = run_program("limit", &[0xE7FE], &["--run", "10"]);
+
+    assert!(output.status.success());
+    assert_eq!(
+        stdout(&output),
+        "stopped: instruction limit\ninstructions 10\npc 0x08000100\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn run_accepts_a_hex_count() {
+    let output = run_program("hex-count", &[0xE7FE], &["--run", "0x10"]);
+
+    assert!(stdout(&output).contains("\ninstructions 16\n"));
+}
+
+#[test]
+fn stop_at_stops_before_the_instruction() {
+    let output = run_program("stop-at", &THREE, &["--stop-at", "0x08000104"]);
+
+    assert!(output.status.success());
+    assert_eq!(
+        stdout(&output),
+        "stopped: address 0x08000104\ninstructions 2\npc 0x08000104\n"
+    );
+}
+
+#[test]
+fn run_and_stop_at_can_be_given_in_either_order() {
+    let output = run_program("both", &THREE, &["--stop-at", "0x08000106", "--run", "100"]);
+
+    assert!(stdout(&output).starts_with("stopped: address 0x08000106\n"));
+}
+
+#[test]
+fn trace_writes_one_line_per_instruction() {
+    let trace = temp_path("trace", "txt");
+    let output = run_program(
+        "trace",
+        &THREE,
+        &["--run", "5", "--trace", trace.to_str().unwrap()],
+    );
+    let text = std::fs::read_to_string(&trace).unwrap();
+    std::fs::remove_file(&trace).unwrap();
+
+    assert!(output.status.success());
+    assert!(stdout(&output).contains("\ninstructions 5\n"));
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 5, "{text}");
+    assert_eq!(lines[0], "0x08000100  mov r0, #1");
+    assert_eq!(lines[1], "0x08000102  mov r1, #2");
+    for line in &lines {
+        let (addr, rest) = line.split_once("  ").unwrap();
+        assert!(addr.starts_with("0x") && addr.len() == 10, "{line}");
+        assert!(!rest.is_empty(), "{line}");
+        assert!(!line.starts_with(' '), "{line}");
+    }
+}
+
+#[test]
+fn trace_mmio_prints_peripheral_accesses() {
+    let output = run_program("mmio", &RCC, &["--trace-mmio", "--run", "6"]);
+
+    assert!(output.status.success());
+    let out = stdout(&output);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "    W RCC_CR 0x58024400 size 4 = 0x0000002A");
+    assert_eq!(lines[1], "    R RCC_CR 0x58024400 size 4 = 0x0000002A");
+    assert!(lines[2].starts_with("stopped: "), "{out}");
+}
+
+#[test]
+fn trace_mmio_names_an_address_inside_a_register() {
+    // ldr r1,[pc,#4]; ldrb r0,[r1]; b .; pool = 0x5802_4401
+    let code = [0x4901, 0x7808, 0xE7FE, 0x0000, 0x4401, 0x5802];
+    let output = run_program("mmio-offset", &code, &["--trace-mmio", "--run", "3"]);
+
+    assert!(
+        stdout(&output).starts_with("    R RCC_CR +1 0x58024401 size 1 = 0x00000000\n"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn trace_mmio_leaves_unknown_registers_unnamed() {
+    // ldr r1,[pc,#4]; ldr r0,[r1]; b .; pool = 0x5FFF_0000
+    let code = [0x4901, 0x6808, 0xE7FE, 0x0000, 0x0000, 0x5FFF];
+    let output = run_program("mmio-unknown", &code, &["--trace-mmio", "--run", "3"]);
+
+    assert!(
+        stdout(&output).starts_with("    R ? 0x5FFF0000 size 4 = 0x00000000\n"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn trace_file_holds_the_accesses_after_their_instruction() {
+    let trace = temp_path("trace-mmio", "txt");
+    let output = run_program(
+        "trace-mmio",
+        &RCC,
+        &[
+            "--run",
+            "6",
+            "--trace",
+            trace.to_str().unwrap(),
+            "--trace-mmio",
+        ],
+    );
+    let text = std::fs::read_to_string(&trace).unwrap();
+    std::fs::remove_file(&trace).unwrap();
+
+    assert!(output.status.success());
+    assert!(!stdout(&output).contains("RCC_CR"));
+    let lines: Vec<&str> = text.lines().collect();
+    let store = lines
+        .iter()
+        .position(|line| line.starts_with("0x08000104  "))
+        .unwrap();
+    assert_eq!(
+        lines[store + 1],
+        "    W RCC_CR 0x58024400 size 4 = 0x0000002A"
+    );
+    assert!(lines[store + 2].starts_with("0x08000106  "), "{text}");
+    assert_eq!(
+        lines[store + 3],
+        "    R RCC_CR 0x58024400 size 4 = 0x0000002A"
+    );
+}
+
+#[test]
+fn a_fault_is_reported_and_exits_with_one() {
+    let output = run_program("fault", &UNDEFINED, &["--run", "10"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let out = stdout(&output);
+    assert!(out.starts_with("stopped: fault trap: "), "{out}");
+    assert!(out.contains("UndefInstr"), "{out}");
+    assert!(out.contains("pc=0x08000100"), "{out}");
+    assert!(out.contains("\ninstructions 1\n"), "{out}");
+}
+
+#[test]
+fn unmapped_accesses_are_listed_in_the_summary() {
+    let output = run_program("unmapped", &UNMAPPED, &["--run", "10"]);
+
+    assert!(output.status.success());
+    let out = stdout(&output);
+    assert!(out.contains("\nunmapped accesses 1\n"), "{out}");
+    assert!(
+        out.ends_with("  0x08000106 write 0x60000000 size 4\n"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_clean_run_has_no_unmapped_line() {
+    let output = run_program("clean", &THREE, &["--run", "4"]);
+
+    assert!(!stdout(&output).contains("unmapped"));
+}
+
+#[test]
+fn trace_file_that_cannot_be_created_fails() {
+    let output = run_program(
+        "bad-trace",
+        &THREE,
+        &["--run", "5", "--trace", "/nonexistent/trace.txt"],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("cmm2-emulator: /nonexistent/trace.txt: "),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn bad_run_options_are_usage_errors() {
+    let cases: [(&[&str], &str); 10] = [
+        (&["--run", "10"], "--run needs --firmware"),
+        (&["--stop-at", "0x1000"], "--stop-at needs --firmware"),
+        (&["--trace-mmio"], "--trace-mmio needs --firmware"),
+        (&["--firmware", "f", "--run"], ""),
+        (&["--firmware", "f", "--run", "abc"], "bad count 'abc'"),
+        (&["--firmware", "f", "--run", "0x"], "bad count '0x'"),
+        (&["--firmware", "f", "--stop-at"], ""),
+        (
+            &["--firmware", "f", "--stop-at", "1234"],
+            "bad address '1234'",
+        ),
+        (&["--firmware", "f", "--trace"], ""),
+        (
+            &["--firmware", "f", "--bogus"],
+            "unknown argument '--bogus'",
+        ),
+    ];
+    for (args, message) in cases {
+        let output = run(args);
+
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let expected = if message.is_empty() {
+            format!("{USAGE}\n")
+        } else {
+            format!("cmm2-emulator: {message}\n{USAGE}\n")
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            expected,
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn trace_without_anything_to_run_is_a_usage_error() {
+    for option in [&["--trace", "out.txt"][..], &["--trace-mmio"][..]] {
+        let mut args = vec!["--firmware", "f"];
+        args.extend_from_slice(option);
+        let output = run(&args);
+
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("cmm2-emulator: nothing to run, give --run or --stop-at\n{USAGE}\n"),
+            "{args:?}"
+        );
+    }
 }

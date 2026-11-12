@@ -40,6 +40,18 @@ One test checks the vector table of the real firmware, so it is ignored by defau
 CMM2_FIRMWARE=/path/to/CMM2_MMBasic_7.00.00b5.bin cargo test -- --ignored
 ```
 
+### Trying it
+
+To run the firmware for 100,000 instructions and see which peripheral registers it touches:
+
+```
+cargo run --release -- --firmware /path/to/CMM2_MMBasic_7.00.00b5.bin --run 100000 --trace-mmio
+```
+
+`--stop-at 0x<address>` stops before the instruction at that address instead, and
+`--trace <file>` writes every executed instruction (and, with `--trace-mmio`, the peripheral
+accesses after it) to a file.
+
 ## Firmware and documentation are not included
 
 You supply your own copy of the official firmware. This repository does not contain the firmware
