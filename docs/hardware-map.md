@@ -85,3 +85,30 @@ The external I/O connector's pin-to-GPIO assignments are in the memory map docum
 
 The Cortex-M private peripherals (NVIC at 0xE000E100 and so on) return an address error from
 `PEEK`. Interrupt use has to come from tracing the emulated firmware, or from the memory map document.
+
+## The registers the boot waits on, as the board reads them at the prompt [board]
+
+Read on 2026-11-12 with `tools/cmm2_regs.py`, firmware 7.00.00b5, board idle at the `>` prompt. Bit
+names are from the SVD. These are the values the iteration 2 peripheral models have to arrive at.
+
+| Register | Value | What it says |
+|---|---|---|
+| `PWR_D3CR` | `0x0000E000` | `VOS` = 3 (highest voltage scale) and `VOSRDY` (bit 13) set. The emulator's stub reads back `0xC000`, so the firmware's wait never ends |
+| `PWR_CSR1` | `0x0000E000` | `ACTVOS` = 3 and `ACTVOSRDY` set: the same state, as the active status |
+| `PWR_CR1` | `0xF000C100` | `DBP` (backup domain write enable) set, `SVOS` = 3; the top four bits are set and unnamed in the SVD |
+| `PWR_CR2` | `0x00010001` | `BREN` (backup regulator on) and `BRRDY` (ready, bit 16) set |
+| `PWR_CR3` | `0x05000042` | `LDOEN` set, `USB33DEN` and `USB33RDY` set; bit 6 is unnamed |
+| `SYSCFG_PWRCR` | `0x00000081` | `ODEN` = 1 (overdrive); bit 7 is unnamed |
+| `RCC_CFGR` | `0x0000001B` | system clock switched to PLL1 and the switch status agrees |
+| `RCC_CSR` | `0x00000003` | `LSION` and `LSIRDY` |
+| `RCC_BDCR` | `0x00008113` | `LSEON` and `LSERDY`, `LSEDRV` = 2, `RTCSRC` = 1 (LSE) and `RTCEN` |
+| `RCC_AHB4ENR` | `0x100001FF` | GPIO A to I clocks and backup SRAM on |
+| `RCC_APB4ENR` | `0x00010002` | `SYSCFG` and the RTC APB clock on |
+| `RTC_ISR` | `0x00000000` | the RTC is not in initialisation mode |
+| `RNG_CR` / `RNG_SR` | `0x00000004` / `0x00000001` | `RNGEN` set, `DRDY` set |
+| `USART1_CR1` | `0x2000002D` | `UE`, `RE`, `TE`, `RXNEIE`, `FIFOEN` |
+| `USART1_ISR` | `0x08E210D0` | `TXFT`, `TXFE`, `REACK`, `TEACK`, `CMF`, `EOBF`, `TXE`, `TC` and `IDLE` set |
+| `FLASH_ACR` | `0x00000032` | two wait states, programming delay 3 |
+| `FLASH_CR1` / `FLASH_SR1` | `0x00000030` / `0x00040000` | `FLASH_SR1` bit 18 set (unchecked which flag) |
+
+Reading `0xE000E100` (the NVIC) from BASIC gives `Address`, so the private bus cannot be probed this way.
