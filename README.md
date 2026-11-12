@@ -16,6 +16,23 @@ Early planning. Nothing runs yet. Progress is tracked in the GitHub issues and m
 - Official MMBasic firmware, currently v7.00.00b5 (`MM.VER` 7.000005).
 - CMM2 only. PicoMite emulation is out of scope for now.
 
+## Layout
+
+The repository is a Cargo workspace with two crates:
+
+- `cmm2-core`: the emulation (CPU, memory, peripherals). It has no SDL or UI dependency, so it can
+  be tested on its own and reused.
+- `cmm2-emulator`: the front end binary. It owns the window and input and drives `cmm2-core`.
+
+They are separate so the SDL front end stays out of the emulation code.
+
+## Building
+
+```
+cargo build
+cargo test
+```
+
 ## Firmware and documentation are not included
 
 You supply your own copy of the official firmware. This repository does not contain the firmware

@@ -1,0 +1,9 @@
+[package]
+name = "cmm2-emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cmm2-core = { path = "../cmm2-core" }
