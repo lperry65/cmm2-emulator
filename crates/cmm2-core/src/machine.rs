@@ -7,6 +7,7 @@ use crate::memory::MemoryMap;
 use crate::pwr::{PWR_BASE, PWR_SIZE, Pwr};
 use crate::rcc::{RCC_BASE, RCC_SIZE, Rcc};
 use crate::rtc::{RTC_BASE, RTC_SIZE, Rtc};
+use crate::timer::{TIM5_BASE, TIM16_BASE, TIMER_SIZE, Timer};
 
 pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
     let mut memory = MemoryMap::new();
@@ -20,6 +21,20 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
     memory
         .map_peripheral(RTC_BASE, RTC_SIZE, Box::new(Rtc::new()))
         .expect("RTC window is clear of RAM");
+    memory
+        .map_peripheral(
+            TIM5_BASE,
+            TIMER_SIZE,
+            Box::new(Timer::new(TIM5_BASE, 32, memory.clock())),
+        )
+        .expect("TIM5 window is clear of RAM");
+    memory
+        .map_peripheral(
+            TIM16_BASE,
+            TIMER_SIZE,
+            Box::new(Timer::new(TIM16_BASE, 16, memory.clock())),
+        )
+        .expect("TIM16 window is clear of RAM");
     let flash = FlashController::new(irqs.clone(), memory.flash_ops());
     memory
         .map_peripheral(FLASH_REGS_BASE, FLASH_REGS_SIZE, Box::new(flash))
@@ -84,6 +99,27 @@ mod tests {
         m.write32(0x5200_2104, 0x4567_0123); // FLASH_KEYR2
         m.write32(0x5200_2104, 0xCDEF_89AB);
         assert_eq!(m.read32(0x5200_210C), 0x30);
+    }
+
+    #[test]
+    fn tim16_and_tim5_count_from_the_maps_clock() {
+        let mut m = cmm2_memory(&Irqs::new());
+        let clock = m.clock();
+        m.write32(TIM16_BASE + 0x28, 239); // PSC
+        m.write32(TIM16_BASE, 1); // CEN
+        m.write32(TIM5_BASE, 1);
+        clock.set(480 * 1234);
+        assert_eq!(m.read32(TIM16_BASE + 0x24), 1234);
+        assert_eq!(m.read32(TIM5_BASE + 0x24), 480 * 1234 / 2);
+        assert!(m.take_unmapped().is_empty());
+    }
+
+    #[test]
+    fn the_other_timers_are_stubs() {
+        let mut m = cmm2_memory(&Irqs::new());
+        m.write32(0x4000_0024, 77); // TIM2_CNT
+        m.clock().set(100_000);
+        assert_eq!(m.read32(0x4000_0024), 77);
     }
 
     #[test]

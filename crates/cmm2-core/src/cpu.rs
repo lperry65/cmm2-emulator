@@ -16,6 +16,7 @@ use zmu_cortex_m::decoder::Decoder;
 use zmu_cortex_m::executor::Executor;
 use zmu_cortex_m::peripheral::nvic::NVIC;
 
+use crate::clock::Clock;
 use crate::firmware::{FLASH_BASE, FLASH_SIZE, Firmware};
 use crate::flash_ops::{FlashOp, FlashOps};
 use crate::irq::Irqs;
@@ -121,6 +122,7 @@ pub struct Cpu {
     irqs: Irqs,
     flash_ops: FlashOps,
     pc: Rc<Cell<u32>>,
+    clock: Clock,
 }
 
 impl Cpu {
@@ -131,6 +133,7 @@ impl Cpu {
     pub fn new(firmware: &Firmware, memory: MemoryMap, irqs: Irqs) -> Result<Cpu, CpuError> {
         let pc = memory.pc_cell();
         let flash_ops = memory.flash_ops();
+        let clock = memory.clock();
         let memory = Rc::new(RefCell::new(memory));
 
         let mut flash = vec![0xFF; FLASH_SIZE];
@@ -156,6 +159,7 @@ impl Cpu {
             irqs,
             flash_ops,
             pc,
+            clock,
         })
     }
 
@@ -164,6 +168,8 @@ impl Cpu {
     /// instruction caused one.
     pub fn step(&mut self) -> Option<Fault> {
         self.pc.set(self.processor.get_pc());
+        // Before the instruction, so a register it reads sees the time at its start.
+        self.clock.set(self.processor.cycle_count);
         self.processor.step();
         if let Some(raised) = self.irqs.take() {
             for (index, bits) in raised.into_iter().enumerate() {
@@ -296,6 +302,7 @@ mod tests {
     use super::*;
     use crate::{AccessKind, FLASH_BASE, Firmware, PeripheralAccess, Svd, UnmappedAccess};
     use crate::{FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController};
+    use crate::{TIM16_BASE, TIMER_SIZE, Timer};
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
@@ -703,6 +710,40 @@ mod tests {
         cpu.run(200);
         assert_eq!(cpu.memory().read32(0x2400_0000), 1);
         assert_eq!(cpu.memory().read32(SR2), 0);
+    }
+
+    #[test]
+    fn the_clock_is_the_core_cycle_count_at_the_start_of_the_instruction() {
+        let mut cpu = cpu(&SPIN);
+        cpu.run(10);
+        let before = cpu.cycle_count();
+        cpu.step();
+        assert_eq!(cpu.memory().clock().now(), before);
+        assert!(before > 0);
+    }
+
+    #[test]
+    fn a_timer_counter_advances_with_the_instructions_between_two_reads() {
+        // Reads TIM16_CNT into r1, runs 10 nops, reads it into r2.
+        let mut ops = vec![Load(0, 0), Raw(0x6801)]; // ldr r1,[r0]
+        ops.extend((0..10).map(|_| Raw(0xBF00)));
+        ops.extend([Raw(0x6802), Raw(SPIN_HERE)]); // ldr r2,[r0]
+        let code = assemble(&ops, &[TIM16_BASE + 0x24]);
+        let mut memory = MemoryMap::new();
+        let timer = Timer::new(TIM16_BASE, 16, memory.clock());
+        memory
+            .map_peripheral(TIM16_BASE, TIMER_SIZE, Box::new(timer))
+            .unwrap();
+        memory.write32(TIM16_BASE, 1); // CEN
+        let mut cpu = Cpu::new(&image(&code, &[]), memory, Irqs::new()).unwrap();
+        cpu.run(14);
+        // Each instruction takes at least a cycle and a tick is two.
+        assert!(
+            cpu.reg(2) - cpu.reg(1) >= 5,
+            "{} {}",
+            cpu.reg(1),
+            cpu.reg(2)
+        );
     }
 
     #[test]

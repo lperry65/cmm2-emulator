@@ -8,6 +8,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::rc::Rc;
 
+use crate::clock::Clock;
 use crate::flash_ops::FlashOps;
 use crate::peripheral::{Peripheral, PeripheralAccess, RegisterStub};
 use crate::svd::Svd;
@@ -125,6 +126,7 @@ pub struct MemoryMap {
     dropped: u64,
     pc: Rc<Cell<u32>>,
     flash_ops: FlashOps,
+    clock: Clock,
 }
 
 impl Default for MemoryMap {
@@ -151,6 +153,7 @@ impl MemoryMap {
             dropped: 0,
             pc: Rc::new(Cell::new(0)),
             flash_ops: FlashOps::new(),
+            clock: Clock::new(),
         }
     }
 
@@ -163,6 +166,11 @@ impl MemoryMap {
     /// The queue of flash changes that the flash controller makes and the CPU carries out.
     pub fn flash_ops(&self) -> FlashOps {
         self.flash_ops.clone()
+    }
+
+    /// The machine's time, which the CPU keeps up to date. It is 0 until a CPU is attached.
+    pub fn clock(&self) -> Clock {
+        self.clock.clone()
     }
 
     pub fn read8(&mut self, addr: u32) -> u8 {

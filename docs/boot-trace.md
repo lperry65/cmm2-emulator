@@ -60,6 +60,20 @@ polls `RNG_SR` (44,757 reads). One read goes outside the flash, 2 bytes at `0x08
 `0x0800419E`, and the machine logs it as unmapped. The next models are a counting `TIM16` (and
 `TIM5`, the free-running counter) and the RNG.
 
+**Then, with the counting timers modelled:** the delay loops complete, and the firmware's longer
+behaviour shows. The loop at `0x0809DE8A` reads `GPIOB_IDR` bit 13 (pin PB13, `HAL_GPIO_ReadPin`
+on `GPIOB`, `0x2000`); while it reads low the firmware waits 300 ms (about 94 million emulated
+instructions, since a millisecond is 1000 timer ticks of 504 core cycles) and tries again, up to
+three times, the first at about 1.75 million instructions and the retries at about 96 and 191
+million. The stub reads the pin low every time. At about 288.8 million instructions, soon after the
+third retry, the core takes an undefined instruction hard fault with `pc=0x40017414`, an address in
+the peripheral window, while the SysTick handler is active, and the run ends in the default
+fault handler. I have not yet found how execution got there. One guess is that a pin that stays low
+sends the firmware down a path such as entering the ROM bootloader, which cannot run here (the
+board has a programming jumper); another is a core bug. The first thing to try is a `GPIOB_IDR`
+that reads the way the board does, so the next model is the GPIO ports, with the input levels the
+board really has.
+
 ## What happens before it
 
 | Instruction | What |
