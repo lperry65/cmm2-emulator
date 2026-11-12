@@ -23,6 +23,11 @@ The firmware needs a few things zmu does not do, so I changed the following.
 - Core registers: AIRCR, DFSR, MMFAR, BFAR and AFSR can now be written (they were
   read-only). AIRCR only accepts a write that carries the VECTKEY, and reads 0xFA05_0000
   before it is written.
+- System reset: a write to AIRCR with the VECTKEY and SYSRESETREQ sets
+  `Processor::system_reset_requested`, and the owner of the processor does the reset. Reset now
+  also clears the interrupt controller, SysTick and the system-control registers (SHPR, SCR,
+  CCR, AIRCR, DWT control) to the values `Processor::new` gives them. The cycle counter and
+  the instruction counts are kept.
 - CCR and zero divide: SDIV and UDIV trap on division by zero only when
   CCR.DIV_0_TRP is set; before, they always trapped.
 - Flash writes: stores to flash are allowed, and the cached decoded

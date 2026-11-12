@@ -1,7 +1,7 @@
 //! The reset and clock controller. The clocks start instantly: the firmware only waits for
 //! the ready flags, so they read as set as soon as what they wait for is switched on.
 
-use crate::peripheral::StubRegisters;
+use crate::peripheral::{ResetCause, StubRegisters};
 use crate::registers::{Registers, WordAccess, follow};
 use crate::svd::Svd;
 
@@ -13,6 +13,7 @@ const CR: u32 = 0x00;
 const CFGR: u32 = 0x10;
 const BDCR: u32 = 0x70;
 const CSR: u32 = 0x74;
+const RSR: u32 = 0xD0;
 
 // RCC_CR: each ready bit follows the on bit next to it in this table.
 const READY_FOLLOWS_ON: [(u32, u32); 7] = [
@@ -34,12 +35,22 @@ const LSEON: u32 = 1 << 0; // RCC_BDCR
 const LSERDY: u32 = 1 << 1; // RCC_BDCR
 const LSION: u32 = 1 << 0; // RCC_CSR
 const LSIRDY: u32 = 1 << 1; // RCC_CSR
+// RCC_RSR: the flags the model sets, the bit that clears them all, and every flag bit.
+const RMVF: u32 = 1 << 16;
+const PINRSTF: u32 = 1 << 22;
+const SFTRSTF: u32 = 1 << 24;
+const POWER_ON_FLAGS: u32 = 1 << 21 | 1 << 22 | 1 << 23; // BORRSTF, PINRSTF, PORRSTF
+const FLAGS: u32 = 0x55FA_0000;
 
 /// Plain registers with the SVD reset values, except for the status bits that the hardware
 /// computes. Those are worked out on every read and ignore what is written to them.
+///
+/// RCC_RSR holds why the chip last reset, and RMVF clears it. RCC_BDCR is in the backup
+/// domain, so a system reset leaves it as it was.
 #[derive(Debug)]
 pub struct RccRegisters {
     stored: StubRegisters,
+    rsr: u32,
 }
 
 impl Registers for RccRegisters {
@@ -54,12 +65,30 @@ impl Registers for RccRegisters {
             CFGR => value & !SWS | (value & SW) << 3,
             BDCR => follow(value, LSEON, LSERDY),
             CSR => follow(value, LSION, LSIRDY),
+            RSR => self.rsr,
             _ => value,
         }
     }
 
     fn write(&mut self, offset: u32, value: u32, mask: u32) {
-        self.stored.write(offset, value, mask);
+        if offset == RSR {
+            if value & mask & RMVF != 0 {
+                self.rsr &= !FLAGS;
+            }
+        } else {
+            self.stored.write(offset, value, mask);
+        }
+    }
+
+    fn reset(&mut self, cause: ResetCause) {
+        let bdcr = self.stored.read(BDCR);
+        self.stored.reset(cause);
+        self.stored.write(BDCR, bdcr, u32::MAX);
+        // A software reset sets the pin flag too, as on the chip.
+        self.rsr = match cause {
+            ResetCause::PowerOn => POWER_ON_FLAGS,
+            ResetCause::Software => SFTRSTF | PINRSTF,
+        };
     }
 }
 
@@ -69,6 +98,7 @@ impl Rcc {
     pub fn new() -> Rcc {
         WordAccess::wrap(RccRegisters {
             stored: StubRegisters::with_reset_values(RCC_BASE, Svd::stm32h743()),
+            rsr: POWER_ON_FLAGS,
         })
     }
 }
@@ -76,7 +106,7 @@ impl Rcc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MemoryMap;
+    use crate::{MemoryMap, ResetCause};
 
     const CR: u32 = RCC_BASE;
     const CFGR: u32 = RCC_BASE + 0x10;
@@ -230,5 +260,48 @@ mod tests {
         m.write32(RCC_BASE + RCC_SIZE - 4, 5);
         assert_eq!(m.read32(RCC_BASE + RCC_SIZE - 4), 5);
         assert!(m.take_unmapped().is_empty());
+    }
+
+    const RSR: u32 = RCC_BASE + 0xD0;
+    const POWER_ON_FLAGS: u32 = 0x00E0_0000;
+    const SOFTWARE_FLAGS: u32 = 0x0140_0000;
+
+    #[test]
+    fn reset_puts_registers_back_but_keeps_bdcr() {
+        let mut m = machine();
+        m.write32(CR, ON_BITS);
+        m.write32(PLL1DIVR, 0x0102_03FF);
+        m.write32(BDCR, 0x0000_8111);
+        m.reset_peripherals(ResetCause::Software);
+        assert_eq!(m.read32(CR), 0x0000_C1A7);
+        assert_eq!(m.read32(PLL1DIVR), 0x0101_0280);
+        assert_eq!(m.read32(BDCR), 0x0000_8113);
+    }
+
+    #[test]
+    fn rsr_reads_the_power_on_flags_at_construction() {
+        let mut m = machine();
+        assert_eq!(m.read32(RSR), POWER_ON_FLAGS);
+    }
+
+    #[test]
+    fn rsr_says_software_reset_after_one() {
+        let mut m = machine();
+        m.reset_peripherals(ResetCause::Software);
+        assert_eq!(m.read32(RSR), SOFTWARE_FLAGS);
+        m.reset_peripherals(ResetCause::PowerOn);
+        assert_eq!(m.read32(RSR), POWER_ON_FLAGS);
+    }
+
+    #[test]
+    fn rsr_flags_clear_with_rmvf_and_nothing_else_writes_them() {
+        let mut m = machine();
+        m.write32(RSR, !RMVF);
+        assert_eq!(m.read32(RSR), POWER_ON_FLAGS);
+        m.write32(RSR, 1 << 16);
+        assert_eq!(m.read32(RSR), 0);
+        m.reset_peripherals(ResetCause::Software);
+        m.write32(RSR, 1 << 16 | 1 << 24);
+        assert_eq!(m.read32(RSR), 0);
     }
 }

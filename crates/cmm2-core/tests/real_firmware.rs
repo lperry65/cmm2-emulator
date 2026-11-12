@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cmm2_core::{
-    Cpu, FLASH_BASE, FLASH_SIZE, Firmware, Irqs, PeripheralAccess, Stop, Svd, cmm2_memory,
+    Console, Cpu, FLASH_BASE, FLASH_SIZE, Firmware, Irqs, PeripheralAccess, Stop, Svd, cmm2_memory,
 };
 
 fn firmware() -> Firmware {
@@ -253,4 +253,58 @@ fn real_firmware_receives_a_key_from_the_console() {
     let after = String::from_utf8_lossy(&console.take_output()).into_owned();
     // Measured: the key is echoed and the next setup prompt follows.
     assert!(after.contains("Enter time (24hr clock)"), "{after:?}");
+}
+
+/// Runs in slices until the console output so far contains `text`, or `cap` instructions have
+/// run. Returns the output so far.
+fn run_to_text(cpu: &mut Cpu, console: &Console, text: &str, cap: u64) -> String {
+    let limit = cpu.instruction_count() + cap;
+    let mut output = String::new();
+    while !output.contains(text) && cpu.instruction_count() < limit {
+        let stop = cpu.run(1_000_000);
+        assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
+        output.push_str(&String::from_utf8_lossy(&console.take_output()));
+    }
+    assert!(output.contains(text), "no {text:?} in {output:?}");
+    output
+}
+
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_reboots_after_the_date_prompt() {
+    let firmware = firmware();
+    let irqs = Irqs::new();
+    let memory = cmm2_memory(&irqs);
+    let console = memory.console();
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
+
+    let mut output = run_to_text(&mut cpu, &console, "Keyboard type", 300_000_000);
+    println!("keyboard prompt at {}", cpu.instruction_count());
+    console.push_input(b"1");
+    output += &run_to_text(&mut cpu, &console, "HH:MM:SS", 20_000_000);
+    println!("time prompt at {}", cpu.instruction_count());
+    console.push_input(b"12:00:00\r");
+    output += &run_to_text(&mut cpu, &console, "DD/MM/YY", 20_000_000);
+    println!("date prompt at {}", cpu.instruction_count());
+    console.push_input(b"12/11/26\r");
+    assert_eq!(cpu.resets(), 0);
+    while cpu.resets() == 0 {
+        assert!(cpu.instruction_count() < 250_000_000, "no reset");
+        let stop = cpu.run(1_000_000);
+        assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
+        output.push_str(&String::from_utf8_lossy(&console.take_output()));
+    }
+    println!("reset at {}", cpu.instruction_count());
+    let before_reboot = output.len();
+    output += &run_to_text(&mut cpu, &console, "\r\n> ", 500_000_000);
+    println!("second prompt at {}", cpu.instruction_count());
+
+    assert_eq!(cpu.resets(), 1);
+    assert_eq!(output.matches("MMBasic Version").count(), 2, "{output:?}");
+    // Measured: the second banner is the board's own, 480MHz, where the first said 504MHz,
+    // and no setup questions follow it.
+    let second = &output[before_reboot..];
+    assert!(second.contains("480MHz Colour Maximite 2 G2"), "{second:?}");
+    assert!(!second.contains("Initial setup"), "{second:?}");
+    assert!(second.ends_with("\r\n> "), "{second:?}");
 }

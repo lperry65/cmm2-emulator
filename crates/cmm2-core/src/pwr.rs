@@ -1,7 +1,7 @@
 //! The power controller. The supply settles instantly: the firmware only waits for the
 //! ready flags, so they read as set as soon as what they wait for is enabled.
 
-use crate::peripheral::StubRegisters;
+use crate::peripheral::{ResetCause, StubRegisters};
 use crate::registers::{Registers, WordAccess, follow};
 use crate::svd::Svd;
 
@@ -51,6 +51,11 @@ impl Registers for PwrRegisters {
             self.stored.write(offset, value, mask);
         }
     }
+
+    // A system reset puts the power controller back to its power-on state.
+    fn reset(&mut self, cause: ResetCause) {
+        self.stored.reset(cause);
+    }
 }
 
 pub type Pwr = WordAccess<PwrRegisters>;
@@ -65,7 +70,7 @@ impl Pwr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MemoryMap;
+    use crate::{MemoryMap, ResetCause};
 
     const CR1: u32 = PWR_BASE;
     const CSR1: u32 = PWR_BASE + 0x04;
@@ -206,5 +211,15 @@ mod tests {
         m.write32(PWR_BASE + PWR_SIZE - 4, 5);
         assert_eq!(m.read32(PWR_BASE + PWR_SIZE - 4), 5);
         assert!(m.take_unmapped().is_empty());
+    }
+
+    #[test]
+    fn reset_puts_written_registers_back() {
+        let mut m = machine();
+        let before = m.read32(CR3);
+        m.write32(CR3, before | 1 << 24 | 1);
+        assert_ne!(m.read32(CR3), before);
+        m.reset_peripherals(ResetCause::Software);
+        assert_eq!(m.read32(CR3), before);
     }
 }

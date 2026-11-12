@@ -144,6 +144,30 @@ restarts with the options it just stored. The core stores the `AIRCR` write and 
 reset the peripherals, but not the flash, the RAM, the RTC or the backup domain, and the reset cause the
 firmware reads from `RCC_RSR` (`PINRSTF`, `PORRSTF`, `SFTRSTF`) has to say what happened.
 
+**With the system reset: the BASIC prompt.** The core now flags `SYSRESETREQ`, and the CPU wrapper restarts the
+machine: the peripherals go back to their reset values (the RTC and `RCC_BDCR` do not, they are in the backup
+domain), pending interrupts and queued flash operations are dropped, the interrupt controller and SysTick
+start clean, and the core restarts from the vector table. Flash and RAM keep their contents, so the options
+the firmware just saved are still there. `RCC_RSR` reads the power-on flags at first and `SFTRSTF | PINRSTF`
+after the reset. The firmware boots a second time with no questions and prints:
+
+```
+480MHz Colour Maximite 2 G2
+MMBasic Version 7.00.00b5
+Copyright 2011-2026 Geoff Graham
+Copyright 2016-2026 Peter Mather
+Copyright 2025-2026 Gerry Allardice
+
+>
+```
+
+That first line is exactly what the real board's `OPTION LIST` begins with. The first boot's "504MHz Colour
+Maximite 2" was just the factory defaults before the options were saved, not a difference in the emulated
+hardware. The whole path, from power on to the prompt with the scripted answers, is about 600 million
+instructions: the first boot reaches the keyboard question at about 198 million, the date prompt at about 200
+million, the reset at about 201 million, and the second boot reaches the prompt at about 612 million. In a
+release build that is 20 to 30 seconds. After the prompt the firmware sits in an idle polling loop.
+
 ## What happens before it
 
 | Instruction | What |

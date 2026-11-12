@@ -1,6 +1,7 @@
 //! The GPIO ports. Each port has its own reset values, and the input data register is worked
 //! out from the pin configuration and the levels the real board has on its pins.
 
+use crate::peripheral::ResetCause;
 use crate::registers::{Registers, WordAccess};
 
 pub const GPIO_BASE: u32 = 0x5802_0000;
@@ -49,6 +50,7 @@ const AF_HIGH: [u16; GPIO_PORTS] = [
 
 #[derive(Debug)]
 pub struct GpioRegisters {
+    port: usize,
     moder: u32,
     otyper: u32,
     ospeedr: u32,
@@ -62,6 +64,23 @@ pub struct GpioRegisters {
 }
 
 impl GpioRegisters {
+    fn new(port: usize) -> GpioRegisters {
+        let [moder, ospeedr, pupdr] = RESETS[port];
+        GpioRegisters {
+            port,
+            moder,
+            otyper: 0,
+            ospeedr,
+            pupdr,
+            odr: 0,
+            lckr: 0,
+            afrl: 0,
+            afrh: 0,
+            held_low: HELD_LOW[port],
+            af_high: AF_HIGH[port],
+        }
+    }
+
     // The level of pin `pin` when nothing on the chip drives it. A pin with no pull has no
     // defined level; it reads low here.
     fn input_level(&self, pin: u32) -> bool {
@@ -124,6 +143,11 @@ impl Registers for GpioRegisters {
             _ => {}
         }
     }
+
+    // A system reset puts the port back to its reset values.
+    fn reset(&mut self, _cause: ResetCause) {
+        *self = GpioRegisters::new(self.port);
+    }
 }
 
 pub type Gpio = WordAccess<GpioRegisters>;
@@ -131,27 +155,15 @@ pub type Gpio = WordAccess<GpioRegisters>;
 impl Gpio {
     /// `port` is 0 for GPIOA.
     pub fn new(port: usize) -> Gpio {
-        let [moder, ospeedr, pupdr] = RESETS[port];
-        WordAccess::wrap(GpioRegisters {
-            moder,
-            otyper: 0,
-            ospeedr,
-            pupdr,
-            odr: 0,
-            lckr: 0,
-            afrl: 0,
-            afrh: 0,
-            held_low: HELD_LOW[port],
-            af_high: AF_HIGH[port],
-        })
+        WordAccess::wrap(GpioRegisters::new(port))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MemoryMap;
     use crate::svd::Svd;
+    use crate::{MemoryMap, ResetCause};
 
     const GPIOA: u32 = GPIO_BASE;
     const GPIOB: u32 = GPIO_BASE + GPIO_PORT_SIZE;
@@ -381,5 +393,20 @@ mod tests {
                 (b'A' + i as u8) as char
             );
         }
+    }
+
+    #[test]
+    fn reset_puts_the_registers_back_to_the_table() {
+        let mut m = machine();
+        m.write32(GPIOB + MODER, 0x1234_5678);
+        m.write32(GPIOB + ODR, 0xFF);
+        m.write32(GPIOB + AFRL, 0x1111_1111);
+        m.write32(GPIOA + MODER, 0);
+        m.reset_peripherals(ResetCause::Software);
+        assert_eq!(m.read32(GPIOB + MODER), 0xFFFF_FEBF);
+        assert_eq!(m.read32(GPIOB + ODR), 0);
+        assert_eq!(m.read32(GPIOB + AFRL), 0);
+        assert_eq!(m.read32(GPIOA + MODER), 0xABFF_FFFF);
+        assert_eq!(m.read32(GPIOB + PUPDR), 0x0000_0100);
     }
 }

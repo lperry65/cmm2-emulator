@@ -21,6 +21,7 @@ use crate::firmware::{FLASH_BASE, FLASH_SIZE, Firmware};
 use crate::flash_ops::{FlashOp, FlashOps};
 use crate::irq::Irqs;
 use crate::memory::MemoryMap;
+use crate::peripheral::ResetCause;
 
 /// Cortex-M7 r1p1.
 const CPUID: u32 = 0x411F_C271;
@@ -116,6 +117,16 @@ impl Bus for Bridge {
     }
 }
 
+/// Starts the core from the vector table at the start of flash.
+fn boot(processor: &mut Processor) -> Result<(), CpuError> {
+    processor.vtor = FLASH_BASE;
+    processor
+        .reset()
+        .map_err(|fault| CpuError::Reset(fault.to_string()))?;
+    processor.running = true;
+    Ok(())
+}
+
 pub struct Cpu {
     processor: Processor,
     memory: Rc<RefCell<MemoryMap>>,
@@ -123,6 +134,7 @@ pub struct Cpu {
     flash_ops: FlashOps,
     pc: Rc<Cell<u32>>,
     clock: Clock,
+    resets: u32,
 }
 
 impl Cpu {
@@ -147,11 +159,7 @@ impl Cpu {
         processor.device(Some(Box::new(Bridge(memory.clone()))));
         processor.fault_trap_mode(FaultTrapMode::all());
         processor.cpuid = CPUID;
-        processor.vtor = FLASH_BASE;
-        processor
-            .reset()
-            .map_err(|fault| CpuError::Reset(fault.to_string()))?;
-        processor.running = true;
+        boot(&mut processor)?;
 
         Ok(Cpu {
             processor,
@@ -160,6 +168,7 @@ impl Cpu {
             flash_ops,
             pc,
             clock,
+            resets: 0,
         })
     }
 
@@ -171,6 +180,9 @@ impl Cpu {
         // Before the instruction, so a register it reads sees the time at its start.
         self.clock.set(self.processor.cycle_count);
         self.processor.step();
+        if self.processor.system_reset_requested {
+            self.reset();
+        }
         if let Some(raised) = self.irqs.take() {
             for (index, bits) in raised.into_iter().enumerate() {
                 self.processor.nvic_write_ispr(index, bits);
@@ -288,6 +300,26 @@ impl Cpu {
         self.processor.read32(addr).unwrap_or(0)
     }
 
+    /// How many system resets have happened since the CPU was made.
+    pub fn resets(&self) -> u32 {
+        self.resets
+    }
+
+    /// Resets the machine as a system reset does: the core restarts from the vector table,
+    /// the peripherals go back to their reset state and anything they had raised or queued is
+    /// dropped. Flash and RAM keep their contents, and time keeps running.
+    pub fn reset(&mut self) {
+        // The peripherals that restart their clocks read the time as it is now.
+        self.clock.set(self.processor.cycle_count);
+        self.memory
+            .borrow_mut()
+            .reset_peripherals(ResetCause::Software);
+        self.irqs.clear();
+        self.flash_ops.clear();
+        boot(&mut self.processor).expect("the vector table is in flash, which always reads");
+        self.resets += 1;
+    }
+
     pub fn memory(&self) -> RefMut<'_, MemoryMap> {
         self.memory.borrow_mut()
     }
@@ -302,6 +334,7 @@ mod tests {
     use super::*;
     use crate::{AccessKind, FLASH_BASE, Firmware, PeripheralAccess, Svd, UnmappedAccess};
     use crate::{Console, FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController, cmm2_memory};
+    use crate::{GPIO_PORT_SIZE, Gpio, RCC_BASE, RCC_SIZE, RTC_BASE, RTC_SIZE, Rcc, Rtc};
     use crate::{TIM16_BASE, TIMER_SIZE, Timer};
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -921,5 +954,201 @@ mod tests {
             wrong.is_empty(),
             "core_register is out of step with zmu at {shown:?}"
         );
+    }
+
+    const AIRCR: u32 = 0xE000_ED0C;
+    const SYSRESETREQ: u32 = 0x05FA_0004;
+    const FLASH_WORD: u32 = 0x081E_0000;
+    const BOOTS: u32 = 0x2400_0100;
+    // Where the AIRCR store and the spin loop are in `boot_program`.
+    const RESET_REQUEST: u32 = CODE + 26;
+    const BOOT_SPIN: u32 = CODE + 30;
+
+    /// Counts its boots in AXI SRAM and stores the count of the first boot in flash. While the
+    /// count is below `limit` it asks for a system reset, then it enables interrupts and spins.
+    /// Until then they are masked.
+    fn boot_program(limit: u16) -> Vec<u16> {
+        assemble(
+            &[
+                Raw(0xB672), // cpsid i
+                Load(0, 0),
+                Raw(0x6801), // ldr r1,[r0]
+                Raw(0x3101), // adds r1,#1
+                Raw(0x6001), // str r1,[r0]
+                Raw(0x2901), // cmp r1,#1
+                Raw(0xD101), // bne +2
+                Load(4, 1),
+                Raw(0x6021), // str r1,[r4]
+                Raw(0x2900 | limit),
+                Raw(0xDA02), // bge spin
+                Load(2, 2),
+                Load(3, 3),
+                Raw(0x6013), // str r3,[r2]
+                Raw(0xB662), // cpsie i
+                Raw(SPIN_HERE),
+            ],
+            &[BOOTS, FLASH_WORD, AIRCR, SYSRESETREQ],
+        )
+    }
+
+    fn boot_cpu(limit: u16) -> Cpu {
+        let code = [boot_program(limit), COUNT_IN_AXI.to_vec()].concat();
+        let handler = 2 * boot_program(limit).len() as u32;
+        let image = image(&code, &[(5, handler)]);
+        Cpu::new(&image, MemoryMap::new(), Irqs::new()).unwrap()
+    }
+
+    #[test]
+    fn a_program_that_resets_itself_boots_again() {
+        let mut cpu = boot_cpu(3);
+        cpu.run(200);
+        assert_eq!(cpu.memory().read32(BOOTS), 3);
+        assert_eq!(cpu.resets(), 2);
+        assert_eq!(cpu.pc(), BOOT_SPIN);
+    }
+
+    #[test]
+    fn a_reset_keeps_time_and_counts_going() {
+        let mut cpu = boot_cpu(2);
+        cpu.run_until(100, Some(RESET_REQUEST));
+        let (instructions, cycles) = (cpu.instruction_count(), cpu.cycle_count());
+        cpu.step();
+        assert_eq!(cpu.resets(), 1);
+        assert_eq!(cpu.instruction_count(), instructions + 1);
+        assert!(cpu.cycle_count() > cycles);
+        assert_eq!(cpu.sp(), SP);
+        assert_eq!(cpu.pc(), CODE);
+    }
+
+    #[test]
+    fn flash_survives_a_reset() {
+        let mut cpu = boot_cpu(3);
+        assert_eq!(cpu.read32(FLASH_WORD), 0xFFFF_FFFF);
+        cpu.run(200);
+        assert_eq!(cpu.resets(), 2);
+        // Only the first boot stores it.
+        assert_eq!(cpu.read32(FLASH_WORD), 1);
+    }
+
+    #[test]
+    fn the_host_can_reset_the_machine() {
+        let mut cpu = cpu(&SPIN);
+        cpu.run(10);
+        cpu.reset();
+        assert_eq!(cpu.resets(), 1);
+        assert_eq!(cpu.pc(), CODE);
+        assert_eq!(cpu.reg(4), 0);
+    }
+
+    #[test]
+    fn peripherals_reset_but_the_backup_domain_does_not() {
+        const GPIOB_MODER: u32 = 0x5802_0400;
+        const RCC_CR: u32 = 0x5802_4400;
+        const RCC_BDCR: u32 = 0x5802_4470;
+        const RCC_RSR: u32 = 0x5802_44D0;
+        const RTC_PRER: u32 = 0x5800_4010;
+        let code = assemble(
+            &[
+                Load(0, 0),
+                Load(1, 1),
+                Raw(STR_R1_R0),
+                Load(0, 2),
+                Load(1, 3),
+                Raw(STR_R1_R0),
+                Load(0, 4),
+                Load(1, 5),
+                Raw(STR_R1_R0),
+                Load(0, 6),
+                Load(1, 7),
+                Raw(STR_R1_R0),
+                Load(2, 8),
+                Load(3, 9),
+                Raw(0x6013), // str r3,[r2]
+                Raw(SPIN_HERE),
+            ],
+            &[
+                GPIOB_MODER,
+                0x1234_5678,
+                RCC_CR,
+                0x0001_0083,
+                RCC_BDCR,
+                0x0000_8111,
+                RTC_PRER,
+                0x007F_00FF,
+                AIRCR,
+                SYSRESETREQ,
+            ],
+        );
+        let mut memory = MemoryMap::new();
+        memory
+            .map_peripheral(GPIOB_MODER, GPIO_PORT_SIZE, Box::new(Gpio::new(1)))
+            .unwrap();
+        memory
+            .map_peripheral(RCC_BASE, RCC_SIZE, Box::new(Rcc::new()))
+            .unwrap();
+        memory
+            .map_peripheral(RTC_BASE, RTC_SIZE, Box::new(Rtc::new()))
+            .unwrap();
+        let mut cpu = Cpu::new(&image(&code, &[]), memory, Irqs::new()).unwrap();
+        while cpu.resets() == 0 {
+            assert!(cpu.instruction_count() < 100);
+            cpu.step();
+        }
+        let mut memory = cpu.memory();
+        assert_eq!(memory.read32(GPIOB_MODER), 0xFFFF_FEBF);
+        assert_eq!(memory.read32(RCC_CR), 0x0000_C1A7);
+        assert_eq!(memory.read32(RCC_BDCR), 0x0000_8113);
+        assert_eq!(memory.read32(RTC_PRER), 0x007F_00FF);
+        assert_eq!(memory.read32(RCC_RSR), 0x0140_0000);
+    }
+
+    #[test]
+    fn the_interrupt_controller_starts_clean_after_a_reset() {
+        let mut cpu = boot_cpu(2);
+        cpu.run_until(100, Some(RESET_REQUEST));
+        cpu.processor.nvic_write_iser(0, 1 << 5);
+        cpu.processor.nvic_write_ispr(0, 1 << 5);
+        cpu.step();
+        assert_eq!(cpu.resets(), 1);
+        assert_eq!(cpu.processor.nvic_read_iser(0), 0);
+        assert_eq!(cpu.processor.nvic_read_ispr(0), 0);
+
+        // Not enabled, so the handler does not run.
+        cpu.irqs().raise(5);
+        cpu.run(100);
+        assert_eq!(cpu.memory().read32(0x2400_0000), 0);
+
+        cpu.processor.nvic_write_iser(0, 1 << 5);
+        cpu.run(100);
+        assert_eq!(cpu.memory().read32(0x2400_0000), 1);
+    }
+
+    #[test]
+    fn systick_is_off_after_a_reset() {
+        const SYST_CSR: u32 = 0xE000_E010;
+        const SYST_RVR: u32 = 0xE000_E014;
+        let mut cpu = boot_cpu(2);
+        cpu.run_until(100, Some(RESET_REQUEST));
+        cpu.processor.write32(SYST_RVR, 50).unwrap();
+        cpu.processor.write32(SYST_CSR, 0b111).unwrap();
+        cpu.step();
+        assert_eq!(cpu.resets(), 1);
+        assert_eq!(cpu.read32(SYST_CSR), 0);
+        assert_eq!(cpu.read32(SYST_RVR), 0);
+        // The vector table has no SysTick handler: one taken would fault.
+        assert_eq!(cpu.run(1000), Stop::InstructionLimit);
+        assert_eq!(cpu.pc(), BOOT_SPIN);
+    }
+
+    #[test]
+    fn queued_flash_ops_and_raised_interrupts_are_dropped_by_a_reset() {
+        let mut cpu = boot_cpu(2);
+        cpu.run_until(100, Some(RESET_REQUEST));
+        cpu.irqs().raise(5);
+        cpu.memory().flash_ops().erase(FLASH_WORD, 0x2_0000);
+        cpu.step();
+        assert_eq!(cpu.resets(), 1);
+        assert_eq!(cpu.read32(FLASH_WORD), 1);
+        assert_eq!(cpu.processor.nvic_read_ispr(0), 0);
     }
 }

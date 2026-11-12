@@ -65,7 +65,7 @@ impl Rtc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MemoryMap;
+    use crate::{MemoryMap, ResetCause};
 
     const PRER: u32 = RTC_BASE + 0x10;
     const CR: u32 = RTC_BASE + 0x08;
@@ -159,5 +159,17 @@ mod tests {
         m.write32(RTC_BASE + RTC_SIZE - 4, 5);
         assert_eq!(m.read32(RTC_BASE + RTC_SIZE - 4), 5);
         assert!(m.take_unmapped().is_empty());
+    }
+
+    #[test]
+    fn a_reset_does_not_touch_the_rtc() {
+        let mut m = machine();
+        m.write32(PRER, 0x007F_00FF);
+        m.write32(ISR_ADDR, INIT);
+        m.reset_peripherals(ResetCause::Software);
+        assert_eq!(m.read32(PRER), 0x007F_00FF);
+        assert_eq!(m.read32(ISR_ADDR), 0xE7);
+        m.reset_peripherals(ResetCause::PowerOn);
+        assert_eq!(m.read32(PRER), 0x007F_00FF);
     }
 }

@@ -6,6 +6,14 @@ use std::collections::HashMap;
 use crate::registers::{Registers, WordAccess};
 use crate::svd::Svd;
 
+/// Why the machine is being reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetCause {
+    PowerOn,
+    /// SYSRESETREQ in the core's AIRCR.
+    Software,
+}
+
 /// A device mapped into the address space. `offset` is the byte offset from the start of
 /// the window the device is mapped at, and `size` is 1, 2 or 4 bytes. The access is passed
 /// whole, never split into bytes.
@@ -13,6 +21,10 @@ pub trait Peripheral {
     /// The value is zero-extended to 32 bits.
     fn read(&mut self, offset: u32, size: u8) -> u32;
     fn write(&mut self, offset: u32, size: u8, value: u32);
+
+    /// Puts the device back as a reset leaves it. Devices that a system reset does not
+    /// touch keep this default.
+    fn reset(&mut self, _cause: ResetCause) {}
 }
 
 /// One access to a peripheral, as seen by the trace callback.
@@ -76,6 +88,11 @@ impl Registers for StubRegisters {
     fn write(&mut self, offset: u32, value: u32, mask: u32) {
         let word = self.word(offset);
         *word = *word & !mask | value & mask;
+    }
+
+    // The registers go back to their reset values.
+    fn reset(&mut self, _cause: ResetCause) {
+        self.words.clear();
     }
 }
 
@@ -289,5 +306,24 @@ mod tests {
     fn address_outside_every_register_reads_zero() {
         let mut s = with_resets();
         assert_eq!(s.read(0, 4), 0);
+    }
+
+    #[test]
+    fn reset_forgets_written_words_and_shows_the_reset_values() {
+        let mut s = with_resets();
+        s.write(0x100, 4, 0x0000_00FF);
+        s.write(0x20, 4, 7);
+        s.reset(ResetCause::Software);
+        assert_eq!(s.read(0x100, 4), 0x1122_3344);
+        assert_eq!(s.read(0x20, 4), 0);
+        assert!(s.inner().resets.is_some());
+    }
+
+    #[test]
+    fn reset_of_a_plain_stub_reads_zero() {
+        let mut s = RegisterStub::new();
+        s.write(0x20, 4, 7);
+        s.reset(ResetCause::PowerOn);
+        assert_eq!(s.read(0x20, 4), 0);
     }
 }

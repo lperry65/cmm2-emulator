@@ -176,6 +176,9 @@ pub struct Processor {
     pub icsr: u32,
     pub vtor: u32,
     pub aircr: u32,
+    /// Set when the program writes AIRCR with the VECTKEY and SYSRESETREQ. The owner of the
+    /// processor does the reset; `reset` clears it.
+    pub system_reset_requested: bool,
     pub scr: u32,
     pub ccr: u32,
     pub shcsr: u32,
@@ -367,6 +370,7 @@ impl Processor {
             cpuid: 0,
             icsr: 0,
             aircr: 0xFA05_0000,
+            system_reset_requested: false,
             scr: 0,
             ccr: 0,
             shcsr: 0,

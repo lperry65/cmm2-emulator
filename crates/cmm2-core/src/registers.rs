@@ -1,7 +1,7 @@
 //! A 32-bit view of a peripheral's registers, for the models that need real register
 //! behaviour (ready bits, read-only bits, write-one-to-clear).
 
-use crate::peripheral::Peripheral;
+use crate::peripheral::{Peripheral, ResetCause};
 
 /// Registers as the hardware sees them: whole 32-bit words. `offset` is a multiple of 4,
 /// counted from the start of the peripheral's window.
@@ -11,6 +11,9 @@ pub trait Registers {
     /// Stores the bytes of `value` that `mask` selects (0xFF for each byte written) and
     /// leaves the other bytes of the register alone.
     fn write(&mut self, offset: u32, value: u32, mask: u32);
+
+    /// See `Peripheral::reset`.
+    fn reset(&mut self, _cause: ResetCause) {}
 }
 
 /// `flag` is set in `value` exactly when `enable` is.
@@ -74,6 +77,10 @@ impl<R: Registers> Peripheral for WordAccess<R> {
                 (mask >> (32 * i)) as u32,
             );
         }
+    }
+
+    fn reset(&mut self, cause: ResetCause) {
+        self.0.reset(cause);
     }
 }
 

@@ -233,8 +233,12 @@ impl Bus for Processor {
                 // Only a write with the VECTKEY is accepted, and only PRIGROUP is kept. It is
                 // stored the way a read returns it (VECTKEYSTAT, little endian). SYSRESETREQ
                 // and VECTCLRACTIVE do nothing, and priority grouping is not applied.
+                // SYSRESETREQ is only flagged: the owner of the processor does the reset.
                 if value >> 16 == 0x05FA {
                     self.aircr = 0xFA05_0000 | (value & 0x0000_0700);
+                    if value & 0x4 != 0 {
+                        self.system_reset_requested = true;
+                    }
                 }
             }
             0xE000_ED10 => self.write_scr(value),

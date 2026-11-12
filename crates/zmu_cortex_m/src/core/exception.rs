@@ -607,6 +607,7 @@ impl ExceptionHandling for Processor {
                 exception.priority = 0;
             }
         }
+        self.pending_exception_count = 0;
     }
     fn exception_active(&self, exception: Exception) -> bool {
         self.exceptions[&usize::from(exception)].active

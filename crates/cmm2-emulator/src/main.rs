@@ -211,6 +211,7 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
 
     let limit = options.run.unwrap_or(u64::MAX);
     let stop = run_slice(&mut cpu, options, trace.as_ref(), limit);
+    report_resets(&cpu, 0);
     finish_trace(trace)?;
 
     let ok = !matches!(stop, Stop::Fault(_));
@@ -232,6 +233,7 @@ fn run_console(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
     let mut script = Script::new(std::mem::take(&mut options.on));
     let limit = options.run.unwrap_or(u64::MAX);
     let mut stdout = io::stdout();
+    let mut resets = 0;
 
     let result = loop {
         let budget = limit.saturating_sub(cpu.instruction_count()).min(SLICE);
@@ -239,6 +241,7 @@ fn run_console(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
         if let Err(err) = show_output(&console, &mut script, &mut stdout) {
             break Err(RunError::Console(err));
         }
+        resets = report_resets(&cpu, resets);
         match stop {
             Stop::Fault(fault) => break Err(RunError::Fault(fault.description)),
             Stop::Address(_) => break Ok(true),
@@ -251,6 +254,15 @@ fn run_console(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
     };
     finish_trace(trace)?;
     result
+}
+
+/// Says on stderr, outside the guest's console stream, that the guest reset the machine, once
+/// for each reset after the first `seen`. Returns how many there have been.
+fn report_resets(cpu: &Cpu, seen: u32) -> u32 {
+    for _ in seen..cpu.resets() {
+        eprintln!("cmm2-emulator: system reset");
+    }
+    cpu.resets()
 }
 
 /// Runs up to `budget` instructions. The traces start at `--trace-from`; until then this is a

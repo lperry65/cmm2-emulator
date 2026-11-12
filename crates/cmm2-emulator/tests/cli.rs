@@ -107,6 +107,14 @@ const ECHO: [u16; 28] = [
     0xE7F7, 0x0000, 0x1000, 0x4001,
 ];
 const UNDEFINED: [u16; 1] = [0xDE00]; // udf #0
+// Counts its boots in AXI SRAM, sends a letter for each ('A' for the first) and asks for a
+// system reset until the third boot, which spins. The literals are at +32: the counter's
+// address, USART1, AIRCR and the reset request.
+const REBOOT: [u16; 24] = [
+    0x4807, 0x6801, 0x3101, 0x6001, 0x4A06, 0x2309, 0x6013, 0x2440, 0x1864, 0x6294, 0x2903, 0xDA02,
+    0x4A03, 0x4B04, 0x6013, 0xE7FE, 0x0100, 0x2400, 0x1000, 0x4001, 0xED0C, 0xE000, 0x0004, 0x05FA,
+];
+const RESET_LINE: &str = "cmm2-emulator: system reset\n";
 
 // Runs the program with `args` after `--firmware <image>`, and removes the image.
 fn run_program(name: &str, code: &[u16], args: &[&str]) -> Output {
@@ -761,4 +769,35 @@ fn trace_from_with_the_console_keeps_the_screen_clean() {
             assert!(lines[0].starts_with("0x08000106  "), "{from}");
         }
     }
+}
+
+#[test]
+fn a_system_reset_in_the_console_restarts_the_guest_and_is_reported_on_stderr() {
+    let output = run_program("console-reboot", &REBOOT, &["--console", "--run", "200000"]);
+
+    assert!(output.status.success());
+    assert_eq!(stdout(&output), "ABC");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        RESET_LINE.repeat(2)
+    );
+}
+
+#[test]
+fn a_system_reset_in_a_batch_run_is_reported_on_stderr() {
+    let output = run_program("batch-reboot", &REBOOT, &["--run", "200000"]);
+
+    assert!(output.status.success());
+    assert!(stdout(&output).contains("ABC"));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        RESET_LINE.repeat(2)
+    );
+}
+
+#[test]
+fn a_run_without_a_reset_says_nothing_on_stderr() {
+    let output = run_program("batch-no-reset", &THREE, &["--run", "10"]);
+
+    assert!(output.stderr.is_empty());
 }

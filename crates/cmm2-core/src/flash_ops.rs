@@ -37,6 +37,12 @@ impl FlashOps {
         self.shared.any.set(true);
     }
 
+    /// Drops the queued operations.
+    pub(crate) fn clear(&self) {
+        self.shared.any.set(false);
+        self.shared.queue.borrow_mut().clear();
+    }
+
     /// Returns and clears the queue, oldest first.
     pub(crate) fn take(&self) -> Option<Vec<FlashOp>> {
         if !self.shared.any.replace(false) {
@@ -85,6 +91,22 @@ mod tests {
             Some(vec![FlashOp::Erase {
                 base: 0x0800_0000,
                 len: 4
+            }])
+        );
+    }
+
+    #[test]
+    fn clear_drops_queued_operations() {
+        let ops = FlashOps::new();
+        ops.erase(0x0800_0000, 4);
+        ops.clear();
+        assert_eq!(ops.take(), None);
+        ops.erase(0x0810_0000, 8);
+        assert_eq!(
+            ops.take(),
+            Some(vec![FlashOp::Erase {
+                base: 0x0810_0000,
+                len: 8
             }])
         );
     }

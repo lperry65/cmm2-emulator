@@ -11,7 +11,7 @@ use std::rc::Rc;
 use crate::clock::Clock;
 use crate::console::Console;
 use crate::flash_ops::FlashOps;
-use crate::peripheral::{Peripheral, PeripheralAccess, RegisterStub};
+use crate::peripheral::{Peripheral, PeripheralAccess, RegisterStub, ResetCause};
 use crate::svd::Svd;
 
 /// DTCM RAM. Owned by the CPU core, like the flash.
@@ -262,6 +262,14 @@ impl MemoryMap {
             self.map_fallback(base, size, Box::new(stub))?;
         }
         Ok(())
+    }
+
+    /// Resets every window and fallback. The RAM is left alone: SRAM keeps its contents through
+    /// a system reset on the chip. The unmapped log and the trace callback stay too.
+    pub fn reset_peripherals(&mut self, cause: ResetCause) {
+        for window in self.windows.iter_mut().chain(&mut self.fallbacks) {
+            window.device.reset(cause);
+        }
     }
 
     /// Calls `f` after every peripheral access, modelled or not, in order. `None` stops it.
@@ -1230,5 +1238,53 @@ mod tests {
         m.map_unmodelled_peripherals().unwrap();
         assert_eq!(m.read32(0x5802_4800), 1);
         assert_eq!(m.read32(0x5802_4400), 0x83);
+    }
+
+    // Counts its resets and remembers the last cause.
+    struct Resettable(Rc<RefCell<Vec<ResetCause>>>);
+
+    impl Peripheral for Resettable {
+        fn read(&mut self, _offset: u32, _size: u8) -> u32 {
+            0
+        }
+
+        fn write(&mut self, _offset: u32, _size: u8, _value: u32) {}
+
+        fn reset(&mut self, cause: ResetCause) {
+            self.0.borrow_mut().push(cause);
+        }
+    }
+
+    #[test]
+    fn reset_peripherals_resets_windows_and_fallbacks_but_not_ram() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut m = MemoryMap::new();
+        m.map_peripheral(0x4000_0000, 0x100, Box::new(Resettable(seen.clone())))
+            .unwrap();
+        m.map_fallback(0x5000_0000, 0x100, Box::new(Resettable(seen.clone())))
+            .unwrap();
+        m.map_fallback(0x6000_0000, 0x1000, Box::new(RegisterStub::new()))
+            .unwrap();
+        m.write32(0x6000_0010, 9);
+        m.write32(0x2400_0000, 0xCAFE);
+        m.write32(0x7000_0000, 1);
+        let unmapped = m.take_unmapped().len();
+        m.set_peripheral_trace(Some(Box::new(|_| {})));
+
+        m.reset_peripherals(ResetCause::Software);
+
+        assert_eq!(*seen.borrow(), [ResetCause::Software; 2]);
+        assert_eq!(m.read32(0x6000_0010), 0);
+        assert_eq!(m.read32(0x2400_0000), 0xCAFE);
+        assert_eq!(unmapped, 1);
+        assert!(m.trace.is_some());
+    }
+
+    #[test]
+    fn reset_peripherals_keeps_the_unmapped_log() {
+        let mut m = MemoryMap::new();
+        m.write32(0x7000_0000, 1);
+        m.reset_peripherals(ResetCause::Software);
+        assert_eq!(m.take_unmapped().len(), 1);
     }
 }

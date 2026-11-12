@@ -11,7 +11,7 @@
 
 use crate::flash_ops::FlashOps;
 use crate::irq::Irqs;
-use crate::peripheral::StubRegisters;
+use crate::peripheral::{ResetCause, StubRegisters};
 use crate::registers::{Registers, WordAccess};
 use crate::svd::Svd;
 
@@ -154,6 +154,12 @@ impl Registers for FlashRegisters {
             _ => self.stored.write(offset, value, mask),
         }
     }
+
+    // A system reset locks both banks again and clears what a wrong key did.
+    fn reset(&mut self, cause: ResetCause) {
+        self.stored.reset(cause);
+        self.banks = [Bank::new(FLASH_BANK1), Bank::new(FLASH_BANK2)];
+    }
 }
 
 pub type FlashController = WordAccess<FlashRegisters>;
@@ -172,8 +178,8 @@ impl FlashController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MemoryMap;
     use crate::flash_ops::FlashOp;
+    use crate::{MemoryMap, ResetCause};
 
     const ACR: u32 = FLASH_REGS_BASE;
     const KEYR1: u32 = FLASH_REGS_BASE + 0x04;
@@ -393,5 +399,40 @@ mod tests {
         assert_eq!(m.map.read32(ACR), 0x37);
         m.map.write32(ACR, 0x32);
         assert_eq!(m.map.read32(ACR), 0x32);
+    }
+
+    #[test]
+    fn reset_relocks_an_unlocked_bank() {
+        let mut m = machine();
+        unlock(&mut m.map, KEYR2);
+        m.map.write32(KEYR1, KEY1);
+        m.map.reset_peripherals(ResetCause::Software);
+        assert_eq!(m.map.read32(CR2), 0x31);
+        // The key progress went too: KEY2 alone is a wrong key.
+        m.map.write32(KEYR1, KEY2);
+        unlock(&mut m.map, KEYR1);
+        assert_eq!(m.map.read32(CR1), 0x31);
+    }
+
+    #[test]
+    fn reset_unlocks_a_locked_up_bank_for_the_keys() {
+        let mut m = machine();
+        m.map.write32(KEYR2, 0);
+        m.map.reset_peripherals(ResetCause::Software);
+        unlock(&mut m.map, KEYR2);
+        assert_eq!(m.map.read32(CR2), 0x30);
+    }
+
+    #[test]
+    fn reset_clears_status_flags_control_and_the_stub() {
+        let mut m = machine();
+        unlock(&mut m.map, KEYR2);
+        m.map.write32(CR2, EOPIE | PSIZE | BER | START);
+        assert_eq!(m.map.read32(SR2) & EOP, EOP);
+        m.map.write32(ACR, 0x32);
+        m.map.reset_peripherals(ResetCause::Software);
+        assert_eq!(m.map.read32(SR2), 0);
+        assert_eq!(m.map.read32(CR2), 0x31);
+        assert_eq!(m.map.read32(ACR), 0x37);
     }
 }

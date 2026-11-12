@@ -8,7 +8,7 @@
 //! flags and the other counting modes are plain stored registers.
 
 use crate::clock::Clock;
-use crate::peripheral::StubRegisters;
+use crate::peripheral::{ResetCause, StubRegisters};
 use crate::registers::{Registers, WordAccess};
 use crate::svd::Svd;
 
@@ -131,6 +131,19 @@ impl Registers for TimerRegisters {
             _ => self.stored.write(offset, value, mask),
         }
     }
+
+    // A system reset stops the timer and puts every register back, count included.
+    fn reset(&mut self, cause: ResetCause) {
+        self.stored.reset(cause);
+        self.cr1 = self.stored.read(CR1);
+        self.sr = self.stored.read(SR);
+        let psc = self.stored.read(PSC);
+        self.set_psc(psc);
+        // The SVD gives ARR a reset value of 0, but the chip resets it to all ones, and a
+        // timer that is enabled without setting ARR counts to the end of its width.
+        self.set_arr(self.width_mask);
+        self.restart(0);
+    }
 }
 
 pub type Timer = WordAccess<TimerRegisters>;
@@ -140,25 +153,20 @@ impl Timer {
     /// reload register, 16 or 32.
     pub fn new(base: u32, width: u32, clock: Clock) -> Timer {
         let width_mask = (u64::MAX >> (64 - width)) as u32;
-        let mut stored = StubRegisters::with_reset_values(base, Svd::stm32h743());
         let mut regs = TimerRegisters {
-            cr1: stored.read(CR1),
-            sr: stored.read(SR),
+            stored: StubRegisters::with_reset_values(base, Svd::stm32h743()),
+            clock,
+            width_mask,
+            cr1: 0,
+            sr: 0,
             psc: 0,
             arr: 0,
             divisor: 0,
             period: 0,
-            stored,
-            clock,
-            width_mask,
             count: 0,
             anchor: 0,
         };
-        let psc = regs.stored.read(PSC);
-        regs.set_psc(psc);
-        // The SVD gives ARR a reset value of 0, but the chip resets it to all ones, and a
-        // timer that is enabled without setting ARR counts to the end of its width.
-        regs.set_arr(width_mask);
+        regs.reset(ResetCause::PowerOn);
         WordAccess::wrap(regs)
     }
 }
@@ -166,7 +174,7 @@ impl Timer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Peripheral;
+    use crate::{Peripheral, ResetCause};
 
     const TIM16: u32 = 0x4001_4400;
     const TIM5: u32 = 0x4000_0C00;
@@ -427,5 +435,32 @@ mod tests {
         assert_eq!(read(&mut t, CR1), arpe_udis_urs | CEN);
         write(&mut t, CR1, arpe_udis_urs);
         assert_eq!(read(&mut t, CR1), arpe_udis_urs);
+    }
+
+    #[test]
+    fn reset_stops_the_timer_and_clears_count_and_flags() {
+        let (mut t, clock) = running(0, 99);
+        clock.set(1000);
+        assert_ne!(read(&mut t, SR) & UIF, 0);
+        write(&mut t, DIER, 1);
+        t.reset(ResetCause::Software);
+        assert_eq!(read(&mut t, CR1) & CEN, 0);
+        assert_eq!(read(&mut t, CNT), 0);
+        assert_eq!(read(&mut t, SR) & UIF, 0);
+        assert_eq!(read(&mut t, PSC), 0);
+        assert_eq!(read(&mut t, ARR), 0xFFFF);
+        assert_eq!(read(&mut t, DIER), 0);
+        clock.set(5000);
+        assert_eq!(read(&mut t, CNT), 0);
+    }
+
+    #[test]
+    fn a_reset_timer_counts_from_the_time_of_the_reset() {
+        let (mut t, clock) = running(0, 0xFFFF);
+        clock.set(1000);
+        t.reset(ResetCause::Software);
+        write(&mut t, CR1, CEN);
+        clock.set(1200);
+        assert_eq!(read(&mut t, CNT), 100);
     }
 }

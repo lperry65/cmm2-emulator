@@ -31,7 +31,7 @@ pub use machine::cmm2_memory;
 pub use memory::{
     AccessKind, DTCM_BASE, DTCM_SIZE, MemoryError, MemoryMap, REGIONS, RegionSpec, UnmappedAccess,
 };
-pub use peripheral::{Peripheral, PeripheralAccess, RegisterStub, StubRegisters};
+pub use peripheral::{Peripheral, PeripheralAccess, RegisterStub, ResetCause, StubRegisters};
 pub use pwr::{PWR_BASE, PWR_SIZE, Pwr, PwrRegisters};
 pub use rcc::{RCC_BASE, RCC_SIZE, Rcc, RccRegisters};
 pub use registers::{Registers, WordAccess};

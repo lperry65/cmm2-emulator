@@ -30,6 +30,12 @@ impl Irqs {
         self.shared.any.set(true);
     }
 
+    /// Drops every pending bit.
+    pub(crate) fn clear(&self) {
+        self.shared.any.set(false);
+        *self.shared.pending.borrow_mut() = [0; 8];
+    }
+
     /// Returns and clears the pending bits, one word per 32 lines.
     pub(crate) fn take(&self) -> Option<[u32; 8]> {
         if !self.shared.any.replace(false) {
@@ -76,5 +82,16 @@ mod tests {
         let irqs = Irqs::new();
         irqs.clone().raise(7);
         assert_eq!(irqs.take(), Some([1 << 7, 0, 0, 0, 0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn clear_drops_pending_bits() {
+        let irqs = Irqs::new();
+        irqs.raise(3);
+        irqs.raise(200);
+        irqs.clear();
+        assert_eq!(irqs.take(), None);
+        irqs.raise(4);
+        assert_eq!(irqs.take(), Some([1 << 4, 0, 0, 0, 0, 0, 0, 0]));
     }
 }

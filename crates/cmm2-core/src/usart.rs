@@ -8,7 +8,7 @@
 
 use crate::console::Console;
 use crate::irq::Irqs;
-use crate::peripheral::StubRegisters;
+use crate::peripheral::{ResetCause, StubRegisters};
 use crate::registers::{Registers, WordAccess};
 use crate::svd::Svd;
 
@@ -127,6 +127,13 @@ impl Registers for UsartRegisters {
             _ => self.stored.write(offset, value, mask),
         }
     }
+
+    // A system reset puts the USART back, so CR1 is 0 and the receive interrupt is off. What
+    // the console holds belongs to the host and stays.
+    fn reset(&mut self, cause: ResetCause) {
+        self.stored.reset(cause);
+        self.console.set_rx_interrupt(false);
+    }
 }
 
 pub type Usart = WordAccess<UsartRegisters>;
@@ -145,7 +152,7 @@ impl Usart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MemoryMap;
+    use crate::{MemoryMap, ResetCause};
 
     const CR1_ADDR: u32 = USART1_BASE + CR1;
     const CR2_ADDR: u32 = USART1_BASE + 0x04;
@@ -471,5 +478,30 @@ mod tests {
         let (mut m, _) = machine();
         m.write32(CR1_ADDR, 0x2000_00FD);
         assert_eq!(m.read32(CR1_ADDR), 0x2000_00FD);
+    }
+
+    #[test]
+    fn reset_puts_cr1_back_and_stops_the_receive_interrupt() {
+        let (mut m, console, irqs) = machine_with_irqs();
+        m.write32(CR1_ADDR, UE | TE | RE | RXNEIE);
+        m.write32(BRR_ADDR, 0x1234);
+        let _ = irqs.take();
+        m.reset_peripherals(ResetCause::Software);
+        assert_eq!(m.read32(CR1_ADDR), 0);
+        assert_eq!(m.read32(BRR_ADDR), 0);
+        console.push_input(b"x");
+        assert!(nothing_raised(&irqs));
+    }
+
+    #[test]
+    fn reset_leaves_the_consoles_queues_alone() {
+        let (mut m, console, _) = machine_with_irqs();
+        m.write32(CR1_ADDR, UE | TE);
+        m.write32(TDR_ADDR, 0x41);
+        console.push_input(b"hi");
+        m.reset_peripherals(ResetCause::Software);
+        assert_eq!(console.take_output(), b"A");
+        assert_eq!(console.read(), Some(b'h'));
+        assert_eq!(console.read(), Some(b'i'));
     }
 }
