@@ -1,5 +1,5 @@
 # Local reference material: not redistributable, never commit
-docs/
+reference/
 firmware/
 *.bin
 *.pdf
