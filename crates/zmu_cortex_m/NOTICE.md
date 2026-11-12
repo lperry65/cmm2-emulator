@@ -35,6 +35,9 @@ The firmware needs a few things zmu does not do, so I changed the following.
   decoded as undefined before. SSAT and USAT set the Q flag on saturation.
 - GDB: `GdbServer`, `ZmuTarget` and `Simulation` can be built from a processor
   that has already been set up and reset (`from_processor`).
+- IT state: the IF-THEN state is now saved in the stacked xPSR on exception
+  entry and restored on return. It was dropped, so an interrupt inside an IT
+  block corrupted the handler.
 - Default features: `default` is now `["armv7em", "fpv5-d16"]`, the Cortex-M7
   with the double-precision FPU. All other features are unchanged.
 

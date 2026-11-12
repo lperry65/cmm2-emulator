@@ -223,6 +223,9 @@ trait ExceptionHandlingHelpers {
     fn exception_active_bit_count(&self) -> usize;
 }
 
+/// xPSR bits that hold ITSTATE: [26:25] and [15:10]
+const IT_XPSR_MASK: u32 = 0b11 << 25 | 0b11_1111 << 10;
+
 #[derive(PartialEq, Debug, Copy, Clone)]
 ///
 /// List of supported Exceptions
@@ -389,8 +392,14 @@ impl ExceptionHandlingHelpers for Processor {
         self.write32(frameptr.wrapping_add(0x10), r12)?;
         self.write32(frameptr.wrapping_add(0x14), lr)?;
         self.write32(frameptr.wrapping_add(0x18), ret_addr)?;
-        let xpsr =
-            (self.psr.value & 0b1111_1111_1111_1111_1111_1101_1111_1111) | frameptralign << 9;
+        // The IT state lives outside psr.value; it is stacked in the EPSR positions
+        // and the handler starts without an IT block.
+        let it = u32::from(self.itstate);
+        let xpsr = (self.psr.value & !(IT_XPSR_MASK | 1 << 9))
+            | frameptralign << 9
+            | it.get_bits(0..2) << 25
+            | it.get_bits(2..8) << 10;
+        self.itstate = 0;
         self.write32(frameptr.wrapping_add(0x1c), xpsr)?;
 
         #[cfg(feature = "has-fp")]
@@ -574,8 +583,8 @@ impl ExceptionHandlingHelpers for Processor {
         }
         self.psr.value.set_bits(27..32, psr.get_bits(27..32));
         self.psr.value.set_bits(0..9, psr.get_bits(0..9));
-        self.psr.value.set_bits(10..16, psr.get_bits(10..16));
-        self.psr.value.set_bits(24..27, psr.get_bits(24..27));
+        self.psr.value.set_bit(24, psr.get_bit(24));
+        self.itstate = (psr.get_bits(25..27) | psr.get_bits(10..16) << 2) as u8;
         // GE[3:0] bits (APSR bits 19:16) are DSP-extension-only architectural state.
         // Restore them from the stacked xPSR only when the DSP extension is present.
         #[cfg(feature = "has-dsp-ext")]
@@ -940,7 +949,7 @@ mod tests {
         assert_eq!(core.read32(STACK_START - 0x20 + 24).unwrap(), 99);
         assert_eq!(
             core.read32(STACK_START - 0x20 + 28).unwrap(),
-            0b1111_1111_1111_1111_1111_1101_1111_1111
+            0b1111_1001_1111_1111_0000_0001_1111_1111
         );
         assert_eq!(lr, 0xffff_fff9);
     }
@@ -980,7 +989,7 @@ mod tests {
         assert_eq!(core.read32(STACK_START - 0x68 + 24).unwrap(), 99);
         assert_eq!(
             core.read32(STACK_START - 0x68 + 28).unwrap(),
-            0b1111_1111_1111_1111_1111_1101_1111_1111
+            0b1111_1001_1111_1111_0000_0001_1111_1111
         );
 
         for i in 0..16 {
@@ -1601,5 +1610,78 @@ mod tests {
             pre_psr_ge_bits, post_psr_ge_bits,
             "GE bits must not be modified by pop_stack without DSP extension"
         );
+    }
+
+    const IT_STACK_START: u32 = 0x2000_0100;
+
+    fn stacked_xpsr_after_entry(itstate: u8) -> (Processor, u32) {
+        let mut core = Processor::new();
+        core.control.sp_sel = false;
+        core.set_msp(IT_STACK_START);
+        core.psr.value = 0xffff_ffff;
+        core.itstate = itstate;
+        core.push_stack(Exception::SysTick, 99).unwrap();
+        let xpsr = core.read32(IT_STACK_START - 0x20 + 0x1c).unwrap();
+        (core, xpsr)
+    }
+
+    #[test]
+    fn test_push_stack_saves_it_state_in_xpsr() {
+        // ITSTATE[7:2] goes to xPSR[15:10], ITSTATE[1:0] to xPSR[26:25]
+        let (core, xpsr) = stacked_xpsr_after_entry(0x18);
+        assert_eq!(xpsr.get_bits(10..16), 0b000110);
+        assert_eq!(xpsr.get_bits(25..27), 0b00);
+        assert_eq!(core.itstate, 0);
+
+        let (core, xpsr) = stacked_xpsr_after_entry(0xa4);
+        assert_eq!(xpsr.get_bits(10..16), 0b101001);
+        assert_eq!(xpsr.get_bits(25..27), 0b00);
+        assert_eq!(core.itstate, 0);
+
+        let (_, xpsr) = stacked_xpsr_after_entry(0xa7);
+        assert_eq!(xpsr.get_bits(10..16), 0b101001);
+        assert_eq!(xpsr.get_bits(25..27), 0b11);
+    }
+
+    #[test]
+    fn test_push_stack_without_it_block_stacks_clear_it_bits() {
+        let (_, xpsr) = stacked_xpsr_after_entry(0);
+        assert_eq!(xpsr.get_bits(10..16), 0);
+        assert_eq!(xpsr.get_bits(25..27), 0);
+    }
+
+    fn pop_frame_with_xpsr(xpsr: u32) -> Processor {
+        const FRAMEPTR: u32 = 0x2000_0100;
+        let mut core = Processor::new();
+        core.set_msp(FRAMEPTR);
+        for offset in (0..0x18).step_by(4) {
+            core.write32(FRAMEPTR + offset, 0).unwrap();
+        }
+        core.write32(FRAMEPTR + 0x18, 0x0800_0001).unwrap();
+        core.write32(FRAMEPTR + 0x1c, xpsr).unwrap();
+        core.pop_stack(FRAMEPTR, 0xffff_fff9).unwrap();
+        core
+    }
+
+    #[test]
+    fn test_pop_stack_restores_it_state_from_xpsr() {
+        let core = pop_frame_with_xpsr((1 << 24) | (0b101001 << 10));
+        assert_eq!(core.itstate, 0xa4);
+
+        let core = pop_frame_with_xpsr((1 << 24) | (0b000110 << 10) | (0b11 << 25));
+        assert_eq!(core.itstate, 0x1b);
+
+        let core = pop_frame_with_xpsr(1 << 24);
+        assert_eq!(core.itstate, 0);
+    }
+
+    #[test]
+    fn test_it_state_survives_exception_entry_and_return() {
+        for itstate in [0x00, 0x18, 0xa4, 0x03, 0xa7, 0xff] {
+            let (core, xpsr) = stacked_xpsr_after_entry(itstate);
+            assert_eq!(core.itstate, 0);
+            let core = pop_frame_with_xpsr(xpsr & !0x1ff);
+            assert_eq!(core.itstate, itstate);
+        }
     }
 }

@@ -456,6 +456,68 @@ mod tests {
         assert!(cpu.reg(4) > after);
     }
 
+    /// Enables IRQ 5, then `cmp r2,r2` (Z set), `ite eq`, `movs r4,#1`, `movs r5,#2`. The
+    /// handler sets r6 unconditionally and returns (r3 would be
+    /// restored from the frame).
+    fn it_block_cpu() -> Cpu {
+        let mut code = assemble(
+            &[
+                Load(0, 0),
+                Raw(0x2120), // movs r1,#0x20
+                Raw(0x6001), // str r1,[r0]
+                Raw(0xB662), // cpsie i
+                Raw(0x4292), // cmp r2,r2
+                Raw(0xBF0C), // ite eq
+                Raw(0x2401), // moveq r4,#1
+                Raw(0x2502), // movne r5,#2
+                Raw(SPIN_HERE),
+            ],
+            &[0xE000_E100],
+        );
+        let handler = 2 * code.len() as u32;
+        code.extend([0x2607, 0x4770]); // movs r6,#7; bx lr
+        Cpu::new(
+            &image(&code, &[(5, handler)]),
+            MemoryMap::new(),
+            Irqs::new(),
+        )
+        .unwrap()
+    }
+
+    /// Steps `before` instructions, raises the interrupt and runs on to the end. The line is
+    /// pended after the next step and taken at the end of the one after it.
+    fn run_it_block_with_interrupt_raised_after(before: usize) -> Cpu {
+        let mut cpu = it_block_cpu();
+        for _ in 0..before {
+            cpu.step();
+        }
+        cpu.irqs().raise(5);
+        for _ in 0..14 {
+            cpu.step();
+        }
+        cpu
+    }
+
+    #[test]
+    fn interrupt_right_after_ite_leaves_the_it_block_intact() {
+        // Raised before cmp, so it is taken at the end of ite
+        let mut cpu = run_it_block_with_interrupt_raised_after(4);
+        assert_eq!(cpu.reg(6), 7);
+        assert_eq!(cpu.reg(4), 1);
+        assert_eq!(cpu.reg(5), 0);
+        assert_eq!(cpu.pc(), CODE + 16);
+    }
+
+    #[test]
+    fn interrupt_inside_the_it_block_leaves_the_it_block_intact() {
+        // Raised before ite, so it is taken at the end of the first instruction of the block
+        let mut cpu = run_it_block_with_interrupt_raised_after(5);
+        assert_eq!(cpu.reg(6), 7);
+        assert_eq!(cpu.reg(4), 1);
+        assert_eq!(cpu.reg(5), 0);
+        assert_eq!(cpu.pc(), CODE + 16);
+    }
+
     #[test]
     fn interrupt_that_is_not_enabled_stays_pending() {
         let mut cpu = with_handler(&SPIN);
