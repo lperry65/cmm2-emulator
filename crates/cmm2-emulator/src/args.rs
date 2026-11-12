@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio]";
+pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--console] [--on <text> <keys>]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -23,6 +23,15 @@ pub struct RunOptions {
     pub stop_at: Option<u32>,
     pub trace: Option<String>,
     pub trace_mmio: bool,
+    pub console: bool,
+    pub on: Vec<OnRule>,
+}
+
+/// Keys to send once the guest has printed some text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnRule {
+    pub text: String,
+    pub keys: Vec<u8>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,6 +42,9 @@ pub enum ArgError {
     BadCount(String),
     BadAddress(String),
     NeedsFirmware(String),
+    NeedsConsole(String),
+    ConsoleWithTrace,
+    BadKeys(String),
     NothingToRun,
 }
 
@@ -46,6 +58,14 @@ impl fmt::Display for ArgError {
             ArgError::NeedsFirmware(option) => {
                 writeln!(f, "cmm2-emulator: {option} needs --firmware")?
             }
+            ArgError::NeedsConsole(option) => {
+                writeln!(f, "cmm2-emulator: {option} needs --console")?
+            }
+            ArgError::ConsoleWithTrace => writeln!(
+                f,
+                "cmm2-emulator: --console cannot be traced, the screen belongs to the guest"
+            )?,
+            ArgError::BadKeys(arg) => writeln!(f, "cmm2-emulator: bad keys '{arg}'")?,
             ArgError::NothingToRun => {
                 writeln!(f, "cmm2-emulator: nothing to run, give --run or --stop-at")?
             }
@@ -71,14 +91,15 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, ArgError
             if options == RunOptions::default() {
                 return Ok(Command::Vectors(firmware));
             }
-            if options.run.is_none() && options.stop_at.is_none() {
+            check_console(&options)?;
+            if !options.console && options.run.is_none() && options.stop_at.is_none() {
                 return Err(ArgError::NothingToRun);
             }
             Ok(Command::Run { firmware, options })
         }
-        Some(option @ ("--run" | "--stop-at" | "--trace" | "--trace-mmio")) => {
-            Err(ArgError::NeedsFirmware(option.to_string()))
-        }
+        Some(
+            option @ ("--run" | "--stop-at" | "--trace" | "--trace-mmio" | "--console" | "--on"),
+        ) => Err(ArgError::NeedsFirmware(option.to_string())),
         Some(arg) => Err(ArgError::Unknown(arg.to_string())),
     }
 }
@@ -93,10 +114,57 @@ fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOption
             }
             "--trace" => options.trace = Some(args.next().ok_or(ArgError::Usage)?),
             "--trace-mmio" => options.trace_mmio = true,
+            "--console" => options.console = true,
+            "--on" => {
+                let text = args.next().ok_or(ArgError::Usage)?;
+                let keys = parse_keys(&args.next().ok_or(ArgError::Usage)?)?;
+                options.on.push(OnRule { text, keys });
+            }
             _ => return Err(ArgError::Unknown(arg)),
         }
     }
     Ok(options)
+}
+
+fn check_console(options: &RunOptions) -> Result<(), ArgError> {
+    if options.console && (options.trace.is_some() || options.trace_mmio) {
+        return Err(ArgError::ConsoleWithTrace);
+    }
+    if !options.console && !options.on.is_empty() {
+        return Err(ArgError::NeedsConsole("--on".to_string()));
+    }
+    Ok(())
+}
+
+/// The keys of an `--on` rule: plain text, with `\r`, `\n`, `\t`, `\e`, `\\` and `\xHH` for the
+/// rest.
+fn parse_keys(arg: &str) -> Result<Vec<u8>, ArgError> {
+    let bad = || ArgError::BadKeys(arg.to_string());
+    let mut keys = Vec::new();
+    let mut chars = arg.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            let mut buf = [0; 4];
+            keys.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        keys.push(match chars.next().ok_or_else(bad)? {
+            'r' => b'\r',
+            'n' => b'\n',
+            't' => b'\t',
+            'e' => 0x1B,
+            '\\' => b'\\',
+            'x' => {
+                let hex: String = chars.by_ref().take(2).collect();
+                if hex.len() != 2 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(bad());
+                }
+                u8::from_str_radix(&hex, 16).map_err(|_| bad())?
+            }
+            _ => return Err(bad()),
+        });
+    }
+    Ok(keys)
 }
 
 /// Decimal, or hex with a `0x` prefix.
@@ -139,6 +207,7 @@ mod tests {
                 stop_at: Some(0x0800_0100),
                 trace: Some("t.txt".into()),
                 trace_mmio: true,
+                ..RunOptions::default()
             },
         };
         assert_eq!(
@@ -180,5 +249,131 @@ mod tests {
             parse_args(&["--firmware", "f", "--trace-mmio"]),
             Err(ArgError::NothingToRun)
         );
+    }
+
+    #[test]
+    fn console_runs_without_a_limit() {
+        let want = Command::Run {
+            firmware: "f.bin".into(),
+            options: RunOptions {
+                console: true,
+                ..RunOptions::default()
+            },
+        };
+        assert_eq!(parse_args(&["--firmware", "f.bin", "--console"]), Ok(want));
+    }
+
+    #[test]
+    fn console_takes_a_limit_too() {
+        let Ok(Command::Run { options, .. }) =
+            parse_args(&["--firmware", "f", "--console", "--run", "9"])
+        else {
+            panic!("not a run");
+        };
+        assert!(options.console);
+        assert_eq!(options.run, Some(9));
+    }
+
+    #[test]
+    fn on_is_repeatable_and_keeps_the_order() {
+        let Ok(Command::Run { options, .. }) = parse_args(&[
+            "--firmware",
+            "f",
+            "--console",
+            "--on",
+            "Keyboard type",
+            "1",
+            "--on",
+            "HH:MM:SS",
+            "12:00:00\\r",
+        ]) else {
+            panic!("not a run");
+        };
+        assert_eq!(
+            options.on,
+            vec![
+                OnRule {
+                    text: "Keyboard type".into(),
+                    keys: b"1".to_vec()
+                },
+                OnRule {
+                    text: "HH:MM:SS".into(),
+                    keys: b"12:00:00\r".to_vec()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn on_needs_two_values() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--console", "--on"]),
+            Err(ArgError::Usage)
+        );
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--console", "--on", "text"]),
+            Err(ArgError::Usage)
+        );
+    }
+
+    #[test]
+    fn on_needs_the_console() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--run", "1", "--on", "a", "b"]),
+            Err(ArgError::NeedsConsole("--on".into()))
+        );
+    }
+
+    #[test]
+    fn console_and_on_need_the_firmware() {
+        assert_eq!(
+            parse_args(&["--console"]),
+            Err(ArgError::NeedsFirmware("--console".into()))
+        );
+        assert_eq!(
+            parse_args(&["--on", "a", "b"]),
+            Err(ArgError::NeedsFirmware("--on".into()))
+        );
+    }
+
+    #[test]
+    fn console_cannot_be_traced() {
+        for trace in [&["--trace", "t"][..], &["--trace-mmio"][..]] {
+            let mut args = vec!["--firmware", "f", "--console"];
+            args.extend_from_slice(trace);
+            assert_eq!(parse_args(&args), Err(ArgError::ConsoleWithTrace));
+        }
+    }
+
+    #[test]
+    fn a_bad_key_escape_is_reported_with_its_option_value() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--console", "--on", "a", "\\q"]),
+            Err(ArgError::BadKeys("\\q".into()))
+        );
+    }
+
+    #[test]
+    fn key_escapes() {
+        assert_eq!(parse_keys("\\r"), Ok(vec![b'\r']));
+        assert_eq!(parse_keys("\\n"), Ok(vec![b'\n']));
+        assert_eq!(parse_keys("\\t"), Ok(vec![b'\t']));
+        assert_eq!(parse_keys("\\e"), Ok(vec![0x1B]));
+        assert_eq!(parse_keys("\\\\"), Ok(vec![b'\\']));
+        assert_eq!(parse_keys("\\x41"), Ok(vec![b'A']));
+        assert_eq!(parse_keys("a\\x1bb\\r"), Ok(vec![b'a', 0x1B, b'b', b'\r']));
+    }
+
+    #[test]
+    fn plain_keys_are_taken_as_they_are() {
+        assert_eq!(parse_keys("12:00:00"), Ok(b"12:00:00".to_vec()));
+        assert_eq!(parse_keys(""), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn bad_key_escapes_are_errors() {
+        for bad in ["\\q", "\\x4", "\\x", "\\xZZ", "ab\\"] {
+            assert_eq!(parse_keys(bad), Err(ArgError::BadKeys(bad.into())), "{bad}");
+        }
     }
 }

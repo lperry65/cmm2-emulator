@@ -125,6 +125,15 @@ and waits for a key. A `1` pushed into the console is echoed and answered with
 board, whose `OPTION LIST` begins `480MHz Colour Maximite 2 G2`: the firmware here reports 504 MHz and
 no `G2`. How it works out the clock and the board generation is the next thing to find out.
 
+**The first-boot dialogue, driven from scripted input** (`--console --on "Keyboard type" "1" --on
+"HH:MM:SS" "12:00:00\r" --on "DD/MM/YY" "12/11/26\r"`; the whole run to the date prompt is about four
+seconds in a release build): the firmware asks, in order, `Keyboard type: 1=UK, 2=US, 3=DE , 4=FR, 5=ES ,
+6=BE ?`, `Enter time (24hr clock) HH:MM:SS ?` and `Enter date DD/MM/YY ?` (the date field takes 8
+characters, so `12/11/2026` is cut to `12/11/20`). After the date it prints nothing more, through three
+billion instructions, with no fault and no `>` prompt: it accepts the date and then waits for something the
+emulator does not provide yet. The time and date are probably written to the clock chip, which the board has
+as a DS3231 on an I2C bus, so I2C is the first suspect.
+
 ## What happens before it
 
 | Instruction | What |

@@ -7,3 +7,4 @@ repository.workspace = true
 
 [dependencies]
 cmm2-core = { path = "../cmm2-core" }
+libc = "0.2"

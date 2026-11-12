@@ -52,6 +52,23 @@ cargo run --release -- --firmware /path/to/CMM2_MMBasic_7.00.00b5.bin --run 1000
 `--trace <file>` writes every executed instruction (and, with `--trace-mmio`, the peripheral
 accesses after it) to a file.
 
+To use it interactively, connect the console to your terminal:
+
+```
+cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console
+```
+
+What you type goes to the firmware and what it prints appears as it sends it. Ctrl-] quits. The
+first text takes about ten seconds to appear today (about 196 million instructions).
+
+For scripts and CI, `--on <text> <keys>` types the keys once the firmware has printed the text
+(`\r`, `\n`, `\t`, `\e`, `\\` and `\xHH` are understood), and `--run` ends the run:
+
+```
+cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --run 260000000 \
+    --on "Keyboard type" "1"
+```
+
 ## Firmware and documentation are not included
 
 You supply your own copy of the official firmware. This repository does not contain the firmware

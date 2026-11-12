@@ -1,20 +1,32 @@
 mod args;
+mod script;
+mod terminal;
 
 use std::cell::RefCell;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 
 use args::{Command, RunOptions};
 use cmm2_core::{
     AccessKind, Console, Cpu, CpuError, Firmware, FirmwareError, Irqs, MemoryError,
     PeripheralAccess, Stop, Svd, cmm2_memory,
 };
+use script::Script;
+use terminal::RawMode;
 
 /// How many unmapped accesses the summary lists; the count covers all of them.
 const UNMAPPED_SHOWN: usize = 5;
+
+/// How many instructions run between looks at the console in `--console` mode.
+const SLICE: u64 = 50_000;
+
+/// Ctrl-] ends a `--console` run; the terminal is in raw mode, so Ctrl-C goes to the guest.
+const QUIT_KEY: u8 = 0x1D;
 
 fn main() -> ExitCode {
     let command = match args::parse(std::env::args().skip(1)) {
@@ -34,6 +46,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Vectors(path) => finish(show_vectors(&path)),
+        Command::Run { firmware, options } if options.console => {
+            finish(run_console(&firmware, options))
+        }
         Command::Run { firmware, options } => finish(run_firmware(&firmware, &options)),
     }
 }
@@ -55,8 +70,14 @@ enum RunError {
     Firmware(FirmwareError),
     Memory(MemoryError),
     Cpu(CpuError),
-    Trace { path: String, source: io::Error },
+    Trace {
+        path: String,
+        source: io::Error,
+    },
     Write(io::Error),
+    Console(io::Error),
+    /// The guest faulted; the text is the core's description.
+    Fault(String),
 }
 
 impl fmt::Display for RunError {
@@ -67,6 +88,8 @@ impl fmt::Display for RunError {
             RunError::Cpu(err) => err.fmt(f),
             RunError::Trace { path, source } => write!(f, "{path}: {source}"),
             RunError::Write(err) => write!(f, "writing the trace: {err}"),
+            RunError::Console(err) => write!(f, "writing the console output: {err}"),
+            RunError::Fault(description) => f.write_str(description),
         }
     }
 }
@@ -158,8 +181,13 @@ fn access_line(access: &PeripheralAccess) -> String {
     )
 }
 
-/// Returns whether the run ended without a fault.
-fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
+struct Machine {
+    cpu: Cpu,
+    console: Console,
+    trace: Option<Rc<RefCell<TraceOut>>>,
+}
+
+fn build_machine(path: &str, options: &RunOptions) -> Result<Machine, RunError> {
     let firmware = Firmware::load(path)?;
     let irqs = Irqs::new();
     let mut memory = cmm2_memory(&irqs);
@@ -172,7 +200,21 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
         })));
     }
     let console = memory.console();
-    let mut cpu = Cpu::new(&firmware, memory, irqs)?;
+    let cpu = Cpu::new(&firmware, memory, irqs)?;
+    Ok(Machine {
+        cpu,
+        console,
+        trace,
+    })
+}
+
+/// Returns whether the run ended without a fault.
+fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
+    let Machine {
+        mut cpu,
+        console,
+        trace,
+    } = build_machine(path, options)?;
 
     let limit = options.run.unwrap_or(u64::MAX);
     let stop = match (&options.trace, &trace) {
@@ -191,7 +233,83 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
     Ok(ok)
 }
 
-/// What the guest sent to its console, until there is an interactive one.
+/// Runs with the console on the host terminal until the quit key, the limit, `--stop-at` or a
+/// fault. The summary is left out, as the screen belongs to the guest.
+fn run_console(path: &str, options: RunOptions) -> Result<bool, RunError> {
+    let Machine {
+        mut cpu, console, ..
+    } = build_machine(path, &options)?;
+    let _raw = RawMode::enable();
+    let keys = read_stdin();
+    let mut script = Script::new(options.on);
+    let limit = options.run.unwrap_or(u64::MAX);
+    let mut stdout = io::stdout();
+
+    loop {
+        let budget = limit.saturating_sub(cpu.instruction_count()).min(SLICE);
+        let stop = cpu.run_until(budget, options.stop_at);
+        show_output(&console, &mut script, &mut stdout).map_err(RunError::Console)?;
+        match stop {
+            Stop::Fault(fault) => return Err(RunError::Fault(fault.description)),
+            Stop::Address(_) => return Ok(true),
+            Stop::InstructionLimit if cpu.instruction_count() >= limit => return Ok(true),
+            Stop::InstructionLimit => {}
+        }
+        if !send_keys(&console, &keys) {
+            return Ok(true);
+        }
+    }
+}
+
+/// Writes what the guest sent to the terminal and types the keys the script has for it.
+fn show_output(console: &Console, script: &mut Script, out: &mut impl Write) -> io::Result<()> {
+    let output = console.take_output();
+    if output.is_empty() {
+        return Ok(());
+    }
+    out.write_all(&output)?;
+    out.flush()?;
+    console.push_input(&script.feed(&output));
+    Ok(())
+}
+
+/// Passes the typed keys on to the guest. Returns false once the quit key has been typed.
+fn send_keys(console: &Console, keys: &Receiver<Vec<u8>>) -> bool {
+    while let Ok(bytes) = keys.try_recv() {
+        let (typed, quit) = until_quit(&bytes);
+        console.push_input(typed);
+        if quit {
+            return false;
+        }
+    }
+    true
+}
+
+/// The keys before the quit key, and whether it was among them.
+fn until_quit(bytes: &[u8]) -> (&[u8], bool) {
+    match bytes.iter().position(|&byte| byte == QUIT_KEY) {
+        Some(at) => (&bytes[..at], true),
+        None => (bytes, false),
+    }
+}
+
+/// Reads stdin on a thread, as a read blocks. At the end of stdin the thread stops and the
+/// emulator carries on.
+fn read_stdin() -> Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut buffer = [0; 256];
+        while let Ok(count @ 1..) = stdin.read(&mut buffer) {
+            if sender.send(buffer[..count].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+/// What the guest sent to its console, after a run with no terminal attached.
 fn print_console(console: &Console) {
     let output = console.take_output();
     if output.is_empty() {
@@ -247,5 +365,17 @@ fn show_register(addr: u32) {
             let high = field.bit_offset + field.bit_width - 1;
             println!("  {} bits {}-{}", field.name, field.bit_offset, high);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_quit_key_and_what_follows_it_are_not_typed() {
+        assert_eq!(until_quit(b"ab"), (&b"ab"[..], false));
+        assert_eq!(until_quit(b"a\x1Db"), (&b"a"[..], true));
+        assert_eq!(until_quit(b"\x1D"), (&b""[..], true));
     }
 }
