@@ -54,6 +54,13 @@ impl ZmuTarget {
         Ok(ZmuTarget { simulation })
     }
 
+    /// Wrap a processor the caller has already built and reset.
+    pub fn from_processor(processor: crate::Processor) -> ZmuTarget {
+        ZmuTarget {
+            simulation: simulation::Simulation::from_processor(processor),
+        }
+    }
+
     pub fn run(&mut self, poll_incomming_data: impl FnMut() -> bool) -> SimulationRunEvent {
         self.simulation.run(poll_incomming_data)
     }

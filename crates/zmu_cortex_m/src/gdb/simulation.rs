@@ -97,6 +97,16 @@ impl Simulation {
         })
     }
 
+    /// Wrap a processor the caller has already built and reset.
+    pub fn from_processor(processor: Processor) -> Simulation {
+        Simulation {
+            processor,
+            exec_mode: SimulationExecMode::Step,
+            watchpoints: Vec::new(),
+            breakpoints: Vec::new(),
+        }
+    }
+
     /// Run the simulation. This function will block until the simulation is complete.
     pub fn run(&mut self, mut poll_incoming_data: impl FnMut() -> bool) -> SimulationRunEvent {
         match self.exec_mode {

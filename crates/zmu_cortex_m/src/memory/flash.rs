@@ -10,6 +10,7 @@ use byteorder::{ByteOrder, LittleEndian};
 #[derive(Debug)]
 /// Flash memory with configurable start address and data content
 pub struct FlashMemory {
+    base: u32,
     data: Box<[u8]>,
 }
 
@@ -19,7 +20,19 @@ impl FlashMemory {
         let mut data = vec![0_u8; size].into_boxed_slice();
         data.copy_from_slice(new_data);
 
-        Self { data }
+        Self { base: 0, data }
+    }
+
+    /// Same, but the flash sits at `base` in the address space.
+    pub fn new_at(base: u32, size: usize, new_data: &[u8]) -> Self {
+        let mut f = Self::new(size, new_data);
+        f.base = base;
+        f
+    }
+
+    /// Address of the first byte.
+    pub fn base(&self) -> u32 {
+        self.base
     }
 
     /// Get the length
@@ -36,39 +49,45 @@ impl FlashMemory {
 impl Bus for FlashMemory {
     #[inline(always)]
     fn read8(&self, addr: u32) -> Result<u8, Fault> {
-        let a = addr as usize;
+        let a = addr.wrapping_sub(self.base) as usize;
         Ok(self.data[a])
     }
     #[inline(always)]
     fn read16(&self, addr: u32) -> Result<u16, Fault> {
-        let a = addr as usize;
+        let a = addr.wrapping_sub(self.base) as usize;
 
         Ok(LittleEndian::read_u16(&self.data[a..a + 2]))
     }
 
     #[inline(always)]
     fn read32(&mut self, addr: u32) -> Result<u32, Fault> {
-        let a = addr as usize;
+        let a = addr.wrapping_sub(self.base) as usize;
         Ok(LittleEndian::read_u32(&self.data[a..a + 4]))
     }
 
     #[inline(always)]
-    fn write32(&mut self, _addr: u32, _value: u32) -> Result<(), Fault> {
-        Err(Fault::DAccViol)
+    fn write32(&mut self, addr: u32, value: u32) -> Result<(), Fault> {
+        let a = addr.wrapping_sub(self.base) as usize;
+        self.data[a..a + 4].copy_from_slice(&value.to_le_bytes());
+        Ok(())
     }
 
     #[inline(always)]
-    fn write16(&mut self, _addr: u32, _value: u16) -> Result<(), Fault> {
-        Err(Fault::DAccViol)
+    fn write16(&mut self, addr: u32, value: u16) -> Result<(), Fault> {
+        let a = addr.wrapping_sub(self.base) as usize;
+        self.data[a..a + 2].copy_from_slice(&value.to_le_bytes());
+        Ok(())
     }
     #[inline(always)]
-    fn write8(&mut self, _addr: u32, _value: u8) -> Result<(), Fault> {
-        Err(Fault::DAccViol)
+    fn write8(&mut self, addr: u32, value: u8) -> Result<(), Fault> {
+        let a = addr.wrapping_sub(self.base) as usize;
+        self.data[a] = value;
+        Ok(())
     }
 
     #[inline(always)]
     fn in_range(&self, addr: u32) -> bool {
-        addr < (self.data.len() as u32)
+        addr.wrapping_sub(self.base) < (self.data.len() as u32)
     }
 }
 

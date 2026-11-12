@@ -305,7 +305,7 @@ impl ExecutorHelper for Processor {
         self.itstate.get_bits(0..4) == 0b1000
     }
     fn integer_zero_divide_trapping_enabled(&self) -> bool {
-        true
+        self.ccr & (1 << 4) != 0 // CCR.DIV_0_TRP
     }
 
     #[inline(always)]
@@ -543,6 +543,9 @@ impl ExecutorHelper for Processor {
 
             Instruction::MOVT { params } => self.exec_movt(*params),
 
+            Instruction::RBIT { params } => self.exec_rbit(*params),
+            Instruction::SSAT { params } => self.exec_sat(params, true),
+            Instruction::USAT { params } => self.exec_sat(params, false),
             Instruction::REV { params, .. } => self.exec_rev(*params),
             Instruction::REV16 { params, .. } => self.exec_rev16(*params),
             Instruction::REVSH { params, .. } => self.exec_revsh(*params),
@@ -809,11 +812,7 @@ impl Executor for Processor {
     #[inline(always)]
     fn step(&mut self) {
         let pc = self.get_pc();
-        let mapped_pc = if self.mem_map.is_some() {
-            (self.map_address(pc) >> 1) as usize
-        } else {
-            (pc >> 1) as usize
-        };
+        let mapped_pc = (self.map_address(pc).wrapping_sub(self.code.base()) >> 1) as usize;
         let count = match self.instruction_cache.get(mapped_pc).copied() {
             Some(CachedInstruction::Decoded {
                 instruction,

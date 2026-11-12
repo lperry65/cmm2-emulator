@@ -15,7 +15,7 @@ thiserror = "2.0.17"
 
 
 [features]
-default = ["armv7m"]
+default = ["armv7em", "fpv5-d16"]
 has-fp = []
 vfp-register-bank-d16 = []
 fpv4-sp-d16 = ["has-fp", "vfp-register-bank-d16"]

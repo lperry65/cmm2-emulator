@@ -586,9 +586,9 @@ impl IsaLoadAndStore for Processor {
 
             if params.rt == Reg::PC {
                 self.load_write_pc(data)?;
-            } else {
-                self.set_r(params.rt, data);
+                return Ok(ExecuteSuccess::Branched { cycles: 2 });
             }
+            self.set_r(params.rt, data);
 
             return Ok(ExecuteSuccess::Taken { cycles: 2 });
         }
@@ -599,7 +599,8 @@ impl IsaLoadAndStore for Processor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{fault::Fault, instruction::SRType};
+    use crate::bus::Bus;
+    use crate::core::instruction::SRType;
 
     #[test]
     fn test_exec_str_reg_wraps_address_calculation_instead_of_panicking() {
@@ -620,6 +621,25 @@ mod tests {
             wback: false,
         });
 
-        assert_eq!(result, Err(Fault::DAccViol));
+        // 0xffff_ffff + 1 wraps to 0, which is flash; flash is writable.
+        assert_eq!(result, Ok(ExecuteSuccess::Taken { cycles: 2 }));
+        assert_eq!(core.read32(0), Ok(0x1234_5678));
+    }
+
+    #[test]
+    fn test_exec_ldr_lit_to_pc_branches() {
+        let mut core = Processor::new();
+        core.write32(0x14, 0x0000_0101).unwrap();
+        // PC reads as the instruction address plus 4
+        core.set_pc(0x10);
+
+        let result = core.exec_ldr_lit(&RegImm32AddParams {
+            rt: Reg::PC,
+            imm32: 0,
+            add: true,
+        });
+
+        assert_eq!(result, Ok(ExecuteSuccess::Branched { cycles: 2 }));
+        assert_eq!(core.get_pc(), 0x100);
     }
 }

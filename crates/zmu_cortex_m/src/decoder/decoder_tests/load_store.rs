@@ -982,3 +982,31 @@ fn test_decode_strw_imm() {
         }
     );
 }
+
+#[test]
+fn test_decode_ldr_lit_w_negative_offset() {
+    // 0xf85f_9004 LDR.W R9, [PC, #-4]
+    assert_eq!(
+        decode_32(0xf85f_9004),
+        Instruction::LDR_lit {
+            params: RegImm32AddParams {
+                rt: Reg::R9,
+                imm32: 4,
+                add: false,
+            },
+            thumb32: true,
+        }
+    );
+    // 0xf85f_9c04 LDR.W R9, [PC, #-0xc04]
+    assert_eq!(
+        decode_32(0xf85f_9c04),
+        Instruction::LDR_lit {
+            params: RegImm32AddParams {
+                rt: Reg::R9,
+                imm32: 0xc04,
+                add: false,
+            },
+            thumb32: true,
+        }
+    );
+}

@@ -80,6 +80,13 @@ impl GdbServer {
         Ok(GdbServer { target })
     }
 
+    /// Serve a processor the caller has already built and reset.
+    pub fn from_processor(processor: crate::Processor) -> GdbServer {
+        GdbServer {
+            target: ZmuTarget::from_processor(processor),
+        }
+    }
+
     /// Start the GDB Server. This function will block until the GDB client disconnects.
     /// or program execution is complete..
     pub fn start(&mut self) -> Result<u32, GdbServerError> {

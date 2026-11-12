@@ -1,10 +1,19 @@
-use crate::core::instruction::Instruction;
+use crate::core::bits::Bits;
+use crate::core::instruction::{Instruction, SatParams};
+use crate::core::operation::decode_imm_shift;
 
 #[allow(non_snake_case)]
 pub fn decode_USAT_t1(opcode: u32) -> Instruction {
-    Instruction::UDF {
-        imm32: 0,
-        opcode: opcode.into(),
-        thumb32: true,
+    let imm5 = ((opcode.get_bits(12..15) << 2) + opcode.get_bits(6..8)) as u8;
+    let (shift_t, shift_n) = decode_imm_shift((opcode.get_bit(21) as u8) << 1, imm5);
+    Instruction::USAT {
+        params: SatParams {
+            rd: opcode.get_bits(8..12).into(),
+            rn: opcode.get_bits(16..20).into(),
+            // SSAT stores saturate_to - 1 in the field, USAT stores it as is
+            saturate_to: opcode.get_bits(0..5) as u8 + 0,
+            shift_t,
+            shift_n,
+        },
     }
 }

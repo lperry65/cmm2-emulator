@@ -88,6 +88,9 @@ pub fn decode_LDR_imm_t3(opcode: u32) -> Instruction {
 
 #[allow(non_snake_case)]
 pub fn decode_LDR_imm_t4(opcode: u32) -> Instruction {
+    if opcode.get_bits(16..20) == 15 {
+        return decode_LDR_lit_t2(opcode); // Rn = PC is the literal form (here with U = 0)
+    }
     // ARMv7-M
     Instruction::LDR_imm {
         params: Reg2FullParams {
@@ -116,6 +119,9 @@ pub fn decode_LDR_lit_t2(opcode: u32) -> Instruction {
 
 #[allow(non_snake_case)]
 pub fn decode_LDR_reg_t2(opcode: u32) -> Instruction {
+    if opcode.get_bits(16..20) == 15 {
+        return decode_LDR_lit_t2(opcode); // Rn = PC is the literal form (here with U = 0)
+    }
     Instruction::LDR_reg {
         params: Reg3FullParams {
             rm: Reg::from(opcode.get_bits(0..4) as u8),

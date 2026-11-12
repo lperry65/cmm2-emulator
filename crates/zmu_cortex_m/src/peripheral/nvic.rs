@@ -118,7 +118,7 @@ fn clear_bits_array(array: &mut [u32; 16], index: usize, value: u32) {
 impl NVICHelper for Processor {
     fn nvic_set_pending_exceptions(&mut self, index: usize) {
         let mut active = self.nvic_interrupt_pending[index] & self.nvic_interrupt_enabled[index];
-        let mut irqn = index * 4;
+        let mut irqn = index * 32;
         while active != 0 {
             if active & 1 != 0 {
                 self.set_exception_pending(Interrupt { n: irqn });
@@ -130,7 +130,7 @@ impl NVICHelper for Processor {
 
     fn nvic_clear_unpended_exceptions(&mut self, index: usize) {
         let mut active = self.nvic_interrupt_pending[index] & self.nvic_interrupt_enabled[index];
-        for irqn in (index * 4)..(index * 4) + 32 {
+        for irqn in (index * 32)..(index * 32) + 32 {
             if active & 1 == 0 {
                 self.clear_pending_exception(Interrupt { n: irqn });
             }
@@ -335,6 +335,58 @@ mod tests {
 
         // Assert
         assert_eq!(processor.nvic_read_iabr(0), 1);
+    }
+
+    #[test]
+    fn test_nvic_registers_above_word_0_through_bus() {
+        use crate::bus::Bus;
+        let mut processor = Processor::new();
+
+        // 0xE000E104 is ISER1 (IRQ 32..63), 0xE000E1BC is ICER15 (IRQ 480..495)
+        processor.write32(0xE000_E104, 1 << 3).unwrap();
+
+        assert_eq!(processor.nvic_read_iser(0), 0);
+        assert_eq!(processor.nvic_read_iser(1), 1 << 3);
+        assert_eq!(processor.read32(0xE000_E104), Ok(1 << 3));
+        assert_eq!(processor.read32(0xE000_E184), Ok(0xffff_ffff ^ (1 << 3)));
+    }
+
+    #[test]
+    fn test_nvic_pending_interrupt_above_31() {
+        let mut processor = Processor::new();
+
+        processor.nvic_write_iser(1, 1 << 8);
+        processor.nvic_write_ispr(1, 1 << 8);
+
+        assert!(processor.exception_pending(Exception::Interrupt { n: 40 }));
+        assert!(!processor.exception_pending(Exception::Interrupt { n: 8 }));
+    }
+
+    #[test]
+    fn test_nvic_clear_pending_interrupt_above_31() {
+        let mut processor = Processor::new();
+
+        processor.nvic_write_iser(0, 1 << 8);
+        processor.nvic_write_ispr(0, 1 << 8);
+        processor.nvic_write_iser(1, (1 << 8) | (1 << 9));
+        processor.nvic_write_ispr(1, (1 << 8) | (1 << 9));
+
+        processor.nvic_write_icpr(1, 1 << 8);
+
+        assert!(!processor.exception_pending(Exception::Interrupt { n: 40 }));
+        assert!(processor.exception_pending(Exception::Interrupt { n: 41 }));
+        assert!(processor.exception_pending(Exception::Interrupt { n: 8 }));
+    }
+
+    #[test]
+    fn test_nvic_supports_240_interrupts() {
+        let mut processor = Processor::new();
+
+        let irq = Exception::Interrupt { n: 239 };
+        processor.nvic_write_iser(7, 1 << 15);
+        processor.nvic_write_ispr(7, 1 << 15);
+
+        assert!(processor.exception_pending(irq));
     }
 
     #[test]

@@ -264,6 +264,16 @@ pub struct Reg2RnRmParams {
 
 #[allow(missing_docs)]
 #[derive(PartialEq, Debug, Copy, Clone)]
+pub struct SatParams {
+    pub rd: Reg,
+    pub rn: Reg,
+    pub saturate_to: u8,
+    pub shift_t: SRType,
+    pub shift_n: u8,
+}
+
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
 pub struct Reg2RdRmParams {
     pub rd: Reg,
     pub rm: Reg,
@@ -1108,7 +1118,18 @@ pub enum Instruction {
     MOVT {
         params: MovtParams,
     },
-    // RBIT
+    /// Reverse bits
+    RBIT {
+        params: Reg2RdRmParams,
+    },
+    /// Signed saturate
+    SSAT {
+        params: SatParams,
+    },
+    /// Unsigned saturate
+    USAT {
+        params: SatParams,
+    },
     /// Byte-reverse word
     REV {
         params: Reg2RdRmParams,
@@ -2351,6 +2372,17 @@ impl fmt::Display for Instruction {
                 }
             ),
 
+            Self::RBIT { params } => write!(f, "rbit {}, {}", params.rd, params.rm),
+            Self::SSAT { params } => write!(
+                f,
+                "ssat {}, #{}, {}",
+                params.rd, params.saturate_to, params.rn
+            ),
+            Self::USAT { params } => write!(
+                f,
+                "usat {}, #{}, {}",
+                params.rd, params.saturate_to, params.rn
+            ),
             Self::REV { params, .. } => write!(f, "rev {}, {}", params.rd, params.rm),
             Self::REV16 { params, .. } => write!(f, "rev16 {}, {}", params.rd, params.rm),
             Self::REVSH { params, .. } => write!(f, "revsh {}, {}", params.rd, params.rm),
@@ -3079,8 +3111,9 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         //QDSUB
         //QSUB16
         //QSUB8
-
-        //RBIT
+        Instruction::RBIT { .. } => 4,
+        Instruction::SSAT { .. } => 4,
+        Instruction::USAT { .. } => 4,
         Instruction::REV { thumb32, .. } => isize_t(*thumb32),
         Instruction::REV16 { thumb32, .. } => isize_t(*thumb32),
         Instruction::REVSH { thumb32, .. } => isize_t(*thumb32),

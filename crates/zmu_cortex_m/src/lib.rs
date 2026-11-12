@@ -312,7 +312,7 @@ fn make_default_exception_priorities() -> HashMap<usize, ExceptionState> {
         ExceptionState::new(Exception::SysTick, 0),
     );
 
-    for irqn in 0..32 {
+    for irqn in 0..240 {
         let irq = Exception::Interrupt { n: irqn };
         priorities.insert(irq.into(), ExceptionState::new(irq, 0));
     }
@@ -421,6 +421,17 @@ impl Processor {
         self
     }
 
+    /// Configure flash memory at a base address.
+    pub fn flash_memory_at<'a>(
+        &'a mut self,
+        base: u32,
+        flash_size: usize,
+        code: &[u8],
+    ) -> &'a mut Self {
+        self.code = FlashMemory::new_at(base, flash_size, code);
+        self
+    }
+
     /// Configure memory mapping
     pub fn memory_map(&mut self, map: Option<MemoryMapConfig>) -> &mut Self {
         self.mem_map = map;
@@ -476,9 +487,10 @@ impl Processor {
     pub fn cache_instructions(&mut self) {
         // pre-cache the decoded instructions
         {
-            let mut pc = 0;
+            let base = self.code.base();
+            let mut pc = base;
 
-            while pc < (self.code.len() as u32) {
+            while pc - base < (self.code.len() as u32) {
                 match self.fetch(pc) {
                     Ok(thumb) => {
                         let instruction = self.decode(thumb);
@@ -495,6 +507,32 @@ impl Processor {
                 }
                 pc += 2;
             }
+        }
+    }
+
+    /// Re-decode the cached instructions that cover a flash write.
+    pub(crate) fn recache(&mut self, addr: u32, len: u32) {
+        if self.instruction_cache.is_empty() {
+            return;
+        }
+        let base = self.code.base();
+        let first = (addr.wrapping_sub(base) >> 1).saturating_sub(1) as usize;
+        let last = ((addr.wrapping_sub(base) + len) >> 1) as usize;
+        for idx in first..=last.min(self.instruction_cache.len() - 1) {
+            let pc = base + (idx as u32) * 2;
+            self.instruction_cache[idx] = match self.fetch(pc) {
+                Ok(thumb) => {
+                    let instruction = self.decode(thumb);
+                    CachedInstruction::Decoded {
+                        instruction,
+                        instruction_size: instruction_size(&instruction),
+                    }
+                }
+                Err(fault) => {
+                    let status = self.take_pending_fault_status();
+                    CachedInstruction::FetchFault { fault, status }
+                }
+            };
         }
     }
 

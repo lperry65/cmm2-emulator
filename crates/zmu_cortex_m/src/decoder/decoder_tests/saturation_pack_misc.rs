@@ -185,3 +185,84 @@ fn test_decode_uxtb_w() {
         }
     );
 }
+
+#[test]
+fn test_decode_rev_w() {
+    // REV.W R2, R1
+    assert_eq!(
+        decode_32(0xfa91_f281),
+        Instruction::REV {
+            params: Reg2RdRmParams {
+                rd: Reg::R2,
+                rm: Reg::R1,
+            },
+            thumb32: true,
+        }
+    );
+    // REV16.W R2, R1
+    assert_eq!(
+        decode_32(0xfa91_f291),
+        Instruction::REV16 {
+            params: Reg2RdRmParams {
+                rd: Reg::R2,
+                rm: Reg::R1,
+            },
+            thumb32: true,
+        }
+    );
+    // REVSH.W R2, R1
+    assert_eq!(
+        decode_32(0xfa91_f2b1),
+        Instruction::REVSH {
+            params: Reg2RdRmParams {
+                rd: Reg::R2,
+                rm: Reg::R1,
+            },
+            thumb32: true,
+        }
+    );
+}
+
+#[test]
+fn test_decode_rbit() {
+    // RBIT R2, R1
+    assert_eq!(
+        decode_32(0xfa91_f2a1),
+        Instruction::RBIT {
+            params: Reg2RdRmParams {
+                rd: Reg::R2,
+                rm: Reg::R1,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_ssat_usat() {
+    // SSAT R2, #8, R1
+    assert_eq!(
+        decode_32(0xf301_0207),
+        Instruction::SSAT {
+            params: SatParams {
+                rd: Reg::R2,
+                rn: Reg::R1,
+                saturate_to: 8,
+                shift_t: SRType::LSL,
+                shift_n: 0,
+            }
+        }
+    );
+    // USAT R2, #8, R1, ASR #2
+    assert_eq!(
+        decode_32(0xf3a1_0288),
+        Instruction::USAT {
+            params: SatParams {
+                rd: Reg::R2,
+                rn: Reg::R1,
+                saturate_to: 8,
+                shift_t: SRType::ASR,
+                shift_n: 2,
+            }
+        }
+    );
+}

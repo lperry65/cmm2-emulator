@@ -140,11 +140,11 @@ impl Bus for Processor {
             0xE000_E014 => self.syst_read_rvr(),
             0xE000_E018 => self.syst_read_cvr(),
             0xE000_E01C => self.syst_read_calib(),
-            0xE000_E100..=0xE000_E13C => self.nvic_read_iser(((addr - 0xE000_E100) >> 5) as usize),
-            0xE000_E180..=0xE000_E1BC => self.nvic_read_icer(((addr - 0xE000_E180) >> 5) as usize),
-            0xE000_E200..=0xE000_E23C => self.nvic_read_ispr(((addr - 0xE000_E200) >> 5) as usize),
-            0xE000_E280..=0xE000_E2BC => self.nvic_read_icpr(((addr - 0xE000_E280) >> 5) as usize),
-            0xE000_E300..=0xE000_E33C => self.nvic_read_iabr(((addr - 0xE000_E300) >> 5) as usize),
+            0xE000_E100..=0xE000_E13C => self.nvic_read_iser(((addr - 0xE000_E100) >> 2) as usize),
+            0xE000_E180..=0xE000_E1BC => self.nvic_read_icer(((addr - 0xE000_E180) >> 2) as usize),
+            0xE000_E200..=0xE000_E23C => self.nvic_read_ispr(((addr - 0xE000_E200) >> 2) as usize),
+            0xE000_E280..=0xE000_E2BC => self.nvic_read_icpr(((addr - 0xE000_E280) >> 2) as usize),
+            0xE000_E300..=0xE000_E33C => self.nvic_read_iabr(((addr - 0xE000_E300) >> 2) as usize),
             0xE000_E400..=0xE000_E5EC => self.nvic_read_ipr(((addr - 0xE000_E400) >> 2) as usize),
 
             0xE000_ED00 => self.cpuid,
@@ -207,7 +207,9 @@ impl Bus for Processor {
             return self.sram.write32(addr, value);
         }
         if self.code.in_range(addr) {
-            return self.code.write32(addr, value);
+            self.code.write32(addr, value)?;
+            self.recache(addr, 4);
+            return Ok(());
         }
         if let Some(device) = self.device.as_mut()
             && device.in_range(addr)
@@ -228,6 +230,7 @@ impl Bus for Processor {
             0xE000_ED04 => self.write_icsr(value),
             0xE000_ED08 => self.write_vtor(value),
             0xE000_ED10 => self.write_scr(value),
+            0xE000_ED14 => self.ccr = value,
             0xE000_ED24 => self.write_shcsr(value),
             #[cfg(not(feature = "armv6m"))]
             0xE000_ED28 => self.write_cfsr(value),
@@ -254,16 +257,16 @@ impl Bus for Processor {
             0xE000_E014 => self.syst_write_rvr(value),
             0xE000_E018 => self.syst_write_cvr(value),
             0xE000_E100..=0xE000_E13C => {
-                self.nvic_write_iser(((addr - 0xE000_E100) >> 5) as usize, value);
+                self.nvic_write_iser(((addr - 0xE000_E100) >> 2) as usize, value);
             }
             0xE000_E180..=0xE000_E1BC => {
-                self.nvic_write_icer(((addr - 0xE000_E180) >> 5) as usize, value);
+                self.nvic_write_icer(((addr - 0xE000_E180) >> 2) as usize, value);
             }
             0xE000_E200..=0xE000_E23C => {
-                self.nvic_write_ispr(((addr - 0xE000_E200) >> 5) as usize, value);
+                self.nvic_write_ispr(((addr - 0xE000_E200) >> 2) as usize, value);
             }
             0xE000_E280..=0xE000_E2BC => {
-                self.nvic_write_icpr(((addr - 0xE000_E280) >> 5) as usize, value);
+                self.nvic_write_icpr(((addr - 0xE000_E280) >> 2) as usize, value);
             }
             0xE000_E400..=0xE000_E5EC => {
                 self.nvic_write_ipr(((addr - 0xE000_E400) >> 2) as usize, value);
@@ -284,7 +287,9 @@ impl Bus for Processor {
             return self.sram.write16(addr, value);
         }
         if self.code.in_range(addr) {
-            return self.code.write16(addr, value);
+            self.code.write16(addr, value)?;
+            self.recache(addr, 2);
+            return Ok(());
         }
         if let Some(device) = self.device.as_mut()
             && device.in_range(addr)
@@ -324,7 +329,9 @@ impl Bus for Processor {
             return self.sram.write8(addr, value);
         }
         if self.code.in_range(addr) {
-            return self.code.write8(addr, value);
+            self.code.write8(addr, value)?;
+            self.recache(addr, 1);
+            return Ok(());
         }
         if let Some(device) = self.device.as_mut()
             && device.in_range(addr)

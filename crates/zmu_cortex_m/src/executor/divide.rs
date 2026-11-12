@@ -79,4 +79,35 @@ mod tests {
         assert_eq!(core.get_r(Reg::R0), 0x29a);
         assert_eq!(core.get_r(Reg::R1), 0x3);
     }
+
+    #[test]
+    fn test_div_by_zero_follows_ccr_div_0_trp() {
+        let mut core = Processor::new();
+        core.set_r(Reg::R0, 10);
+        core.set_r(Reg::R1, 0);
+        let params = Reg3NoSetFlagsParams {
+            rd: Reg::R2,
+            rn: Reg::R0,
+            rm: Reg::R1,
+        };
+
+        // CCR.DIV_0_TRP clear: the result is 0
+        core.set_r(Reg::R2, 0xff);
+        assert_eq!(
+            core.exec_udiv(&params),
+            Ok(ExecuteSuccess::Taken { cycles: 2 })
+        );
+        assert_eq!(core.get_r(Reg::R2), 0);
+        core.set_r(Reg::R2, 0xff);
+        assert_eq!(
+            core.exec_sdiv(&params),
+            Ok(ExecuteSuccess::Taken { cycles: 2 })
+        );
+        assert_eq!(core.get_r(Reg::R2), 0);
+
+        // CCR.DIV_0_TRP set: usage fault
+        core.ccr = 1 << 4;
+        assert_eq!(core.exec_udiv(&params), Err(Fault::DivByZero));
+        assert_eq!(core.exec_sdiv(&params), Err(Fault::DivByZero));
+    }
 }
