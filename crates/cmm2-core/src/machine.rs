@@ -21,7 +21,7 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
         .map_peripheral(RCC_BASE, RCC_SIZE, Box::new(Rcc::new()))
         .expect("RCC window is clear of RAM");
     memory
-        .map_peripheral(RTC_BASE, RTC_SIZE, Box::new(Rtc::new()))
+        .map_peripheral(RTC_BASE, RTC_SIZE, Box::new(Rtc::new(memory.clock())))
         .expect("RTC window is clear of RAM");
     memory
         .map_peripheral(
@@ -86,6 +86,14 @@ mod tests {
         assert_eq!(m.read32(0x5800_400C), 0x27); // RTC_ISR
         m.write32(0x5800_400C, 0x80); // INIT
         assert_eq!(m.read32(0x5800_400C), 0xE7);
+    }
+
+    #[test]
+    fn the_rtc_counts_with_the_machine_clock() {
+        let mut m = cmm2_memory(&Irqs::new());
+        assert_eq!(m.read32(0x5800_4000), 0); // RTC_TR
+        m.clock().set(480_000_000);
+        assert_eq!(m.read32(0x5800_4000), 1);
     }
 
     #[test]

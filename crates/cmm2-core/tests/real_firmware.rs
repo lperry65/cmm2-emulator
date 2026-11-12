@@ -308,3 +308,47 @@ fn real_firmware_reboots_after_the_date_prompt() {
     assert!(!second.contains("Initial setup"), "{second:?}");
     assert!(second.ends_with("\r\n> "), "{second:?}");
 }
+
+/// Boots, answers the setup questions and runs through the reset to the second boot's prompt.
+/// Returns the instruction count at the prompt.
+fn boot_to_second_prompt(cpu: &mut Cpu, console: &Console) -> u64 {
+    run_to_text(cpu, console, "Keyboard type", 300_000_000);
+    console.push_input(b"1");
+    run_to_text(cpu, console, "HH:MM:SS", 20_000_000);
+    console.push_input(b"12:00:00\r");
+    run_to_text(cpu, console, "DD/MM/YY", 20_000_000);
+    console.push_input(b"12/11/26\r");
+    while cpu.resets() == 0 {
+        assert!(cpu.instruction_count() < 250_000_000, "no reset");
+        let stop = cpu.run(1_000_000);
+        assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
+        console.take_output();
+    }
+    run_to_text(cpu, console, "\r\n> ", 500_000_000);
+    cpu.instruction_count()
+}
+
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_leaves_the_rtc_second_wait() {
+    let firmware = firmware();
+    let irqs = Irqs::new();
+    let mut memory = cmm2_memory(&irqs);
+    let console = memory.console();
+    let trace = Rc::new(RefCell::new(0u64));
+    let sink = trace.clone();
+    memory.set_peripheral_trace(Some(Box::new(move |access| {
+        if !access.write && access.addr == 0x5800_4000 {
+            *sink.borrow_mut() += 1;
+        }
+    })));
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
+
+    let prompt = boot_to_second_prompt(&mut cpu, &console);
+    // The firmware used to wait in a loop that read RTC_TR about 143,000 times and, with a
+    // clock that did not count, never left it. Measured: it reads RTC_TR 3 times in the
+    // whole run to the second prompt, and the second prompt is at 612 million instructions.
+    let reads = *trace.borrow();
+    println!("second prompt at {prompt}, RTC_TR reads so far: {reads}");
+    assert!(reads < 1_000, "{reads}");
+}

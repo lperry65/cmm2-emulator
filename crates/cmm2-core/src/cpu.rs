@@ -1087,7 +1087,7 @@ mod tests {
             .map_peripheral(RCC_BASE, RCC_SIZE, Box::new(Rcc::new()))
             .unwrap();
         memory
-            .map_peripheral(RTC_BASE, RTC_SIZE, Box::new(Rtc::new()))
+            .map_peripheral(RTC_BASE, RTC_SIZE, Box::new(Rtc::new(memory.clock())))
             .unwrap();
         let mut cpu = Cpu::new(&image(&code, &[]), memory, Irqs::new()).unwrap();
         while cpu.resets() == 0 {
