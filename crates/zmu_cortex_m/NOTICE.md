@@ -20,6 +20,9 @@ The firmware needs a few things zmu does not do, so I changed the following.
   and the pending-exception and clear scans used the wrong interrupt number
   for words above 0.
 - Core register: the CCR register (0xE000ED14) is now writable.
+- Core registers: AIRCR, DFSR, MMFAR, BFAR and AFSR can now be written (they were
+  read-only). AIRCR only accepts a write that carries the VECTKEY, and reads 0xFA05_0000
+  before it is written.
 - CCR and zero divide: SDIV and UDIV trap on division by zero only when
   CCR.DIV_0_TRP is set; before, they always trapped.
 - Flash writes: stores to flash are allowed, and the cached decoded

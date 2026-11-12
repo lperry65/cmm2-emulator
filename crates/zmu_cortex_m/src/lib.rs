@@ -366,7 +366,7 @@ impl Processor {
             semihost_func: None,
             cpuid: 0,
             icsr: 0,
-            aircr: 0,
+            aircr: 0xFA05_0000,
             scr: 0,
             ccr: 0,
             shcsr: 0,

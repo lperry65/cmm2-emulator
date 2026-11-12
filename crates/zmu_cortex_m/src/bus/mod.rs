@@ -229,6 +229,14 @@ impl Bus for Processor {
 
             0xE000_ED04 => self.write_icsr(value),
             0xE000_ED08 => self.write_vtor(value),
+            0xE000_ED0C => {
+                // Only a write with the VECTKEY is accepted, and only PRIGROUP is kept. It is
+                // stored the way a read returns it (VECTKEYSTAT, little endian). SYSRESETREQ
+                // and VECTCLRACTIVE do nothing, and priority grouping is not applied.
+                if value >> 16 == 0x05FA {
+                    self.aircr = 0xFA05_0000 | (value & 0x0000_0700);
+                }
+            }
             0xE000_ED10 => self.write_scr(value),
             0xE000_ED14 => self.ccr = value,
             0xE000_ED24 => self.write_shcsr(value),
@@ -236,6 +244,14 @@ impl Bus for Processor {
             0xE000_ED28 => self.write_cfsr(value),
             #[cfg(not(feature = "armv6m"))]
             0xE000_ED2C => self.write_hfsr(value),
+            #[cfg(not(feature = "armv6m"))]
+            0xE000_ED30 => self.dfsr &= !value,
+            #[cfg(not(feature = "armv6m"))]
+            0xE000_ED34 => self.mmfar = value,
+            #[cfg(not(feature = "armv6m"))]
+            0xE000_ED38 => self.bfar = value,
+            #[cfg(not(feature = "armv6m"))]
+            0xE000_ED3C => self.afsr = value,
             #[cfg(any(feature = "armv7m", feature = "armv7em"))]
             0xE000_ED18 => self.write_shpr1(value),
             #[cfg(any(feature = "armv7m", feature = "armv7em"))]
@@ -464,6 +480,54 @@ mod tests {
         assert_eq!(processor.read32(0xE000_ED34), Ok(0x2000_1234));
         assert_eq!(processor.read32(0xE000_ED38), Ok(0x4000_5678));
         assert_eq!(processor.read32(0xE000_ED3C), Ok(0x89ab_cdef));
+    }
+
+    #[test]
+    fn test_aircr_reads_vectkeystat_before_write() {
+        let mut processor = Processor::new();
+
+        assert_eq!(processor.read32(0xE000_ED0C), Ok(0xFA05_0000));
+        assert_eq!(processor.write32(0xE000_ED0C, 0x05FA_0300), Ok(()));
+        assert_eq!(processor.read32(0xE000_ED0C), Ok(0xFA05_0300));
+    }
+
+    #[test]
+    fn test_aircr_write_needs_vectkey() {
+        let mut processor = Processor::new();
+
+        assert_eq!(processor.write32(0xE000_ED0C, 0x05FA_0500), Ok(()));
+        assert_eq!(processor.read32(0xE000_ED0C), Ok(0xFA05_0500));
+
+        // Wrong key: ignored.
+        assert_eq!(processor.write32(0xE000_ED0C, 0x1234_0300), Ok(()));
+        assert_eq!(processor.read32(0xE000_ED0C), Ok(0xFA05_0500));
+
+        // Only PRIGROUP is kept; ENDIANNESS, SYSRESETREQ and VECTCLRACTIVE are not.
+        assert_eq!(processor.write32(0xE000_ED0C, 0x05FA_8706), Ok(()));
+        assert_eq!(processor.read32(0xE000_ED0C), Ok(0xFA05_0700));
+    }
+
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_dfsr_is_write_one_to_clear() {
+        let mut processor = Processor::new();
+        processor.dfsr = 0x0000_001f;
+
+        assert_eq!(processor.write32(0xE000_ED30, 0x0000_0005), Ok(()));
+        assert_eq!(processor.read32(0xE000_ED30), Ok(0x0000_001a));
+        assert_eq!(processor.write32(0xE000_ED30, 0), Ok(()));
+        assert_eq!(processor.read32(0xE000_ED30), Ok(0x0000_001a));
+    }
+
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_mmfar_bfar_afsr_round_trip() {
+        let mut processor = Processor::new();
+
+        for address in [0xE000_ED34, 0xE000_ED38, 0xE000_ED3C] {
+            assert_eq!(processor.write32(address, 0x89ab_cdef), Ok(()));
+            assert_eq!(processor.read32(address), Ok(0x89ab_cdef));
+        }
     }
 
     #[test]
