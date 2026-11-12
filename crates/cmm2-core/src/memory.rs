@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use crate::peripheral::{Peripheral, PeripheralAccess, RegisterStub};
+
 /// DTCM RAM. Owned by the CPU core, like the flash.
 pub const DTCM_BASE: u32 = 0x2000_0000;
 pub const DTCM_SIZE: usize = 128 * 1024;
@@ -77,12 +79,17 @@ pub struct UnmappedAccess {
 #[derive(Debug, PartialEq, Eq)]
 pub enum MemoryError {
     Unmapped(u32),
+    /// A peripheral window would overlap a RAM region or another window.
+    Overlap(u32),
 }
 
 impl fmt::Display for MemoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MemoryError::Unmapped(addr) => write!(f, "address {addr:#010x} is not mapped"),
+            MemoryError::Overlap(addr) => {
+                write!(f, "window at {addr:#010x} overlaps mapped memory")
+            }
         }
     }
 }
@@ -94,8 +101,18 @@ struct Region {
     data: Box<[u8]>,
 }
 
+struct Window {
+    base: u32,
+    size: u32,
+    device: Box<dyn Peripheral>,
+}
+
+type Trace = Box<dyn FnMut(&PeripheralAccess)>;
+
 pub struct MemoryMap {
     regions: Vec<Region>,
+    windows: Vec<Window>,
+    trace: Option<Trace>,
     unmapped: Vec<UnmappedAccess>,
     dropped: u64,
 }
@@ -117,6 +134,8 @@ impl MemoryMap {
             .collect();
         MemoryMap {
             regions,
+            windows: Vec::new(),
+            trace: None,
             unmapped: Vec::new(),
             dropped: 0,
         }
@@ -144,6 +163,51 @@ impl MemoryMap {
 
     pub fn write32(&mut self, addr: u32, value: u32) {
         self.write_bytes(addr, value.to_le_bytes(), value);
+    }
+
+    /// Maps `device` over `size` bytes at `base`. Nothing is allocated for the window, so it
+    /// can be as large as the address range it stands for. An access that runs past the end
+    /// of the window never reaches `device`: it is logged as partly unmapped.
+    pub fn map_peripheral(
+        &mut self,
+        base: u32,
+        size: u32,
+        device: Box<dyn Peripheral>,
+    ) -> Result<(), MemoryError> {
+        let start = u64::from(base);
+        let end = start + u64::from(size);
+        let overlaps = |other_base: u32, other_size: u64| {
+            let other_start = u64::from(other_base);
+            start < other_start + other_size && other_start < end
+        };
+        let taken = self
+            .regions
+            .iter()
+            .any(|r| overlaps(r.base, r.data.len() as u64))
+            || self
+                .windows
+                .iter()
+                .any(|w| overlaps(w.base, u64::from(w.size)));
+        if taken {
+            return Err(MemoryError::Overlap(base));
+        }
+        self.windows.push(Window { base, size, device });
+        Ok(())
+    }
+
+    /// Puts a `RegisterStub` over the peripheral space (0x4000_0000 up to 0x6000_0000) and
+    /// the Cortex-M private peripheral bus (0xE000_0000 up to 0xE010_0000). Returns the
+    /// error of the first window that cannot be mapped; a window mapped before it stays.
+    pub fn map_unmodelled_peripherals(&mut self) -> Result<(), MemoryError> {
+        for (base, size) in [(0x4000_0000, 0x2000_0000), (0xE000_0000, 0x10_0000)] {
+            self.map_peripheral(base, size, Box::new(RegisterStub::new()))?;
+        }
+        Ok(())
+    }
+
+    /// Calls `f` after every peripheral access, modelled or not, in order. `None` stops it.
+    pub fn set_peripheral_trace(&mut self, f: Option<Trace>) {
+        self.trace = f;
     }
 
     /// Copies `bytes` to `addr`. Stops at the first unmapped byte, so the bytes before it
@@ -182,6 +246,28 @@ impl MemoryMap {
         })
     }
 
+    /// The window that holds all `size` bytes at `addr`, and the offset into it. An access
+    /// that runs past the end of a window is not found here, so it is handled like any other
+    /// partly unmapped access: byte by byte against the RAM, one record, and the peripheral
+    /// sees none of it.
+    fn window(&self, addr: u32, size: u8) -> Option<(usize, u32)> {
+        self.windows.iter().enumerate().find_map(|(i, w)| {
+            let offset = addr.checked_sub(w.base)?;
+            (u64::from(offset) + u64::from(size) <= u64::from(w.size)).then_some((i, offset))
+        })
+    }
+
+    fn traced(&mut self, addr: u32, size: u8, write: bool, value: u32) {
+        if let Some(trace) = &mut self.trace {
+            trace(&PeripheralAccess {
+                addr,
+                size,
+                write,
+                value,
+            });
+        }
+    }
+
     /// Unmapped bytes read as 0.
     fn read_bytes<const N: usize>(&mut self, addr: u32) -> [u8; N] {
         let mut out = [0; N];
@@ -189,6 +275,13 @@ impl MemoryMap {
             && let Some(src) = self.regions[region].data.get(offset..offset + N)
         {
             out.copy_from_slice(src);
+            return out;
+        }
+        if let Some((window, offset)) = self.window(addr, N as u8) {
+            let mask = u32::MAX >> (32 - 8 * N as u32);
+            let value = self.windows[window].device.read(offset, N as u8) & mask;
+            self.traced(addr, N as u8, false, value);
+            out.copy_from_slice(&value.to_le_bytes()[..N]);
             return out;
         }
         let mut missed = false;
@@ -210,6 +303,11 @@ impl MemoryMap {
             && let Some(dst) = self.regions[region].data.get_mut(offset..offset + N)
         {
             dst.copy_from_slice(&bytes);
+            return;
+        }
+        if let Some((window, offset)) = self.window(addr, N as u8) {
+            self.windows[window].device.write(offset, N as u8, value);
+            self.traced(addr, N as u8, true, value);
             return;
         }
         let mut missed = false;
@@ -240,7 +338,9 @@ impl MemoryMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FLASH_BASE;
+    use crate::{FLASH_BASE, Svd};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn region(name: &str) -> &'static RegionSpec {
         REGIONS.iter().find(|r| r.name == name).unwrap()
@@ -482,5 +582,409 @@ mod tests {
     fn creating_the_map_is_cheap() {
         // Zeroed allocations come straight from the OS, so the 32 MB of SDRAM costs nothing.
         let _ = MemoryMap::new();
+    }
+
+    /// Returns a count on each read of offset 0, and keeps what is written to offset 4.
+    /// Every access is also noted in `seen` as (offset, size, written value).
+    type Seen = Rc<RefCell<Vec<(u32, u8, Option<u32>)>>>;
+
+    struct Counter {
+        next: u32,
+        stored: u32,
+        seen: Seen,
+    }
+
+    impl Counter {
+        fn new() -> (Counter, Seen) {
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let counter = Counter {
+                next: 1,
+                stored: 0,
+                seen: seen.clone(),
+            };
+            (counter, seen)
+        }
+    }
+
+    impl Peripheral for Counter {
+        fn read(&mut self, offset: u32, size: u8) -> u32 {
+            self.seen.borrow_mut().push((offset, size, None));
+            if offset == 0 {
+                self.next += 1;
+                self.next - 1
+            } else {
+                self.stored
+            }
+        }
+
+        fn write(&mut self, offset: u32, size: u8, value: u32) {
+            self.seen.borrow_mut().push((offset, size, Some(value)));
+            if offset == 4 {
+                self.stored = value;
+            }
+        }
+    }
+
+    fn events() -> (Rc<RefCell<Vec<PeripheralAccess>>>, Option<Trace>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let sink = log.clone();
+        (log, Some(Box::new(move |e| sink.borrow_mut().push(*e))))
+    }
+
+    #[test]
+    fn peripheral_receives_offsets_and_sizes() {
+        let (counter, seen) = Counter::new();
+        let mut m = MemoryMap::new();
+        m.map_peripheral(0x4000_1000, 0x100, Box::new(counter))
+            .unwrap();
+
+        assert_eq!(m.read32(0x4000_1000), 1);
+        assert_eq!(m.read16(0x4000_1000), 2);
+        m.write32(0x4000_1004, 0xAABB_CCDD);
+        assert_eq!(m.read32(0x4000_1004), 0xAABB_CCDD);
+        m.write8(0x4000_1004, 0x7F);
+        assert_eq!(m.read8(0x4000_1004), 0x7F);
+        m.write16(0x4000_1004, 0x1234);
+
+        assert_eq!(
+            *seen.borrow(),
+            [
+                (0, 4, None),
+                (0, 2, None),
+                (4, 4, Some(0xAABB_CCDD)),
+                (4, 4, None),
+                (4, 1, Some(0x7F)),
+                (4, 1, None),
+                (4, 2, Some(0x1234)),
+            ]
+        );
+        assert!(m.take_unmapped().is_empty());
+    }
+
+    #[test]
+    fn window_edges_are_inside_and_outside() {
+        let (counter, seen) = Counter::new();
+        let mut m = MemoryMap::new();
+        m.map_peripheral(0x4000_1000, 0x100, Box::new(counter))
+            .unwrap();
+        m.read32(0x4000_10FC);
+        m.read8(0x4000_10FF);
+        assert_eq!(seen.borrow().len(), 2);
+        m.read8(0x4000_1100);
+        m.read8(0x4000_0FFF);
+        assert_eq!(seen.borrow().len(), 2);
+        assert_eq!(m.take_unmapped().len(), 2);
+    }
+
+    #[test]
+    fn large_window_costs_nothing() {
+        let mut m = MemoryMap::new();
+        m.map_peripheral(0x4000_0000, 0x2000_0000, Box::new(RegisterStub::new()))
+            .unwrap();
+    }
+
+    fn mapped() -> MemoryMap {
+        let mut m = MemoryMap::new();
+        m.map_peripheral(0x4000_0000, 0x1000, Box::new(RegisterStub::new()))
+            .unwrap();
+        m
+    }
+
+    #[test]
+    fn window_over_ram_is_rejected() {
+        let mut m = mapped();
+        let stub = || Box::new(RegisterStub::new());
+        // Start inside, end inside, and containing a RAM region.
+        assert_eq!(
+            m.map_peripheral(0x2400_0000, 0x10, stub()),
+            Err(MemoryError::Overlap(0x2400_0000))
+        );
+        assert_eq!(
+            m.map_peripheral(0x23FF_FFF0, 0x20, stub()),
+            Err(MemoryError::Overlap(0x23FF_FFF0))
+        );
+        assert_eq!(
+            m.map_peripheral(0x2000_0000, 0x1000_0000, stub()),
+            Err(MemoryError::Overlap(0x2000_0000))
+        );
+    }
+
+    #[test]
+    fn window_over_another_window_is_rejected() {
+        let mut m = mapped();
+        let stub = || Box::new(RegisterStub::new());
+        // Partial overlap at either end, containment both ways, and the same window.
+        for (base, size) in [
+            (0x3FFF_FF00, 0x200),
+            (0x4000_0F00, 0x200),
+            (0x4000_0100, 0x10),
+            (0x3FFF_0000, 0x2_0000),
+            (0x4000_0000, 0x1000),
+        ] {
+            assert_eq!(
+                m.map_peripheral(base, size, stub()),
+                Err(MemoryError::Overlap(base)),
+                "{base:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_windows_are_accepted() {
+        let mut m = mapped();
+        let stub = || Box::new(RegisterStub::new());
+        assert_eq!(m.map_peripheral(0x4000_1000, 0x1000, stub()), Ok(()));
+        assert_eq!(m.map_peripheral(0x3FFF_F000, 0x1000, stub()), Ok(()));
+        // Touching a RAM region without overlapping it.
+        assert_eq!(m.map_peripheral(0x3004_8000, 0x1000, stub()), Ok(()));
+    }
+
+    #[test]
+    fn failed_mapping_leaves_the_map_alone() {
+        let mut m = mapped();
+        let _ = m.map_peripheral(0x4000_0800, 0x1000, Box::new(RegisterStub::new()));
+        assert_eq!(m.read32(0x4000_1000), 0);
+        assert_eq!(m.take_unmapped().len(), 1);
+    }
+
+    #[test]
+    fn overlap_error_is_readable() {
+        assert_eq!(
+            MemoryError::Overlap(0x4000_0000).to_string(),
+            "window at 0x40000000 overlaps mapped memory"
+        );
+    }
+
+    #[test]
+    fn access_past_the_end_of_a_window_is_unmapped() {
+        let (counter, seen) = Counter::new();
+        let mut m = MemoryMap::new();
+        m.map_peripheral(0x4000_1000, 0x100, Box::new(counter))
+            .unwrap();
+
+        m.write32(0x4000_10FE, 0x4433_2211);
+        assert_eq!(
+            m.take_unmapped(),
+            [UnmappedAccess {
+                addr: 0x4000_10FE,
+                size: 4,
+                kind: AccessKind::Write(0x4433_2211)
+            }]
+        );
+        assert_eq!(m.read32(0x4000_10FE), 0);
+        assert_eq!(m.take_unmapped().len(), 1);
+        // The peripheral did not see any of it.
+        assert!(seen.borrow().is_empty());
+    }
+
+    #[test]
+    fn access_from_ram_into_a_window_is_unmapped() {
+        let mut m = MemoryMap::new();
+        m.map_peripheral(0x3004_8000, 0x100, Box::new(RegisterStub::new()))
+            .unwrap();
+        m.write16(0x3004_7FFF, 0xAABB);
+        assert_eq!(m.take_unmapped().len(), 1);
+        assert_eq!(m.read8(0x3004_7FFF), 0xBB);
+        // The byte that fell in the window was not delivered.
+        assert_eq!(m.read8(0x3004_8000), 0);
+        assert!(m.take_unmapped().is_empty());
+    }
+
+    struct AllOnes;
+
+    impl Peripheral for AllOnes {
+        fn read(&mut self, _offset: u32, _size: u8) -> u32 {
+            0xFFFF_FFFF
+        }
+
+        fn write(&mut self, _offset: u32, _size: u8, _value: u32) {}
+    }
+
+    #[test]
+    fn read_value_is_masked_to_the_access_size() {
+        let mut m = MemoryMap::new();
+        m.map_peripheral(0x4000_0000, 0x100, Box::new(AllOnes))
+            .unwrap();
+        let (log, trace) = events();
+        m.set_peripheral_trace(trace);
+        assert_eq!(m.read8(0x4000_0000), 0xFF);
+        assert_eq!(m.read16(0x4000_0000), 0xFFFF);
+        assert_eq!(m.read32(0x4000_0000), 0xFFFF_FFFF);
+        let values: Vec<u32> = log.borrow().iter().map(|e| e.value).collect();
+        assert_eq!(values, [0xFF, 0xFFFF, 0xFFFF_FFFF]);
+    }
+
+    #[test]
+    fn write_value_is_masked_for_the_trace_only() {
+        let (counter, seen) = Counter::new();
+        let mut m = MemoryMap::new();
+        m.map_peripheral(0x4000_0000, 0x100, Box::new(counter))
+            .unwrap();
+        let (log, trace) = events();
+        m.set_peripheral_trace(trace);
+        m.write8(0x4000_0004, 0xAB);
+        m.write16(0x4000_0004, 0x1234);
+        let values: Vec<u32> = log.borrow().iter().map(|e| e.value).collect();
+        assert_eq!(values, [0xAB, 0x1234]);
+        // The device is given the value as it came in.
+        assert_eq!(*seen.borrow(), [(4, 1, Some(0xAB)), (4, 2, Some(0x1234))]);
+    }
+
+    #[test]
+    fn unmodelled_peripherals_twice_is_an_overlap() {
+        let mut m = MemoryMap::new();
+        m.map_unmodelled_peripherals().unwrap();
+        assert_eq!(
+            m.map_unmodelled_peripherals(),
+            Err(MemoryError::Overlap(0x4000_0000))
+        );
+    }
+
+    #[test]
+    fn unmodelled_peripherals_round_trip() {
+        let mut m = MemoryMap::new();
+        m.map_unmodelled_peripherals().unwrap();
+        m.write32(0x5802_4400, 0x0303_0083);
+        assert_eq!(m.read32(0x5802_4400), 0x0303_0083);
+        m.write32(0xE000_ED14, 0x200);
+        assert_eq!(m.read32(0xE000_ED14), 0x200);
+        m.write16(0x4000_0002, 0xAAAA);
+        assert_eq!(m.read32(0x4000_0000), 0xAAAA_0000);
+        assert!(m.take_unmapped().is_empty());
+    }
+
+    #[test]
+    fn unmodelled_peripherals_stop_at_their_ends() {
+        let mut m = MemoryMap::new();
+        m.map_unmodelled_peripherals().unwrap();
+        for addr in [0x3FFF_FFFF, 0x6000_0000, 0xDFFF_FFFF, 0xE010_0000] {
+            m.write8(addr, 1);
+            assert_eq!(m.read8(addr), 0, "{addr:#x}");
+            assert_eq!(m.take_unmapped().len(), 2, "{addr:#x}");
+        }
+        for addr in [0x5FFF_FFFC, 0xE00F_FFFC, 0x4000_0000, 0xE000_0000] {
+            m.write32(addr, 1);
+            assert_eq!(m.read32(addr), 1, "{addr:#x}");
+        }
+        assert!(m.take_unmapped().is_empty());
+    }
+
+    #[test]
+    fn ram_still_works_and_is_not_traced() {
+        let mut m = MemoryMap::new();
+        m.map_unmodelled_peripherals().unwrap();
+        let (log, trace) = events();
+        m.set_peripheral_trace(trace);
+        m.write32(0x2400_0000, 0x1234_5678);
+        assert_eq!(m.read32(0x2400_0000), 0x1234_5678);
+        m.write8(0xD000_0000, 9);
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn trace_sees_reads_and_writes_in_order() {
+        let mut m = MemoryMap::new();
+        m.map_unmodelled_peripherals().unwrap();
+        let (log, trace) = events();
+        m.set_peripheral_trace(trace);
+
+        m.write32(0x5802_4400, 0xAB);
+        assert_eq!(m.read16(0x5802_4400), 0xAB);
+
+        assert_eq!(
+            *log.borrow(),
+            [
+                PeripheralAccess {
+                    addr: 0x5802_4400,
+                    size: 4,
+                    write: true,
+                    value: 0xAB
+                },
+                PeripheralAccess {
+                    addr: 0x5802_4400,
+                    size: 2,
+                    write: false,
+                    value: 0xAB
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn trace_can_be_switched_off() {
+        let mut m = MemoryMap::new();
+        m.map_unmodelled_peripherals().unwrap();
+        let (log, trace) = events();
+        m.set_peripheral_trace(trace);
+        m.read32(0x5802_4400);
+        m.set_peripheral_trace(None);
+        m.read32(0x5802_4400);
+        m.write32(0x5802_4400, 1);
+        assert_eq!(log.borrow().len(), 1);
+    }
+
+    #[test]
+    fn trace_does_not_see_unmapped_accesses() {
+        let mut m = MemoryMap::new();
+        m.map_unmodelled_peripherals().unwrap();
+        let (log, trace) = events();
+        m.set_peripheral_trace(trace);
+        m.read32(0x6000_0000);
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn trace_events_can_be_named_with_the_svd() {
+        let mut m = MemoryMap::new();
+        m.map_unmodelled_peripherals().unwrap();
+        let named = Rc::new(RefCell::new(Vec::new()));
+        let sink = named.clone();
+        let svd = Svd::stm32h743();
+        m.set_peripheral_trace(Some(Box::new(move |e| {
+            let name = svd.lookup(e.addr).map(|l| l.name.to_string());
+            sink.borrow_mut().push((name.unwrap(), e.write));
+        })));
+
+        m.write32(0x5802_4400, 1);
+        m.read32(0x5200_414C);
+
+        assert_eq!(
+            *named.borrow(),
+            [
+                ("RCC_CR".to_string(), true),
+                ("FMC_SDTR2".to_string(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn trace_sees_modelled_peripherals() {
+        let (counter, _) = Counter::new();
+        let mut m = MemoryMap::new();
+        m.map_peripheral(0x4000_1000, 0x100, Box::new(counter))
+            .unwrap();
+        let (log, trace) = events();
+        m.set_peripheral_trace(trace);
+
+        m.read32(0x4000_1000);
+        m.write32(0x4000_1004, 7);
+
+        assert_eq!(
+            *log.borrow(),
+            [
+                PeripheralAccess {
+                    addr: 0x4000_1000,
+                    size: 4,
+                    write: false,
+                    value: 1
+                },
+                PeripheralAccess {
+                    addr: 0x4000_1004,
+                    size: 4,
+                    write: true,
+                    value: 7
+                },
+            ]
+        );
     }
 }
