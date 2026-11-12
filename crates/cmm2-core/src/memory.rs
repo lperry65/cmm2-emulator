@@ -117,6 +117,8 @@ type Trace = Box<dyn FnMut(&PeripheralAccess)>;
 pub struct MemoryMap {
     regions: Vec<Region>,
     windows: Vec<Window>,
+    // Consulted only when no window holds the access.
+    fallbacks: Vec<Window>,
     trace: Option<Trace>,
     unmapped: Vec<UnmappedAccess>,
     dropped: u64,
@@ -141,6 +143,7 @@ impl MemoryMap {
         MemoryMap {
             regions,
             windows: Vec::new(),
+            fallbacks: Vec::new(),
             trace: None,
             unmapped: Vec::new(),
             dropped: 0,
@@ -180,13 +183,34 @@ impl MemoryMap {
 
     /// Maps `device` over `size` bytes at `base`. Nothing is allocated for the window, so it
     /// can be as large as the address range it stands for. An access that runs past the end
-    /// of the window never reaches `device`: it is logged as partly unmapped.
+    /// of the window never reaches `device`: it is logged as partly unmapped, unless a
+    /// fallback holds all of it. The window may lie inside a fallback, where it wins.
     pub fn map_peripheral(
         &mut self,
         base: u32,
         size: u32,
         device: Box<dyn Peripheral>,
     ) -> Result<(), MemoryError> {
+        self.check_free(base, size, &self.windows)?;
+        self.windows.push(Window { base, size, device });
+        Ok(())
+    }
+
+    /// Like `map_peripheral`, but the window only serves the accesses that no
+    /// `map_peripheral` window holds. It may not overlap RAM or another fallback.
+    pub fn map_fallback(
+        &mut self,
+        base: u32,
+        size: u32,
+        device: Box<dyn Peripheral>,
+    ) -> Result<(), MemoryError> {
+        self.check_free(base, size, &self.fallbacks)?;
+        self.fallbacks.push(Window { base, size, device });
+        Ok(())
+    }
+
+    // Whether `base..base + size` is clear of the RAM regions and of `windows`.
+    fn check_free(&self, base: u32, size: u32, windows: &[Window]) -> Result<(), MemoryError> {
         let start = u64::from(base);
         let end = start + u64::from(size);
         let overlaps = |other_base: u32, other_size: u64| {
@@ -197,24 +221,21 @@ impl MemoryMap {
             .regions
             .iter()
             .any(|r| overlaps(r.base, r.data.len() as u64))
-            || self
-                .windows
-                .iter()
-                .any(|w| overlaps(w.base, u64::from(w.size)));
+            || windows.iter().any(|w| overlaps(w.base, u64::from(w.size)));
         if taken {
             return Err(MemoryError::Overlap(base));
         }
-        self.windows.push(Window { base, size, device });
         Ok(())
     }
 
     /// Puts a `RegisterStub` over the peripheral space (0x4000_0000 up to 0x6000_0000) and
-    /// the Cortex-M private peripheral bus (0xE000_0000 up to 0xE010_0000). Returns the
-    /// error of the first window that cannot be mapped; a window mapped before it stays.
+    /// the Cortex-M private peripheral bus (0xE000_0000 up to 0xE010_0000), as fallbacks:
+    /// peripherals that are modelled win. Returns the error of the first window that cannot
+    /// be mapped; a window mapped before it stays.
     pub fn map_unmodelled_peripherals(&mut self) -> Result<(), MemoryError> {
         for (base, size) in [(0x4000_0000, 0x2000_0000), (0xE000_0000, 0x10_0000)] {
             let stub = RegisterStub::with_reset_values(base, Svd::stm32h743());
-            self.map_peripheral(base, size, Box::new(stub))?;
+            self.map_fallback(base, size, Box::new(stub))?;
         }
         Ok(())
     }
@@ -260,15 +281,27 @@ impl MemoryMap {
         })
     }
 
-    /// The window that holds all `size` bytes at `addr`, and the offset into it. An access
-    /// that runs past the end of a window is not found here, so it is handled like any other
-    /// partly unmapped access: byte by byte against the RAM, one record, and the peripheral
-    /// sees none of it.
-    fn window(&self, addr: u32, size: u8) -> Option<(usize, u32)> {
-        self.windows.iter().enumerate().find_map(|(i, w)| {
+    /// The device whose window holds all `size` bytes at `addr`, and the offset into it: a
+    /// specific window if there is one, else a fallback. An access that runs past the end of
+    /// a window is not served by it, so one that straddles the edge of a specific window goes
+    /// to the fallback around it, which sees it whole. If nothing holds it all, it is handled
+    /// like any other partly unmapped access: byte by byte against the RAM, one record, and
+    /// no peripheral sees any of it.
+    fn window(&mut self, addr: u32, size: u8) -> Option<(&mut dyn Peripheral, u32)> {
+        let holds = |w: &Window| {
             let offset = addr.checked_sub(w.base)?;
-            (u64::from(offset) + u64::from(size) <= u64::from(w.size)).then_some((i, offset))
-        })
+            (u64::from(offset) + u64::from(size) <= u64::from(w.size)).then_some(offset)
+        };
+        let windows = if self.windows.iter().any(|w| holds(w).is_some()) {
+            &mut self.windows
+        } else {
+            &mut self.fallbacks
+        };
+        let (i, offset) = windows
+            .iter()
+            .enumerate()
+            .find_map(|(i, w)| Some((i, holds(w)?)))?;
+        Some((&mut *windows[i].device, offset))
     }
 
     fn traced(&mut self, addr: u32, size: u8, write: bool, value: u32) {
@@ -292,9 +325,9 @@ impl MemoryMap {
             out.copy_from_slice(src);
             return out;
         }
-        if let Some((window, offset)) = self.window(addr, N as u8) {
+        if let Some((device, offset)) = self.window(addr, N as u8) {
             let mask = u32::MAX >> (32 - 8 * N as u32);
-            let value = self.windows[window].device.read(offset, N as u8) & mask;
+            let value = device.read(offset, N as u8) & mask;
             self.traced(addr, N as u8, false, value);
             out.copy_from_slice(&value.to_le_bytes()[..N]);
             return out;
@@ -320,8 +353,8 @@ impl MemoryMap {
             dst.copy_from_slice(&bytes);
             return;
         }
-        if let Some((window, offset)) = self.window(addr, N as u8) {
-            self.windows[window].device.write(offset, N as u8, value);
+        if let Some((device, offset)) = self.window(addr, N as u8) {
+            device.write(offset, N as u8, value);
             self.traced(addr, N as u8, true, value);
             return;
         }
@@ -1047,5 +1080,131 @@ mod tests {
 
         assert_eq!(m.take_unmapped()[0].pc, 0x0800_1234);
         assert_eq!(log.borrow()[0].pc, 0x0800_5678);
+    }
+
+    // A window at 0x4000_1000 (0x100 bytes) that only answers with its own marker, inside a
+    // fallback stub over 0x4000_0000 (0x1000_0000 bytes).
+    fn with_fallback() -> (MemoryMap, Seen) {
+        let (counter, seen) = Counter::new();
+        let mut m = MemoryMap::new();
+        m.map_fallback(0x4000_0000, 0x1000_0000, Box::new(RegisterStub::new()))
+            .unwrap();
+        m.map_peripheral(0x4000_1000, 0x100, Box::new(counter))
+            .unwrap();
+        (m, seen)
+    }
+
+    #[test]
+    fn specific_window_wins_inside_a_fallback() {
+        let (mut m, seen) = with_fallback();
+        assert_eq!(m.read32(0x4000_1000), 1);
+        assert_eq!(*seen.borrow(), [(0, 4, None)]);
+        m.write32(0x4000_1004, 0xAABB_CCDD);
+        assert_eq!(m.read32(0x4000_1004), 0xAABB_CCDD);
+    }
+
+    #[test]
+    fn fallback_serves_the_rest() {
+        let (mut m, seen) = with_fallback();
+        m.write32(0x4000_0FFC, 7);
+        m.write32(0x4000_1100, 8);
+        assert_eq!(m.read32(0x4000_0FFC), 7);
+        assert_eq!(m.read32(0x4000_1100), 8);
+        assert!(seen.borrow().is_empty());
+        assert!(m.take_unmapped().is_empty());
+    }
+
+    // An access that is not wholly inside the specific window goes to the fallback when the
+    // fallback holds all its bytes: the specific window never sees a partial access.
+    #[test]
+    fn access_straddling_a_specific_window_goes_to_the_fallback() {
+        let (mut m, seen) = with_fallback();
+        m.write32(0x4000_10FE, 0x4433_2211);
+        assert_eq!(m.read32(0x4000_10FE), 0x4433_2211);
+        m.write16(0x4000_0FFF, 0xAABB);
+        assert_eq!(m.read16(0x4000_0FFF), 0xAABB);
+        assert!(seen.borrow().is_empty());
+        assert!(m.take_unmapped().is_empty());
+    }
+
+    #[test]
+    fn fallback_only_serves_accesses_it_holds_whole() {
+        let mut m = MemoryMap::new();
+        m.map_fallback(0x4000_0000, 0x100, Box::new(RegisterStub::new()))
+            .unwrap();
+        m.write32(0x4000_00FE, 1);
+        assert_eq!(m.take_unmapped().len(), 1);
+    }
+
+    #[test]
+    fn fallback_over_ram_is_rejected() {
+        let mut m = MemoryMap::new();
+        let stub = || Box::new(RegisterStub::new());
+        assert_eq!(
+            m.map_fallback(0x2400_0000, 0x10, stub()),
+            Err(MemoryError::Overlap(0x2400_0000))
+        );
+        assert_eq!(
+            m.map_fallback(0x2000_0000, 0x1000_0000, stub()),
+            Err(MemoryError::Overlap(0x2000_0000))
+        );
+    }
+
+    #[test]
+    fn fallback_over_another_fallback_is_rejected() {
+        let mut m = MemoryMap::new();
+        let stub = || Box::new(RegisterStub::new());
+        m.map_fallback(0x4000_0000, 0x1000, stub()).unwrap();
+        assert_eq!(
+            m.map_fallback(0x4000_0800, 0x1000, stub()),
+            Err(MemoryError::Overlap(0x4000_0800))
+        );
+        assert_eq!(m.map_fallback(0x4000_1000, 0x1000, stub()), Ok(()));
+    }
+
+    #[test]
+    fn specific_windows_still_cannot_overlap_inside_a_fallback() {
+        let (mut m, _) = with_fallback();
+        assert_eq!(
+            m.map_peripheral(0x4000_1080, 0x100, Box::new(RegisterStub::new())),
+            Err(MemoryError::Overlap(0x4000_1080))
+        );
+        // Over a part of the fallback that no specific window holds.
+        assert_eq!(
+            m.map_peripheral(0x4000_2000, 0x100, Box::new(RegisterStub::new())),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn specific_window_can_be_mapped_before_the_fallback() {
+        let (counter, _) = Counter::new();
+        let mut m = MemoryMap::new();
+        m.map_peripheral(0x4000_1000, 0x100, Box::new(counter))
+            .unwrap();
+        m.map_fallback(0x4000_0000, 0x1000_0000, Box::new(RegisterStub::new()))
+            .unwrap();
+        assert_eq!(m.read32(0x4000_1000), 1);
+    }
+
+    #[test]
+    fn unmodelled_peripherals_map_both_ranges() {
+        let mut m = MemoryMap::new();
+        m.map_unmodelled_peripherals().unwrap();
+        m.write32(0x4000_0000, 1);
+        m.write32(0xE000_0000, 2);
+        assert_eq!(m.read32(0x4000_0000), 1);
+        assert_eq!(m.read32(0xE000_0000), 2);
+    }
+
+    #[test]
+    fn modelled_peripheral_wins_over_the_unmodelled_ones() {
+        let (counter, _) = Counter::new();
+        let mut m = MemoryMap::new();
+        m.map_peripheral(0x5802_4800, 0x400, Box::new(counter))
+            .unwrap();
+        m.map_unmodelled_peripherals().unwrap();
+        assert_eq!(m.read32(0x5802_4800), 1);
+        assert_eq!(m.read32(0x5802_4400), 0x83);
     }
 }

@@ -28,6 +28,12 @@ The loop gives up after 1000 ticks of the counter the SysTick handler advances, 
 
 So nothing before this point needs a modelled peripheral, and this is the first thing that does.
 
+**Later, with the power controller modelled:** both power waits pass. The 3 million instruction run
+then ends in a bounded poll of `RCC_CR` bit 17 (`HSERDY`, which gives up after 100 ticks), and
+after 60 million instructions the firmware is polling `RTC_ISR` (`0x5800400C`), which reads its
+reset value `0x0003FF5F` every time: 5,026,089 reads. The clock controller and the RTC are the next
+two models.
+
 ## What happens before it
 
 | Instruction | What |

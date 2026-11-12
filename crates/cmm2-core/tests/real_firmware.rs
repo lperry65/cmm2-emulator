@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cmm2_core::{
-    Cpu, FLASH_BASE, FLASH_SIZE, Firmware, Irqs, MemoryMap, PeripheralAccess, Stop, Svd,
+    Cpu, FLASH_BASE, FLASH_SIZE, Firmware, Irqs, PeripheralAccess, Stop, Svd, cmm2_memory,
 };
 
 fn firmware() -> Firmware {
@@ -23,8 +23,7 @@ fn real_firmware_vector_table() {
 #[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
 fn real_firmware_runs_its_first_instructions() {
     let firmware = firmware();
-    let mut memory = MemoryMap::new();
-    memory.map_unmodelled_peripherals().unwrap();
+    let mut memory = cmm2_memory();
     let trace = Rc::new(RefCell::new(Vec::<PeripheralAccess>::new()));
     let sink = trace.clone();
     memory.set_peripheral_trace(Some(Box::new(move |access| {
@@ -51,4 +50,31 @@ fn real_firmware_runs_its_first_instructions() {
     assert!(names.contains(&"RCC_PLL1DIVR"));
     let first_rcc = names.iter().find(|name| name.starts_with("RCC_"));
     assert_eq!(first_rcc, Some(&"RCC_CR"));
+}
+
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_passes_the_pwr_voltage_waits() {
+    let firmware = firmware();
+    let mut memory = cmm2_memory();
+    let trace = Rc::new(RefCell::new(Vec::<PeripheralAccess>::new()));
+    let sink = trace.clone();
+    memory.set_peripheral_trace(Some(Box::new(move |access| {
+        sink.borrow_mut().push(*access)
+    })));
+    let mut cpu = Cpu::new(&firmware, memory, Irqs::new()).unwrap();
+
+    let stop = cpu.run(3_000_000);
+    assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
+
+    let svd = Svd::stm32h743();
+    let reads = |register: &str| {
+        trace
+            .borrow()
+            .iter()
+            .filter(|a| !a.write && svd.lookup(a.addr).is_some_and(|l| l.name == register))
+            .count()
+    };
+    assert!(reads("PWR_CSR1") < 100, "{}", reads("PWR_CSR1"));
+    assert!(reads("PWR_D3CR") < 100, "{}", reads("PWR_D3CR"));
 }

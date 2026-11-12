@@ -9,8 +9,8 @@ use std::rc::Rc;
 
 use args::{Command, RunOptions};
 use cmm2_core::{
-    AccessKind, Cpu, CpuError, Firmware, FirmwareError, Irqs, MemoryError, MemoryMap,
-    PeripheralAccess, Stop, Svd,
+    AccessKind, Cpu, CpuError, Firmware, FirmwareError, Irqs, MemoryError, PeripheralAccess, Stop,
+    Svd, cmm2_memory,
 };
 
 /// How many unmapped accesses the summary lists; the count covers all of them.
@@ -161,8 +161,7 @@ fn access_line(access: &PeripheralAccess) -> String {
 /// Returns whether the run ended without a fault.
 fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
     let firmware = Firmware::load(path)?;
-    let mut memory = MemoryMap::new();
-    memory.map_unmodelled_peripherals()?;
+    let mut memory = cmm2_memory();
     let trace = trace_out(options)?;
     if let (Some(trace), true) = (&trace, options.trace_mmio) {
         let sink = trace.clone();

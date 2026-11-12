@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use crate::registers::{Registers, WordAccess};
 use crate::svd::Svd;
 
 /// A device mapped into the address space. `offset` is the byte offset from the start of
@@ -28,28 +29,23 @@ pub struct PeripheralAccess {
     pub pc: u32,
 }
 
-/// For peripherals that are not modelled: every register just remembers what was written.
-/// Registers are 32 bits wide; narrower accesses read and merge into the word they fall in.
-/// A word starts at zero, or at the reset values from the SVD if the stub has them.
+/// The registers of a peripheral that is not modelled: every register just remembers what
+/// was written. A word starts at zero, or at the reset values from the SVD if it has them.
 #[derive(Debug, Default)]
-pub struct RegisterStub {
+pub struct StubRegisters {
     // Keyed by the offset of the word, which is a multiple of 4.
     words: HashMap<u32, u32>,
     // The absolute address the stub is mapped at, and the registers found there.
     resets: Option<(u32, &'static Svd)>,
 }
 
-impl RegisterStub {
-    pub fn new() -> RegisterStub {
-        RegisterStub::default()
-    }
-
-    /// `base` is the absolute address of the start of the window the stub is mapped at.
-    /// Bytes that no register in the SVD covers start at zero.
-    pub fn with_reset_values(base: u32, svd: &'static Svd) -> RegisterStub {
-        RegisterStub {
+impl StubRegisters {
+    /// `base` is the absolute address of the start of the window the registers are mapped
+    /// at. Bytes that no register in the SVD covers start at zero.
+    pub fn with_reset_values(base: u32, svd: &'static Svd) -> StubRegisters {
+        StubRegisters {
             resets: Some((base, svd)),
-            ..RegisterStub::default()
+            ..StubRegisters::default()
         }
     }
 
@@ -72,38 +68,29 @@ impl RegisterStub {
     }
 }
 
-impl RegisterStub {
-    /// The offset of the word an access starts in, the bit shift of its first byte within
-    /// that word, and how many words it touches (two only when it crosses a boundary).
-    fn span(offset: u32, size: u8) -> (u32, u32, u32) {
-        let shift = 8 * (offset & 3);
-        let words = if shift + 8 * u32::from(size) > 32 {
-            2
-        } else {
-            1
-        };
-        (offset & !3, shift, words)
+impl Registers for StubRegisters {
+    fn read(&mut self, offset: u32) -> u32 {
+        *self.word(offset)
+    }
+
+    fn write(&mut self, offset: u32, value: u32, mask: u32) {
+        let word = self.word(offset);
+        *word = *word & !mask | value & mask;
     }
 }
 
-impl Peripheral for RegisterStub {
-    fn read(&mut self, offset: u32, size: u8) -> u32 {
-        let (base, shift, words) = Self::span(offset, size);
-        let mut combined = 0u64;
-        for i in 0..words {
-            combined |= u64::from(*self.word(base.wrapping_add(4 * i))) << (32 * i);
-        }
-        (combined >> shift) as u32 & (u32::MAX >> (32 - 8 * u32::from(size)))
+/// For peripherals that are not modelled. Registers are 32 bits wide; narrower accesses read
+/// and merge into the word they fall in.
+pub type RegisterStub = WordAccess<StubRegisters>;
+
+impl RegisterStub {
+    pub fn new() -> RegisterStub {
+        RegisterStub::default()
     }
 
-    fn write(&mut self, offset: u32, size: u8, value: u32) {
-        let (base, shift, words) = Self::span(offset, size);
-        let mask = u64::from(u32::MAX >> (32 - 8 * u32::from(size))) << shift;
-        let bits = (u64::from(value) << shift) & mask;
-        for i in 0..words {
-            let word = self.word(base.wrapping_add(4 * i));
-            *word = (*word & !((mask >> (32 * i)) as u32)) | (bits >> (32 * i)) as u32;
-        }
+    /// See `StubRegisters::with_reset_values`.
+    pub fn with_reset_values(base: u32, svd: &'static Svd) -> RegisterStub {
+        WordAccess::wrap(StubRegisters::with_reset_values(base, svd))
     }
 }
 
@@ -219,12 +206,12 @@ mod tests {
     fn aligned_word_write_makes_one_entry() {
         let mut s = RegisterStub::new();
         s.write(0x20, 4, 1);
-        assert_eq!(s.words.len(), 1);
+        assert_eq!(s.inner().words.len(), 1);
         s.write(0x22, 2, 1);
         s.write(0x21, 1, 1);
-        assert_eq!(s.words.len(), 1);
+        assert_eq!(s.inner().words.len(), 1);
         s.write(0x23, 2, 1);
-        assert_eq!(s.words.len(), 2);
+        assert_eq!(s.inner().words.len(), 2);
     }
 
     // Registers at 0x1000: R32 (reset 0x11223344) at 0, R16A (0xAABB) at 4, R16B (0xCCDD) at 6,
@@ -295,7 +282,7 @@ mod tests {
         let mut s = with_resets();
         let first = s.read(0x100, 4);
         assert_eq!(s.read(0x100, 4), first);
-        assert_eq!(s.words.len(), 1);
+        assert_eq!(s.inner().words.len(), 1);
     }
 
     #[test]
