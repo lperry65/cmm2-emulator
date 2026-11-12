@@ -49,6 +49,17 @@ touching no peripheral. An earlier spike identified the same loop as the flash s
 the firmware starts an erase of the option or program sector and waits for the flash interrupt
 handler to set the byte. The flash controller is the next model.
 
+**Then, with the flash controller modelled:** the erase completes. The firmware unlocks bank 2
+with the two keys, erases sector 7 (`0x081E0000`, the saved options) and sector 1 (`0x08120000`, the
+program area), then programs both with stores, setting and clearing `PG` around each 32 byte word
+(31 programming sequences on sector 7 and 4 on sector 1 in the first 3 million instructions). The
+flash interrupt handler runs once per erase. The run then settles in a microsecond delay routine at
+`0x0809ADE2` (`ldr` of `TIM16_CNT`, `sub`, `uxth`, `cmp #1000`, `bcc`), waiting for the 16 bit
+difference to reach 1000: 49.6 million reads of `TIM16_CNT` in a 250 million instruction run. It also
+polls `RNG_SR` (44,757 reads). One read goes outside the flash, 2 bytes at `0x08200000` from
+`0x0800419E`, and the machine logs it as unmapped. The next models are a counting `TIM16` (and
+`TIM5`, the free-running counter) and the RNG.
+
 ## What happens before it
 
 | Instruction | What |

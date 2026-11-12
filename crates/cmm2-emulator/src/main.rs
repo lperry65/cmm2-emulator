@@ -161,7 +161,8 @@ fn access_line(access: &PeripheralAccess) -> String {
 /// Returns whether the run ended without a fault.
 fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
     let firmware = Firmware::load(path)?;
-    let mut memory = cmm2_memory();
+    let irqs = Irqs::new();
+    let mut memory = cmm2_memory(&irqs);
     let trace = trace_out(options)?;
     if let (Some(trace), true) = (&trace, options.trace_mmio) {
         let sink = trace.clone();
@@ -170,7 +171,7 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
                 .line(format_args!("{}", access_line(access)));
         })));
     }
-    let mut cpu = Cpu::new(&firmware, memory, Irqs::new())?;
+    let mut cpu = Cpu::new(&firmware, memory, irqs)?;
 
     let limit = options.run.unwrap_or(u64::MAX);
     let stop = match (&options.trace, &trace) {

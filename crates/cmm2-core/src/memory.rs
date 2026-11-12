@@ -8,6 +8,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::rc::Rc;
 
+use crate::flash_ops::FlashOps;
 use crate::peripheral::{Peripheral, PeripheralAccess, RegisterStub};
 use crate::svd::Svd;
 
@@ -123,6 +124,7 @@ pub struct MemoryMap {
     unmapped: Vec<UnmappedAccess>,
     dropped: u64,
     pc: Rc<Cell<u32>>,
+    flash_ops: FlashOps,
 }
 
 impl Default for MemoryMap {
@@ -148,6 +150,7 @@ impl MemoryMap {
             unmapped: Vec::new(),
             dropped: 0,
             pc: Rc::new(Cell::new(0)),
+            flash_ops: FlashOps::new(),
         }
     }
 
@@ -155,6 +158,11 @@ impl MemoryMap {
     /// 0 until a CPU is attached.
     pub fn pc_cell(&self) -> Rc<Cell<u32>> {
         self.pc.clone()
+    }
+
+    /// The queue of flash changes that the flash controller makes and the CPU carries out.
+    pub fn flash_ops(&self) -> FlashOps {
+        self.flash_ops.clone()
     }
 
     pub fn read8(&mut self, addr: u32) -> u8 {

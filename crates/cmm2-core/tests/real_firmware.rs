@@ -23,13 +23,14 @@ fn real_firmware_vector_table() {
 #[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
 fn real_firmware_runs_its_first_instructions() {
     let firmware = firmware();
-    let mut memory = cmm2_memory();
+    let irqs = Irqs::new();
+    let mut memory = cmm2_memory(&irqs);
     let trace = Rc::new(RefCell::new(Vec::<PeripheralAccess>::new()));
     let sink = trace.clone();
     memory.set_peripheral_trace(Some(Box::new(move |access| {
         sink.borrow_mut().push(*access)
     })));
-    let mut cpu = Cpu::new(&firmware, memory, Irqs::new()).unwrap();
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
 
     assert_eq!(cpu.run(100_000), Stop::InstructionLimit);
     assert!(cpu.instruction_count() >= 100_000);
@@ -56,13 +57,14 @@ fn real_firmware_runs_its_first_instructions() {
 #[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
 fn real_firmware_passes_the_pwr_voltage_waits() {
     let firmware = firmware();
-    let mut memory = cmm2_memory();
+    let irqs = Irqs::new();
+    let mut memory = cmm2_memory(&irqs);
     let trace = Rc::new(RefCell::new(Vec::<PeripheralAccess>::new()));
     let sink = trace.clone();
     memory.set_peripheral_trace(Some(Box::new(move |access| {
         sink.borrow_mut().push(*access)
     })));
-    let mut cpu = Cpu::new(&firmware, memory, Irqs::new()).unwrap();
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
 
     let stop = cpu.run(3_000_000);
     assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
@@ -83,13 +85,14 @@ fn real_firmware_passes_the_pwr_voltage_waits() {
 #[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
 fn real_firmware_passes_the_rcc_clock_waits() {
     let firmware = firmware();
-    let mut memory = cmm2_memory();
+    let irqs = Irqs::new();
+    let mut memory = cmm2_memory(&irqs);
     let trace = Rc::new(RefCell::new(Vec::<PeripheralAccess>::new()));
     let sink = trace.clone();
     memory.set_peripheral_trace(Some(Box::new(move |access| {
         sink.borrow_mut().push(*access)
     })));
-    let mut cpu = Cpu::new(&firmware, memory, Irqs::new()).unwrap();
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
 
     let stop = cpu.run(3_000_000);
     assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
@@ -107,13 +110,14 @@ fn real_firmware_passes_the_rcc_clock_waits() {
 #[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
 fn real_firmware_passes_the_rtc_waits() {
     let firmware = firmware();
-    let mut memory = cmm2_memory();
+    let irqs = Irqs::new();
+    let mut memory = cmm2_memory(&irqs);
     let trace = Rc::new(RefCell::new(Vec::<PeripheralAccess>::new()));
     let sink = trace.clone();
     memory.set_peripheral_trace(Some(Box::new(move |access| {
         sink.borrow_mut().push(*access)
     })));
-    let mut cpu = Cpu::new(&firmware, memory, Irqs::new()).unwrap();
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
 
     let stop = cpu.run(3_000_000);
     assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
@@ -125,4 +129,42 @@ fn real_firmware_passes_the_rtc_waits() {
         .filter(|a| !a.write && svd.lookup(a.addr).is_some_and(|l| l.name == "RTC_RTC_ISR"))
         .count();
     assert!(isr_reads < 200, "{isr_reads}");
+}
+
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_passes_the_flash_erase_wait() {
+    let firmware = firmware();
+    let irqs = Irqs::new();
+    let mut memory = cmm2_memory(&irqs);
+    let trace = Rc::new(RefCell::new(Vec::<PeripheralAccess>::new()));
+    let sink = trace.clone();
+    memory.set_peripheral_trace(Some(Box::new(move |access| {
+        sink.borrow_mut().push(*access)
+    })));
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
+
+    let stop = cpu.run(3_000_000);
+    assert!(!matches!(stop, Stop::Fault(_)), "{stop:?}");
+
+    // The wait for the flash interrupt handler was at 0x08094DD6.
+    let pc = cpu.pc();
+    assert!(!(0x0809_4DD6..=0x0809_4DE4).contains(&pc), "{pc:#010x}");
+
+    const FLASH_CR2: u32 = 0x5200_210C;
+    const SER_START: u32 = 1 << 2 | 1 << 7;
+    let starts: Vec<u32> = trace
+        .borrow()
+        .iter()
+        .filter(|a| a.write && a.addr == FLASH_CR2 && a.value & SER_START == SER_START)
+        .map(|a| a.value)
+        .collect();
+    // The first one erases sector 7 of bank 2.
+    assert_eq!(starts.first().map(|v| v >> 8 & 7), Some(7), "{starts:x?}");
+    assert!(starts.len() >= 3, "{starts:x?}");
+
+    // Measured: three erases (sector 7 of bank 2, then sector 1 twice), and the firmware has
+    // programmed the first word of both sectors by the end of the run.
+    assert_ne!(cpu.read32(0x081E_0000), 0xFFFF_FFFF);
+    assert_ne!(cpu.read32(0x0812_0000), 0xFFFF_FFFF);
 }

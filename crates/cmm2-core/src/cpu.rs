@@ -17,6 +17,7 @@ use zmu_cortex_m::executor::Executor;
 use zmu_cortex_m::peripheral::nvic::NVIC;
 
 use crate::firmware::{FLASH_BASE, FLASH_SIZE, Firmware};
+use crate::flash_ops::{FlashOp, FlashOps};
 use crate::irq::Irqs;
 use crate::memory::MemoryMap;
 
@@ -118,6 +119,7 @@ pub struct Cpu {
     processor: Processor,
     memory: Rc<RefCell<MemoryMap>>,
     irqs: Irqs,
+    flash_ops: FlashOps,
     pc: Rc<Cell<u32>>,
 }
 
@@ -128,6 +130,7 @@ impl Cpu {
     /// the first thing that goes wrong; the guest's own fault handlers do not run.
     pub fn new(firmware: &Firmware, memory: MemoryMap, irqs: Irqs) -> Result<Cpu, CpuError> {
         let pc = memory.pc_cell();
+        let flash_ops = memory.flash_ops();
         let memory = Rc::new(RefCell::new(memory));
 
         let mut flash = vec![0xFF; FLASH_SIZE];
@@ -151,6 +154,7 @@ impl Cpu {
             processor,
             memory,
             irqs,
+            flash_ops,
             pc,
         })
     }
@@ -166,10 +170,28 @@ impl Cpu {
                 self.processor.nvic_write_ispr(index, bits);
             }
         }
+        if let Some(ops) = self.flash_ops.take() {
+            self.apply(ops);
+        }
         self.processor.take_pending_fault_trap().map(|trap| Fault {
             pc: trap.pc,
             description: trap.to_string(),
         })
+    }
+
+    /// Carries out the flash changes the controller asked for. They go through the core's own
+    /// writes, which also refresh its decoded instructions.
+    fn apply(&mut self, ops: Vec<FlashOp>) {
+        for op in ops {
+            match op {
+                FlashOp::Erase { base, len } => {
+                    for addr in (base..base + len).step_by(4) {
+                        // The core only refuses addresses outside its flash.
+                        let _ = self.processor.write32(addr, 0xFFFF_FFFF);
+                    }
+                }
+            }
+        }
     }
 
     /// Steps until `max_instructions` more have run, the next instruction is at `stop_at` (the
@@ -253,6 +275,13 @@ impl Cpu {
         self.processor.cycle_count
     }
 
+    /// Reads a word as the core would: flash and DTCM are the core's own, the rest comes from
+    /// the machine, where reading a peripheral has that peripheral's read side effects. It is
+    /// 0 where the core refuses the address.
+    pub fn read32(&mut self, addr: u32) -> u32 {
+        self.processor.read32(addr).unwrap_or(0)
+    }
+
     pub fn memory(&self) -> RefMut<'_, MemoryMap> {
         self.memory.borrow_mut()
     }
@@ -266,6 +295,7 @@ impl Cpu {
 mod tests {
     use super::*;
     use crate::{AccessKind, FLASH_BASE, Firmware, PeripheralAccess, Svd, UnmappedAccess};
+    use crate::{FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController};
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
@@ -546,6 +576,133 @@ mod tests {
                 pc: 0,
             }]
         );
+    }
+
+    #[test]
+    fn read32_reads_flash_dtcm_and_the_machine() {
+        let code: Vec<u16> = [&STORES[..], &STORES_POOL[..]].concat();
+        let mut cpu = cpu(&code);
+        cpu.run(20);
+        assert_eq!(cpu.read32(FLASH_BASE), SP);
+        assert_eq!(cpu.read32(0x2000_0000), 0xCAFE_F00D);
+        assert_eq!(cpu.read32(0x2400_0000), 0xCAFE_F00D);
+    }
+
+    /// An instruction that is either a halfword or a load of a pool word into a register.
+    enum Op {
+        Raw(u16),
+        Load(u16, usize),
+    }
+    use Op::{Load, Raw};
+
+    /// The instructions, then the pool they load from, which starts on a word boundary.
+    fn assemble(ops: &[Op], pool: &[u32]) -> Vec<u16> {
+        let pool_at = (2 * ops.len() as u32).next_multiple_of(4);
+        let mut code: Vec<u16> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, op)| match *op {
+                Raw(half) => half,
+                Load(rt, entry) => {
+                    let from = (2 * i as u32 + 4) & !3;
+                    0x4800 | rt << 8 | ((pool_at + 4 * entry as u32 - from) / 4) as u16
+                }
+            })
+            .collect();
+        code.resize(pool_at as usize / 2, 0);
+        code.extend(pool.iter().flat_map(|w| [*w as u16, (*w >> 16) as u16]));
+        code
+    }
+
+    fn flash_machine() -> (MemoryMap, Irqs) {
+        let mut memory = MemoryMap::new();
+        let irqs = Irqs::new();
+        let controller = FlashController::new(irqs.clone(), memory.flash_ops());
+        memory
+            .map_peripheral(FLASH_REGS_BASE, FLASH_REGS_SIZE, Box::new(controller))
+            .unwrap();
+        (memory, irqs)
+    }
+
+    const STR_R1_R0: u16 = 0x6001; // str r1,[r0]
+    const STR_R2_R0: u16 = 0x6002; // str r2,[r0]
+    const STR_R3_R0_8: u16 = 0x6083; // str r3,[r0,#8]
+    const SPIN_HERE: u16 = 0xE7FE; // b .
+    const KEYR2: u32 = 0x5200_2104;
+    const KEY1: u32 = 0x4567_0123;
+    const KEY2: u32 = 0xCDEF_89AB;
+    const SR2: u32 = 0x5200_2110;
+
+    #[test]
+    fn a_flash_erase_clears_the_sector_in_the_core() {
+        // Zeroes a word in sector 7 and one in sector 6 of bank 2, unlocks the bank and erases
+        // sector 7 (CR2 = SER | START | SNB 7 | PSIZE 3).
+        let code = assemble(
+            &[
+                Load(0, 0),
+                Load(1, 1),
+                Load(2, 2),
+                Load(3, 3),
+                Load(4, 4),
+                Load(6, 5),
+                Raw(0x2500), // movs r5,#0
+                Raw(0x6025), // str r5,[r4]
+                Raw(0x6035), // str r5,[r6]
+                Raw(STR_R1_R0),
+                Raw(STR_R2_R0),
+                Raw(STR_R3_R0_8),
+                Raw(SPIN_HERE),
+            ],
+            &[KEYR2, KEY1, KEY2, 0x7B4, 0x081E_0000, 0x081C_0000],
+        );
+        let (memory, irqs) = flash_machine();
+        let mut cpu = Cpu::new(&image(&code, &[]), memory, irqs).unwrap();
+        cpu.run(30);
+        assert_eq!(cpu.read32(0x081E_0000), 0xFFFF_FFFF);
+        assert_eq!(cpu.read32(0x081C_0000), 0);
+    }
+
+    #[test]
+    fn the_flash_interrupt_runs_its_handler_once() {
+        // Enables IRQ 4, unlocks bank 2 and starts an erase with EOPIE set. The handler counts
+        // in AXI SRAM and clears EOP through FLASH_CCR2.
+        let main = assemble(
+            &[
+                Load(0, 0),
+                Raw(0x2110), // movs r1,#0x10
+                Raw(0x6001), // str r1,[r0]
+                Raw(0xB662), // cpsie i
+                Load(0, 1),
+                Load(1, 2),
+                Load(2, 3),
+                Load(3, 4),
+                Raw(STR_R1_R0),
+                Raw(STR_R2_R0),
+                Raw(STR_R3_R0_8),
+                Raw(SPIN_HERE),
+            ],
+            &[0xE000_E100, KEYR2, KEY1, KEY2, 0x1_07B4],
+        );
+        let handler = assemble(
+            &[
+                Load(0, 0),
+                Raw(0x6801), // ldr r1,[r0]
+                Raw(0x3101), // adds r1,#1
+                Raw(0x6001), // str r1,[r0]
+                Load(2, 1),
+                Load(3, 2),
+                Raw(0x6013), // str r3,[r2]
+                Raw(0x4770), // bx lr
+            ],
+            &[0x2400_0000, 0x5200_2114, 0x1_0000],
+        );
+        let offset = 2 * main.len() as u32;
+        let code = [main, handler].concat();
+        let (memory, irqs) = flash_machine();
+        let mut cpu = Cpu::new(&image(&code, &[(4, offset)]), memory, irqs).unwrap();
+        cpu.run(200);
+        assert_eq!(cpu.memory().read32(0x2400_0000), 1);
+        assert_eq!(cpu.memory().read32(SR2), 0);
     }
 
     #[test]
