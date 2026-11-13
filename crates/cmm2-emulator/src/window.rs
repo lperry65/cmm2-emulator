@@ -1,4 +1,5 @@
-//! The screen in an SDL window, scaled to fit with the picture's proportions kept.
+//! The screen in an SDL window, scaled to fit with the picture's proportions kept, and its
+//! keyboard as the console's input.
 
 use std::fmt;
 use std::mem::{Discriminant, discriminant};
@@ -11,6 +12,8 @@ use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::Rect;
 use sdl2::render::{Canvas, TextureCreator};
 use sdl2::video::{Window as SdlWindow, WindowContext};
+
+use crate::keys::{key_bytes, text_bytes};
 
 /// The window opens at this size; it can be resized.
 const START_SIZE: (u32, u32) = (800, 600);
@@ -49,6 +52,8 @@ impl Window {
     pub fn open() -> Result<Window, WindowError> {
         let context = sdl(sdl2::init())?;
         let video = sdl(context.video())?;
+        // Printable keys arrive as text, which has the layout and shift applied.
+        video.text_input().start();
         let window = sdl(video
             .window("Colour Maximite 2", START_SIZE.0, START_SIZE.1)
             .resizable()
@@ -68,10 +73,12 @@ impl Window {
     }
 
     /// Once the redraw interval has passed, shows the frame the emulator has now, or the last
-    /// good one if there is none, and handles the window's events. Returns false when the
-    /// window has been closed. `frame` is only called when it is time to draw.
+    /// good one if there is none, and handles the window's events: the console bytes for
+    /// the keys typed are passed to `input`. Returns false when the window has been closed.
+    /// `frame` is only called when it is time to draw.
     pub fn update(
         &mut self,
+        mut input: impl FnMut(&[u8]),
         frame: impl FnOnce() -> Result<Frame, FrameError>,
     ) -> Result<bool, WindowError> {
         if self.drawn.is_some_and(|at| at.elapsed() < REDRAW) {
@@ -90,10 +97,23 @@ impl Window {
             }
         }
         self.draw()?;
-        let open = !self
-            .events
-            .poll_iter()
-            .any(|event| matches!(event, Event::Quit { .. }));
+        let mut open = true;
+        for event in self.events.poll_iter() {
+            match event {
+                Event::Quit { .. } => open = false,
+                Event::KeyDown {
+                    keycode: Some(keycode),
+                    keymod,
+                    ..
+                } => {
+                    if let Some(bytes) = key_bytes(keycode, keymod) {
+                        input(bytes);
+                    }
+                }
+                Event::TextInput { text, .. } => input(&text_bytes(&text)),
+                _ => {}
+            }
+        }
         Ok(open)
     }
 
@@ -158,6 +178,11 @@ impl Complaint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sdl2::keyboard::{Keycode, Mod};
+    use sdl2::sys::{
+        SDL_Event, SDL_EventType, SDL_KeyboardEvent, SDL_Keysym, SDL_PRESSED, SDL_PushEvent,
+        SDL_TextInputEvent,
+    };
 
     fn bounds(rect: Rect) -> (i32, i32, u32, u32) {
         (rect.x(), rect.y(), rect.width(), rect.height())
@@ -193,5 +218,95 @@ mod tests {
         assert!(!complaint.is_new(&FrameError::Unreadable(0x20)));
         complaint.clear();
         assert!(complaint.is_new(&FrameError::Unreadable(0x20)));
+    }
+
+    // SDL's own queue is the only way in, as the Rust wrapper has no way to make a text event.
+    fn push_text(text: &str) {
+        let mut bytes = [0; 32];
+        for (slot, byte) in bytes.iter_mut().zip(text.bytes()) {
+            *slot = byte as _;
+        }
+        let mut event = SDL_Event {
+            text: SDL_TextInputEvent {
+                type_: SDL_EventType::SDL_TEXTINPUT as u32,
+                timestamp: 0,
+                windowID: 0,
+                text: bytes,
+            },
+        };
+        // SAFETY: the pointer is to a live event, which SDL copies.
+        assert_eq!(unsafe { SDL_PushEvent(&mut event) }, 1);
+    }
+
+    fn push_key(keycode: Keycode, keymod: Mod) {
+        let mut event = SDL_Event {
+            key: SDL_KeyboardEvent {
+                type_: SDL_EventType::SDL_KEYDOWN as u32,
+                timestamp: 0,
+                windowID: 0,
+                state: SDL_PRESSED as u8,
+                repeat: 0,
+                padding2: 0,
+                padding3: 0,
+                keysym: SDL_Keysym {
+                    scancode: sdl2::sys::SDL_Scancode::SDL_SCANCODE_UNKNOWN,
+                    sym: i32::from(keycode),
+                    mod_: keymod.bits(),
+                    unused: 0,
+                },
+            },
+        };
+        // SAFETY: the pointer is to a live event, which SDL copies.
+        assert_eq!(unsafe { SDL_PushEvent(&mut event) }, 1);
+    }
+
+    // SDL allows one instance in a process, so the window is opened in this one test.
+    #[test]
+    fn the_windows_keys_reach_the_console_and_closing_it_ends_the_run() {
+        assert!(sdl2::hint::set("SDL_VIDEODRIVER", "dummy"));
+        let mut window = Window::open().unwrap();
+        let mut typed: Vec<u8> = Vec::new();
+        let no_picture = || Err(FrameError::Off);
+
+        push_text("a");
+        push_key(Keycode::Left, Mod::NOMOD);
+        push_key(Keycode::C, Mod::LCTRLMOD);
+        push_text("é");
+        push_key(Keycode::Return, Mod::NOMOD);
+        push_key(Keycode::LShift, Mod::NOMOD);
+        assert!(
+            window
+                .update(|bytes| typed.extend(bytes), no_picture)
+                .unwrap()
+        );
+        assert_eq!(typed, b"a\x1b[D\x03\r");
+
+        // Within the redraw interval nothing is handled, and the keys wait for the next time.
+        push_text("b");
+        assert!(
+            window
+                .update(|bytes| typed.extend(bytes), no_picture)
+                .unwrap()
+        );
+        assert_eq!(typed, b"a\x1b[D\x03\r");
+        window.drawn = None;
+        assert!(
+            window
+                .update(|bytes| typed.extend(bytes), no_picture)
+                .unwrap()
+        );
+        assert_eq!(typed, b"a\x1b[D\x03\rb");
+
+        let mut event = SDL_Event {
+            type_: SDL_EventType::SDL_QUIT as u32,
+        };
+        // SAFETY: the pointer is to a live event, which SDL copies.
+        assert_eq!(unsafe { SDL_PushEvent(&mut event) }, 1);
+        window.drawn = None;
+        assert!(
+            !window
+                .update(|bytes| typed.extend(bytes), no_picture)
+                .unwrap()
+        );
     }
 }

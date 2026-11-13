@@ -1,4 +1,5 @@
 mod args;
+mod keys;
 mod pacing;
 mod script;
 mod terminal;
@@ -344,7 +345,7 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
     Ok(ok)
 }
 
-/// Runs with the console on the host terminal and the screen in a window, as asked, until the
+/// Runs with the console on the host terminal and the screen and keyboard in a window, as asked, until the
 /// quit key, the window is closed, the limit, `--stop-at` or a fault. The machine is held to
 /// its own speed unless `--unpaced`. The summary is left out, as the screen belongs to the
 /// guest. Without `--console` the guest's output is printed at the end. The `--flash` and `--sd`
@@ -380,7 +381,7 @@ fn run_live(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
         }
         resets = report_resets(&cpu, resets);
         if let Some(window) = &mut window {
-            match window.update(|| cpu.memory().frame()) {
+            match window.update(|bytes| console.push_input(bytes), || cpu.memory().frame()) {
                 Ok(true) => {}
                 Ok(false) => break Ok(true),
                 Err(err) => break Err(RunError::Window(err)),

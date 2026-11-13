@@ -80,6 +80,19 @@ To see the screen, add `--window`. It opens an SDL window that shows what the fi
 and scales it to fit, and closing the window ends the run. It works with or without `--console`
 (without it the run goes on until the window is closed, or `--run` or `--stop-at` ends it).
 
+The window is also the keyboard. Click it and type: printable keys come as SDL text input, so
+the layout and Shift apply, and the other keys are sent as the bytes the firmware's console
+reads from a terminal. Enter is CR, Backspace is 0x08 (the firmware ignores 0x7F), and Tab and
+Escape are themselves. The arrows are `ESC [ A` to `D`, Home and End are `ESC [ 1 ~` and
+`ESC [ 4 ~` (measured: the firmware does not read xterm's `ESC [ H` and `ESC [ F`), Insert,
+Delete, Page Up and Page Down are `ESC [ 2 ~`, `3~`, `5~` and `6~`, F1 to F4 are `ESC O P` to
+`S`, and F5 to F12 are `ESC [ 15 ~`, `17~`, `18~`, `19~`, `20~`, `21~`, `23~` and `24~`.
+Ctrl with a letter sends the control code, so Ctrl-C stops a running program. Held keys repeat
+as SDL repeats them; there is no held-key state yet (the USB keyboard comes later). With
+`--window` and no `--console` the window alone gives input; with both, the terminal and the
+window feed the same console. Text other than ASCII is dropped, as the console has no way to
+take it.
+
 `--console` and `--window` run the machine at its own speed: the core's clock (480 MHz) is held
 to the wall clock by sleeping, in steps of at most 10 ms, whenever the emulation is ahead. When
 the host is too slow it runs flat out and does not try to catch up later, and a stall (dragging
