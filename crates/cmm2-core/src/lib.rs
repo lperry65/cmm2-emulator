@@ -3,6 +3,7 @@
 mod clock;
 mod console;
 mod cpu;
+mod display;
 mod firmware;
 mod flash;
 mod flash_ops;
@@ -23,6 +24,7 @@ mod usart;
 pub use clock::Clock;
 pub use console::Console;
 pub use cpu::{Cpu, CpuError, Fault, Stop};
+pub use display::{Frame, FrameError};
 pub use firmware::{FLASH_BASE, FLASH_SIZE, Firmware, FirmwareError, VectorTable};
 pub use flash::{FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController, FlashRegisters};
 pub use flash_ops::{FlashOp, FlashOps};

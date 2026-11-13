@@ -10,6 +10,7 @@ use std::rc::Rc;
 
 use crate::clock::Clock;
 use crate::console::Console;
+use crate::display::{Display, Frame, FrameError};
 use crate::flash_ops::FlashOps;
 use crate::peripheral::{Peripheral, PeripheralAccess, RegisterStub, ResetCause};
 use crate::svd::Svd;
@@ -129,6 +130,7 @@ pub struct MemoryMap {
     flash_ops: FlashOps,
     clock: Clock,
     console: Console,
+    display: Display,
 }
 
 impl Default for MemoryMap {
@@ -157,6 +159,7 @@ impl MemoryMap {
             flash_ops: FlashOps::new(),
             clock: Clock::new(),
             console: Console::new(),
+            display: Display::default(),
         }
     }
 
@@ -179,6 +182,22 @@ impl MemoryMap {
     /// The text channel of the console USART, shared with the front end.
     pub fn console(&self) -> Console {
         self.console.clone()
+    }
+
+    /// The LTDC's side of the display, which the controller model keeps up to date.
+    pub(crate) fn display(&self) -> Display {
+        self.display.clone()
+    }
+
+    /// The picture the LTDC is scanning out now, read from the emulated RAM.
+    pub fn frame(&self) -> Result<Frame, FrameError> {
+        self.display.frame(|addr, len| self.ram(addr, len))
+    }
+
+    /// `len` bytes of RAM from `addr`, if they all lie in one region.
+    fn ram(&self, addr: u32, len: usize) -> Option<&[u8]> {
+        let (region, offset) = self.locate(addr)?;
+        self.regions[region].data.get(offset..offset + len)
     }
 
     pub fn read8(&mut self, addr: u32) -> u8 {

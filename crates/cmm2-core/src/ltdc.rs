@@ -1,5 +1,6 @@
-//! The LCD-TFT controller. For now it draws nothing; it keeps the timing the firmware waits on.
-//! After every frame's active area the firmware's display code expects a line interrupt (IRQ
+//! The LCD-TFT controller. It keeps the timing the firmware waits on, and the registers that
+//! say what is on the screen, which it passes to the display (see `display.rs`) for the host to
+//! look at. After every frame's active area the firmware's display code expects a line interrupt (IRQ
 //! 88), and the BASIC interpreter's main thread waits for it, so without it the prompt never
 //! runs a command.
 //!
@@ -10,9 +11,11 @@
 //! worked out whenever ISR is read, so it does not need the interrupt to be on; the interrupt
 //! asks the clock for a tick, because the firmware does not touch the controller while it waits.
 //!
-//! A write of IMR or VBR to SRCR reloads the shadow registers, which are not shadowed here, so it
-//! completes at once: the bit reads back 0 and ISR.RRIF is set. The reload on VBR is not held
-//! back to the next vertical blank. The other flags (FU, TERR) are never set, as nothing is
+//! A write of IMR or VBR to SRCR reloads the shadow registers, so it completes at once: the bit
+//! reads back 0 and ISR.RRIF is set, and the layer registers the display uses are those as of
+//! that write. The reload on VBR is not held back to the next vertical blank. The registers
+//! read back as written, whether or not they have been reloaded. A write to CLUTWR goes into the
+//! colour table at once. The other flags (FU, TERR) are never set, as nothing is
 //! fetched, so the error interrupt (IRQ 89) is never raised. CDSR and CPSR, the position the
 //! controller is at, are plain stored registers: the firmware does not read them.
 //!
@@ -20,6 +23,7 @@
 //! when a flag is set that is enabled, and when an enable is written for a flag that is set.
 
 use crate::clock::{CORE_HZ, Clock};
+use crate::display::{Display, Layer, Scanout};
 use crate::irq::Irqs;
 use crate::peripheral::{ResetCause, StubRegisters};
 use crate::registers::{Registers, WordAccess};
@@ -36,13 +40,26 @@ const LTDC_IRQ: u16 = 88;
 const PIXEL_HZ: u128 = 49_500_000;
 
 // Register offsets and bit positions, as the SVD gives them.
+const BPCR: u32 = 0x0C;
+const AWCR: u32 = 0x10;
 const TWCR: u32 = 0x14;
 const GCR: u32 = 0x18;
+const BCCR: u32 = 0x2C;
 const SRCR: u32 = 0x24;
 const IER: u32 = 0x34;
 const ISR: u32 = 0x38;
 const ICR: u32 = 0x3C;
 const LIPCR: u32 = 0x40;
+// Layer 1, and the control register of layer 2.
+const L1CR: u32 = 0x84;
+const L1WHPCR: u32 = 0x88;
+const L1WVPCR: u32 = 0x8C;
+const L1PFCR: u32 = 0x94;
+const L1CACR: u32 = 0x98;
+const L1CFBAR: u32 = 0xAC;
+const L1CFBLR: u32 = 0xB0;
+const L1CLUTWR: u32 = 0xC4;
+const L2CR: u32 = 0x104;
 
 const LTDCEN: u32 = 1 << 0;
 const LIF: u32 = 1 << 0;
@@ -51,7 +68,8 @@ const FLAGS: u32 = 0xF;
 const IMR_OR_VBR: u32 = 0b11;
 const LIPOS_MASK: u32 = 0x7FF;
 
-/// TWCR, GCR and LIPCR are stored; ISR is worked out. While the controller is enabled,
+/// The registers are stored, except ISR, which is worked out, and the display gets a copy of
+/// those it draws from. While the controller is enabled,
 /// `frame_start` is the core cycle the frame began at, and `next_line` is the pixel, counted
 /// from it, of the next line event that has not been flagged yet. Both are `None` otherwise.
 /// `next_line` is also `None` when LIPCR is beyond the last line, which is never reached.
@@ -60,6 +78,7 @@ pub struct LtdcRegisters {
     stored: StubRegisters,
     clock: Clock,
     irqs: Irqs,
+    display: Display,
     isr: u32,
     frame_start: Option<u64>,
     next_line: Option<u64>,
@@ -148,10 +167,26 @@ impl LtdcRegisters {
         }
     }
 
+    /// The layer registers take effect: the display uses them from now on.
+    fn reload(&mut self) {
+        let layer = Layer {
+            cr: self.stored.read(L1CR),
+            whpcr: self.stored.read(L1WHPCR),
+            wvpcr: self.stored.read(L1WVPCR),
+            pfcr: self.stored.read(L1PFCR),
+            cacr: self.stored.read(L1CACR),
+            cfbar: self.stored.read(L1CFBAR),
+            cfblr: self.stored.read(L1CFBLR),
+            layer2_cr: self.stored.read(L2CR),
+        };
+        self.display.update(|s| s.layer = layer);
+    }
+
     fn write_gcr(&mut self, value: u32, mask: u32) {
         let was_enabled = self.stored.read(GCR) & LTDCEN != 0;
         self.stored.write(GCR, value, mask);
         let enabled = self.stored.read(GCR) & LTDCEN != 0;
+        self.display.update(|s| s.enabled = enabled);
         if enabled != was_enabled {
             self.frame_start = enabled.then(|| self.clock.now());
             self.arm();
@@ -181,9 +216,29 @@ impl Registers for LtdcRegisters {
                 self.schedule();
                 self.raise_if_enabled();
             }
+            BPCR | AWCR | BCCR => {
+                self.stored.write(offset, value, mask);
+                let (bpcr, awcr, bccr) = (
+                    self.stored.read(BPCR),
+                    self.stored.read(AWCR),
+                    self.stored.read(BCCR),
+                );
+                self.display.update(|s| {
+                    s.bpcr = bpcr;
+                    s.awcr = awcr;
+                    s.bccr = bccr;
+                });
+            }
+            L1CLUTWR => {
+                self.stored.write(offset, value, mask);
+                let entry = self.stored.read(offset);
+                self.display
+                    .update(|s| s.clut[(entry >> 24) as usize] = entry & 0xFF_FFFF);
+            }
             ICR => self.isr &= !(value & mask & FLAGS),
             SRCR => {
                 if value & mask & IMR_OR_VBR != 0 {
+                    self.reload();
                     self.isr |= RRIF;
                     self.raise_if_enabled();
                 }
@@ -195,6 +250,7 @@ impl Registers for LtdcRegisters {
 
     fn reset(&mut self, cause: ResetCause) {
         self.stored.reset(cause);
+        self.display.update(|s| *s = Scanout::default());
         self.isr = 0;
         self.frame_start = None;
         self.next_line = None;
@@ -209,11 +265,12 @@ impl Registers for LtdcRegisters {
 pub type Ltdc = WordAccess<LtdcRegisters>;
 
 impl Ltdc {
-    pub fn new(clock: Clock, irqs: Irqs) -> Ltdc {
+    pub(crate) fn new(clock: Clock, display: Display, irqs: Irqs) -> Ltdc {
         WordAccess::wrap(LtdcRegisters {
             stored: StubRegisters::with_reset_values(LTDC_BASE, Svd::stm32h743()),
             clock,
             irqs,
+            display,
             isr: 0,
             frame_start: None,
             next_line: None,
@@ -224,7 +281,7 @@ impl Ltdc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MemoryMap, ResetCause};
+    use crate::{FrameError, MemoryMap, ResetCause};
 
     const GCR_ADDR: u32 = LTDC_BASE + GCR;
     const TWCR_ADDR: u32 = LTDC_BASE + TWCR;
@@ -258,7 +315,7 @@ mod tests {
                 .map_peripheral(
                     LTDC_BASE,
                     LTDC_SIZE,
-                    Box::new(Ltdc::new(clock.clone(), irqs.clone())),
+                    Box::new(Ltdc::new(clock.clone(), memory.display(), irqs.clone())),
                 )
                 .unwrap();
             Machine {
@@ -644,5 +701,135 @@ mod tests {
         assert!(m.raised());
         m.memory.write8(ICR_ADDR, 1);
         assert_eq!(m.isr(), 0);
+    }
+
+    // What the firmware writes to bring up layer 1: L8, 800 x 600 at the start of AXI SRAM,
+    // and the colour table. The controller is enabled first, as the firmware does.
+    fn configure_layer(m: &mut Machine) {
+        m.memory.write32(LTDC_BASE + BPCR, 0x00EF_0017);
+        m.memory.write32(LTDC_BASE + AWCR, 0x040F_026F);
+        m.memory.write32(TWCR_ADDR, BOARD_TWCR);
+        m.memory.write32(GCR_ADDR, LTDCEN);
+        m.memory.write32(LTDC_BASE + L1WHPCR, 0x040F_00F0);
+        m.memory.write32(LTDC_BASE + L1WVPCR, 0x026F_0018);
+        m.memory.write32(LTDC_BASE + L1PFCR, 5);
+        m.memory.write32(LTDC_BASE + L1CACR, 0xFF);
+        m.memory.write32(LTDC_BASE + L1CFBAR, 0x2400_0000);
+        m.memory.write32(LTDC_BASE + L1CFBLR, 0x0320_0327);
+        m.memory.write32(LTDC_BASE + L1CLUTWR, 0x0000_0000);
+        m.memory.write32(LTDC_BASE + L1CLUTWR, 0x0100_00FF);
+        m.memory.write32(LTDC_BASE + L1CLUTWR, 0x0200_FF00);
+    }
+
+    #[test]
+    fn the_frame_is_what_the_layer_registers_describe_once_they_are_reloaded() {
+        let mut m = Machine::new();
+        configure_layer(&mut m);
+        m.memory.write8(0x2400_0000, 1);
+        m.memory.write8(0x2400_0001, 2);
+        m.memory.write32(LTDC_BASE + L1CR, 0x11);
+        m.memory.write32(SRCR_ADDR, 1);
+        let frame = m.memory.frame().unwrap();
+        assert_eq!((frame.width, frame.height), (800, 600));
+        assert_eq!(frame.pixel(0, 0), [0, 0, 0xFF]);
+        assert_eq!(frame.pixel(1, 0), [0, 0xFF, 0]);
+        assert_eq!(frame.pixel(2, 0), [0, 0, 0]);
+    }
+
+    #[test]
+    fn the_layer_registers_only_count_from_the_reload() {
+        let mut m = Machine::new();
+        configure_layer(&mut m);
+        m.memory.write8(0x2400_0000, 1);
+        m.memory.write32(LTDC_BASE + L1CR, 0x11);
+        m.memory.write32(SRCR_ADDR, 1);
+        // Moved to the second pixel and disabled, but not reloaded: the frame is as before.
+        m.memory.write32(LTDC_BASE + L1CFBAR, 0x2400_0001);
+        m.memory.write32(LTDC_BASE + L1CR, 0);
+        assert_eq!(m.memory.frame().unwrap().pixel(0, 0), [0, 0, 0xFF]);
+        m.memory.write32(SRCR_ADDR, 2);
+        assert_eq!(m.memory.frame().unwrap().pixel(0, 0), [0, 0, 0]);
+    }
+
+    #[test]
+    fn the_colour_table_counts_at_once() {
+        let mut m = Machine::new();
+        configure_layer(&mut m);
+        m.memory.write8(0x2400_0000, 1);
+        m.memory.write32(LTDC_BASE + L1CR, 0x11);
+        m.memory.write32(SRCR_ADDR, 1);
+        m.memory.write32(LTDC_BASE + L1CLUTWR, 0x0111_2233);
+        assert_eq!(m.memory.frame().unwrap().pixel(0, 0), [0x11, 0x22, 0x33]);
+    }
+
+    #[test]
+    fn the_active_area_and_the_background_count_at_once() {
+        let mut m = Machine::new();
+        configure_layer(&mut m);
+        m.memory
+            .write32(LTDC_BASE + AWCR, 0x00EF_0017 + 0x0010_0004);
+        m.memory.write32(LTDC_BASE + BCCR, 0x0001_0203);
+        let frame = m.memory.frame().unwrap();
+        assert_eq!((frame.width, frame.height), (16, 4));
+        assert_eq!(frame.pixel(0, 0), [1, 2, 3]);
+    }
+
+    #[test]
+    fn there_is_no_frame_while_the_controller_is_disabled() {
+        let mut m = Machine::new();
+        configure_layer(&mut m);
+        m.memory.write32(GCR_ADDR, 0);
+        assert_eq!(m.memory.frame(), Err(FrameError::Off));
+    }
+
+    #[test]
+    fn a_system_reset_blanks_the_display() {
+        let mut m = Machine::new();
+        configure_layer(&mut m);
+        m.memory.write32(LTDC_BASE + L1CR, 0x11);
+        m.memory.write32(SRCR_ADDR, 1);
+        m.memory.reset_peripherals(ResetCause::Software);
+        assert_eq!(m.memory.frame(), Err(FrameError::Off));
+        // The colour table and the layer are gone too, not only the enable.
+        m.memory.write32(GCR_ADDR, LTDCEN);
+        m.memory.write32(LTDC_BASE + BPCR, 0x00EF_0017);
+        m.memory.write32(LTDC_BASE + AWCR, 0x040F_026F);
+        let frame = m.memory.frame().unwrap();
+        assert_eq!(frame.pixel(0, 0), [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_second_layer_is_reported() {
+        let mut m = Machine::new();
+        configure_layer(&mut m);
+        m.memory.write32(LTDC_BASE + L2CR, 1);
+        m.memory.write32(SRCR_ADDR, 1);
+        assert_eq!(m.memory.frame(), Err(FrameError::Unsupported("layer 2")));
+    }
+
+    #[test]
+    fn the_framebuffer_can_be_in_sdram() {
+        let mut m = Machine::new();
+        configure_layer(&mut m);
+        m.memory.write8(0xD000_0000, 2);
+        m.memory.write32(LTDC_BASE + L1CFBAR, 0xD000_0000);
+        m.memory.write32(LTDC_BASE + L1CR, 0x11);
+        m.memory.write32(SRCR_ADDR, 1);
+        assert_eq!(m.memory.frame().unwrap().pixel(0, 0), [0, 0xFF, 0]);
+    }
+
+    #[test]
+    fn a_framebuffer_that_runs_off_the_end_of_ram_is_reported() {
+        let mut m = Machine::new();
+        configure_layer(&mut m);
+        // AXI SRAM is 512 KiB; this leaves room for the first line only.
+        let last_line = 0x2400_0000 + 512 * 1024 - 800;
+        m.memory.write32(LTDC_BASE + L1CFBAR, last_line);
+        m.memory.write32(LTDC_BASE + L1CR, 0x11);
+        m.memory.write32(SRCR_ADDR, 1);
+        assert_eq!(
+            m.memory.frame(),
+            Err(FrameError::Unreadable(last_line + 800))
+        );
     }
 }

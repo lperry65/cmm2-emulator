@@ -25,7 +25,7 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
         .map_peripheral(
             LTDC_BASE,
             LTDC_SIZE,
-            Box::new(Ltdc::new(memory.clock(), irqs.clone())),
+            Box::new(Ltdc::new(memory.clock(), memory.display(), irqs.clone())),
         )
         .expect("LTDC window is clear of RAM");
     memory
@@ -102,6 +102,26 @@ mod tests {
         assert_eq!(m.read32(0x5800_4000), 0); // RTC_TR
         m.clock().set(480_000_000);
         assert_eq!(m.read32(0x5800_4000), 1);
+    }
+
+    #[test]
+    fn the_frame_comes_from_the_ltdc_registers_and_the_ram() {
+        let mut m = cmm2_memory(&Irqs::new());
+        m.write32(0x5000_1018, 1); // LTDC_GCR: LTDCEN
+        m.write32(0x5000_100C, 0x00EF_0017); // LTDC_BPCR
+        m.write32(0x5000_1010, 0x040F_026F); // LTDC_AWCR
+        m.write32(0x5000_1084, 1); // LTDC_L1CR: LEN
+        m.write32(0x5000_1088, 0x040F_00F0); // LTDC_L1WHPCR
+        m.write32(0x5000_108C, 0x026F_0018); // LTDC_L1WVPCR
+        m.write32(0x5000_1094, 2); // LTDC_L1PFCR: RGB565
+        m.write32(0x5000_1098, 0xFF); // LTDC_L1CACR
+        m.write32(0x5000_10AC, 0xD000_0000); // LTDC_L1CFBAR
+        m.write32(0x5000_10B0, 1600 << 16); // LTDC_L1CFBLR
+        m.write32(0x5000_1024, 1); // LTDC_SRCR: IMR
+        m.write16(0xD000_0000, 0xF800);
+        let frame = m.frame().unwrap();
+        assert_eq!((frame.width, frame.height), (800, 600));
+        assert_eq!(frame.pixel(0, 0), [255, 0, 0]);
     }
 
     #[test]

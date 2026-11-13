@@ -384,3 +384,36 @@ fn real_firmware_runs_a_command_at_the_prompt() {
     assert!(time.starts_with("12:00:0"), "{time:?}");
     assert_eq!(answer(b"PRINT DATE$\r"), "12-11-2026");
 }
+
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_draws_a_frame_at_the_prompt() {
+    let firmware = firmware();
+    let irqs = Irqs::new();
+    let memory = cmm2_memory(&irqs);
+    let console = memory.console();
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
+
+    boot_to_second_prompt(&mut cpu, &console);
+    let frame = cpu.memory().frame().unwrap();
+    assert_eq!((frame.width, frame.height), (800, 600));
+
+    // The prompt is text: more than one colour, and some of it in the top left, where the
+    // banner is. Look at it with the PPM the test leaves behind.
+    let background = frame.pixel(799, 599);
+    let colours: std::collections::HashSet<[u8; 3]> = (0..frame.height)
+        .flat_map(|y| (0..frame.width).map(move |x| (x, y)))
+        .map(|(x, y)| frame.pixel(x, y))
+        .collect();
+    println!("{} colours, background {background:?}", colours.len());
+    assert!(colours.len() > 1);
+    let top_left_text = (0..100)
+        .flat_map(|y| (0..400).map(move |x| (x, y)))
+        .filter(|&(x, y)| frame.pixel(x, y) != background)
+        .count();
+    assert!(top_left_text > 100, "{top_left_text}");
+
+    if let Ok(path) = std::env::var("CMM2_SCREENSHOT") {
+        std::fs::write(path, frame.to_ppm()).unwrap();
+    }
+}

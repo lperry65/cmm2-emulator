@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>]";
+pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -27,6 +27,8 @@ pub struct RunOptions {
     pub trace_from: Option<u64>,
     pub console: bool,
     pub on: Vec<OnRule>,
+    /// Where to write the screen as a PPM file when the run ends.
+    pub screenshot: Option<String>,
 }
 
 /// Keys to send once the guest has printed some text.
@@ -107,7 +109,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, ArgError
         }
         Some(
             option @ ("--run" | "--stop-at" | "--trace" | "--trace-mmio" | "--trace-from"
-            | "--console" | "--on"),
+            | "--console" | "--on" | "--screenshot"),
         ) => Err(ArgError::NeedsFirmware(option.to_string())),
         Some(arg) => Err(ArgError::Unknown(arg.to_string())),
     }
@@ -127,6 +129,7 @@ fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOption
                 options.trace_from = Some(parse_count(&args.next().ok_or(ArgError::Usage)?)?)
             }
             "--console" => options.console = true,
+            "--screenshot" => options.screenshot = Some(args.next().ok_or(ArgError::Usage)?),
             "--on" => {
                 let text = args.next().ok_or(ArgError::Usage)?;
                 let keys = parse_keys(&args.next().ok_or(ArgError::Usage)?)?;
@@ -320,6 +323,33 @@ mod tests {
                     keys: b"12:00:00\r".to_vec()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn screenshot_takes_a_file() {
+        let options = run_options(&["--run", "9", "--screenshot", "s.ppm"]);
+        assert_eq!(options.screenshot.as_deref(), Some("s.ppm"));
+        assert_eq!(run_options(&["--run", "9"]).screenshot, None);
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--run", "9", "--screenshot"]),
+            Err(ArgError::Usage)
+        );
+    }
+
+    #[test]
+    fn screenshot_needs_the_firmware() {
+        assert_eq!(
+            parse_args(&["--screenshot", "s.ppm"]),
+            Err(ArgError::NeedsFirmware("--screenshot".into()))
+        );
+    }
+
+    #[test]
+    fn screenshot_alone_has_nothing_to_run() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--screenshot", "s.ppm"]),
+            Err(ArgError::NothingToRun)
         );
     }
 

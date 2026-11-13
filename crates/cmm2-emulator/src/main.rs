@@ -13,7 +13,7 @@ use std::thread;
 
 use args::{Command, RunOptions};
 use cmm2_core::{
-    AccessKind, Console, Cpu, CpuError, Firmware, FirmwareError, Irqs, MemoryError,
+    AccessKind, Console, Cpu, CpuError, Firmware, FirmwareError, FrameError, Irqs, MemoryError,
     PeripheralAccess, Stop, Svd, cmm2_memory,
 };
 use script::Script;
@@ -76,6 +76,12 @@ enum RunError {
     },
     Write(io::Error),
     Console(io::Error),
+    /// There is no screen to take a picture of.
+    Frame(FrameError),
+    Screenshot {
+        path: String,
+        source: io::Error,
+    },
     /// The guest faulted; the text is the core's description.
     Fault(String),
 }
@@ -89,6 +95,8 @@ impl fmt::Display for RunError {
             RunError::Trace { path, source } => write!(f, "{path}: {source}"),
             RunError::Write(err) => write!(f, "writing the trace: {err}"),
             RunError::Console(err) => write!(f, "writing the console output: {err}"),
+            RunError::Frame(err) => write!(f, "no screenshot: {err}"),
+            RunError::Screenshot { path, source } => write!(f, "{path}: {source}"),
             RunError::Fault(description) => f.write_str(description),
         }
     }
@@ -217,6 +225,7 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
     let ok = !matches!(stop, Stop::Fault(_));
     print_summary(&mut cpu, &stop);
     print_console(&console);
+    write_screenshot(&mut cpu, options)?;
     Ok(ok)
 }
 
@@ -253,7 +262,21 @@ fn run_console(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
         }
     };
     finish_trace(trace)?;
-    result
+    let ok = result?;
+    write_screenshot(&mut cpu, &options)?;
+    Ok(ok)
+}
+
+/// Writes the screen to `--screenshot`, if it was given.
+fn write_screenshot(cpu: &mut Cpu, options: &RunOptions) -> Result<(), RunError> {
+    let Some(path) = &options.screenshot else {
+        return Ok(());
+    };
+    let frame = cpu.memory().frame().map_err(RunError::Frame)?;
+    std::fs::write(path, frame.to_ppm()).map_err(|source| RunError::Screenshot {
+        path: path.clone(),
+        source,
+    })
 }
 
 /// Says on stderr, outside the guest's console stream, that the guest reset the machine, once

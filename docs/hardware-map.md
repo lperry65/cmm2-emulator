@@ -45,6 +45,9 @@ active high, 49.5 MHz pixel clock = 75 Hz. Layer 1 only, pixel format L8 with CL
 RGB332 mode is index-to-colour through the CLUT), framebuffer 0x2400_0000, pitch 800.
 Output is three 8-bit resistor ladders.
 
+The frame the model builds from this is in `boot-trace.md` (issue 36): what the firmware writes,
+and what is drawn and what is reported as unsupported.
+
 Interrupts: the firmware turns on the line interrupt (IRQ 88) at line 624, the one after the
 active area, and the main thread waits for it once a frame. It also enables the FIFO underrun and
 transfer error interrupts, which the model never raises. See `boot-trace.md`.

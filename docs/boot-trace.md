@@ -297,7 +297,42 @@ The time and date are the ones set in the first-boot dialogue (12:00:00 on 12/11
 the RTC model. The first answer takes about 17 million instructions and later ones 7 to 8
 million. `real_firmware_runs_a_command_at_the_prompt` in `tests/real_firmware.rs` checks these.
 
+## The LTDC frame (issue 36)
+
+The model now keeps what the display needs and `MemoryMap::frame()` builds the picture from it
+and the emulated RAM (`display.rs`). I traced every write to the LTDC from reset to the second
+prompt (the first boot's setup and the reboot run the same sequence, so each write below
+happens twice in the whole run). What the firmware writes, in order, beyond the table above:
+
+| Register | Value | |
+|---|---|---|
+| `BCCR` | `0` | black background |
+| `L1WHPCR`, `L1WVPCR` | `0x040F00F0`, `0x026F0018` | window start 240 / 24, to 1039 / 623: 800 x 600, at the start of the active area (back porch + 1) |
+| `L1PFCR` | `5` | L8 |
+| `L1DCCR`, `L1CACR`, `L1BFCR` | `0xFF000000`, `0xFF`, `0x405` | default colour opaque black, constant alpha 255, blend with pixel alpha x constant alpha |
+| `L1CFBAR`, `L1CFBLR`, `L1CFBLNR` | `0x24000000`, `0x03200327`, `0x258` | pitch 800, line length field 807, 600 lines |
+| `L1CR`, `SRCR` | `0x1`, `0x1`, then `0x11`, `0x1` | layer on and reload, then colour table on and reload |
+| `L1CLUTWR` | 256 words | `index << 24 \| RGB`: entry 0 is black, entry 1 `0x000054`, entry 255 `0xE0E0E0` |
+
+`L1CLUTWR` is at offset `0xC4`, not `0x144` (that is layer 2's). The firmware never writes layer
+2 or `CKCR`, and never reads `CDSR` or `CPSR`.
+
+The frame is the active area (`AWCR` less `BPCR`), 800 x 600, with the layer window placed in it
+and filled from `L1CFBAR` with the pitch from `L1CFBLR`. The layer registers are those as of
+the last `SRCR` reload, the colour table is live. At the second prompt the frame has 6 colours:
+black, white `E0E0E0`, and the four logo and status colours red, green, yellow and blue. It
+shows the MaxiMite logo, the banner (`480MHz Colour Maximite 2 G2`, `MMBasic Version
+7.00.00b5` and the three copyright lines) centred, and `>` with the cursor at the left below
+them. Some time later (640 million instructions) the status line along the bottom row appears in
+dark orange: `A:/`, `Check Disk` and the clock.
+
+Not drawn, and reported as `FrameError::Unsupported` rather than drawn wrong: layer 2, colour
+keying, constant alpha below 255, L8 without the colour table, and every pixel format with an
+alpha channel (ARGB8888, ARGB1555, ARGB4444, AL44, AL88). L8, RGB565 and RGB888 are drawn. The
+default colour (`L1DCCR`), the blending factors and the CLUT alpha are not used, as the firmware
+sets the layer opaque. `--screenshot <file>` on the emulator writes the frame as a PPM at the
+end of a run.
+
 ## Where it blocks now
 
-It does not block at the prompt: commands run. Nothing is drawn, because the LTDC model does no
-pixel work, so there is no display output yet. I have not run past `PRINT` to find the next wait.
+It does not block at the prompt: commands run, and the frame shows the prompt. I have not run past `PRINT` to find the next wait.
