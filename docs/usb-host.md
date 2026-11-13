@@ -483,3 +483,91 @@ table for the keyboard. The gamepad is the real unknown and should not be promis
 - **The firmware's behaviour with a first-boot flash**: the keyboard question (`Keyboard type: 1=UK`)
   comes at about 198 million instructions, before USB has started (the port reset is at
   444 million), so a USB keyboard cannot answer it. The window has to use the UART for that.
+
+## 12. What is built
+
+Issues 50 and 51 are the first two steps of section 10: the OTG controller (`otg.rs`), the port and
+the device trait (`usb.rs`), a low-speed HID boot keyboard (`usb_keyboard.rs`), and ignored tests
+that boot the real firmware with the keyboard plugged in. The window does not drive the keys yet
+(issue 52): `KeyReport` is the shared report that it will set, and the tests set it directly.
+
+**What it is.** `Otg` is mapped at 0x40080000 for 0x20000 bytes, always, with IRQ 101. `UsbPort` is
+a handle like `SdSlot` (`MemoryMap::usb_port()`): `attach(device)` and `detach()`, and the core
+notices on its next tick, because a plug asks the clock for one at once. Plugging a device in over
+another counts as pulling the first out. A device implements `UsbDevice`: `setup`, `out`, `in_token`,
+`address` and `reset`, and answers `In::Data`/`Nak`/`Stall` and `Out::Ack`/`Nak`/`Stall`. The core
+does the framing, the packet sizes and the toggles, so a device only knows its own protocol. The
+core attaches nothing: the front end plugs the keyboard in, so that no console test sees the extra
+`Connected` line. With nothing plugged in the firmware's USB init now runs (the id is valid) and the
+boot still reaches the second prompt at the same instruction count as before (612 million, in
+slices of a million), at the same speed.
+
+**Where the model differs from the scratch one.**
+
+- The RX FIFO is one queue of words, as on the chip: a status word, then for a data packet its
+  words, so `GINTSTS.RXFLVL` stays set while the data is unread. The scratch model kept two queues.
+- `HAINT` is worked out from `HCINT` and `HCINTMSK` of each channel, and `GINTSTS.HCINT` from
+  `HAINT` and `HAINTMSK`. The firmware sets both masks, so it did not matter in the scratch model.
+- `HFNUM` and `GINTSTS.SOF` are worked out from the clock: the frame is the cycle count divided by
+  480,000, and `SOF` is set when the frame is not the one at which the firmware last cleared it. Nothing
+  runs while `SOF` is masked. While it is unmasked the core asks the clock for a tick at each frame
+  start, and asks again from the tick. No transfer needs `SOF` in this model: a transaction happens a
+  fixed time after the channel is enabled, not in the frame the `ODDFRM` bit names.
+- The port is powered by `HPRT.PPWR`: a device connects 200 us after the port is powered or the device
+  plugged in, whichever is later (the scratch model did it 200 us after `PPWR`). A reset (`PRST`)
+  resets the device when it starts, and the port is enabled 2 us after it ends. A power-down drops the
+  connection.
+- A detach sets `PENCHNG` (only if the port was enabled), clears `PCSTS` and `PENA`, latches
+  `DISCINT`, and drops the RX FIFO, the staged FIFO data and the transactions waiting. Re-attaching is
+  a full enumeration, and the firmware printed `USB Keyboard Disconnected` and then the connect
+  message again.
+- A transaction takes 100 us (about what eight bytes take at low speed). With no answer (no device,
+  the port not enabled, a different address) the channel gets `TXERR`. A halt request (`CHDIS`) sets
+  `CHH` and clears `CHENA`; a finished transfer, a NAK and a STALL leave the channel enabled until the
+  firmware halts it, as the scratch model did.
+- The packet status word carries the toggle of each packet, and the core toggles `HCTSIZ.DPID` after
+  each packet that was acknowledged; a SETUP leaves DATA1. The core does not check the device's own
+  toggle, so a device that did not toggle would go unnoticed.
+- `GUSBCFG` resets to 0x1440 and `HCFG` to 0x200 (the guesses of section 2, which make the registers
+  read what the board does after the firmware has edited them), not the SVD's values.
+- The device answers a request for string 0 with a STALL, which the firmware tolerates. The keyboard
+  also stalls the interrupt endpoint until `SET_CONFIGURATION`, and answers every request that is not
+  one of those in section 3 with a stall.
+
+**The guessed identity registers**, none of them read from the board:
+
+| Register | Value | Meaning |
+|---|---|---|
+| `GSNPSID` | 0x4F54310A | the id the firmware checks for, and low half 0x310A (not above 0x4209) |
+| `GHWCFG1` | 0 | every endpoint bidirectional |
+| `GHWCFG2` | 0x029AD500 | slave mode only, dedicated FS PHY, 6 device endpoints, 12 host channels, dynamic FIFO sizing, periodic support, queues of 8 |
+| `GHWCFG3` | 0x040000E8 | 1024 words of FIFO, 19 bit transfer size and 10 bit packet count (the widths of `HCTSIZ`), OTG enabled |
+| `GHWCFG4` | 0 | |
+| `GNPTXSTS`, `HPTXSTS` | 0x00080200, 0x00080100 | room for 8 requests, 0x200 and 0x100 words |
+| `GRSTCTL` | 0xA0000000 | `AHBIDL` and `CSRST_DONE`, so a core reset and the flushes are over as soon as they are asked for |
+
+**Measured on the real firmware** (release build, a first boot with the questions answered over the
+console, then the keyboard attached from reset). The cycle counts are the machine clock, 480 MHz, and
+include the first boot:
+
+| Event | Instructions | Cycle | Machine time |
+|---|---|---|---|
+| second prompt | 612 million | 1.038 billion | 2.16 s |
+| `UK USB Keyboard Connected on channel 1` | 690 million | 1.213 billion | 2.53 s |
+| first interrupt IN poll | 910 million | 1.707 billion | 3.56 s |
+
+The connect message is exactly `UK USB Keyboard Connected on channel 1` and a line end. The gap of
+1.03 s of machine time between the message and the first poll is the one of section 3. The speed
+with the keyboard attached is the same as without it (54.5 million instructions a second over the 400
+million after the prompt, measured both ways, twice). A key report set by the front end is seen by
+the firmware within a few milliseconds of machine time: `KEYDOWN(0)` was 1 and `KEYDOWN(1)` 97 for
+`a` held, 2 and `KEYDOWN(7)` 8 for left Shift with two keys, 0 after the release, `INKEY$` returned
+`a`, and shift and `a` at the idle prompt typed `A`. A report that is set and set back between two
+polls is never seen, which is also what a real keyboard does, so a front end should hold a key
+until it has been polled (issue 52).
+
+**Left for issue 52:** the window, scancodes to usages, the held-key list and `KeyReport` building,
+focus loss, routing to the UART until the first poll (the model knows when: the first interrupt IN
+write to channel 1; the test counts it from the MMIO trace), and attaching the keyboard from the CLI
+with the window. The mouse and the gamepad (issues after) need a composite device or a second
+device behind a hub, which the port does not have.

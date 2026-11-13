@@ -12,6 +12,7 @@ mod irq;
 mod ltdc;
 mod machine;
 mod memory;
+mod otg;
 mod peripheral;
 mod pwr;
 mod rcc;
@@ -22,6 +23,8 @@ mod sd_slot;
 mod svd;
 mod timer;
 mod usart;
+mod usb;
+mod usb_keyboard;
 
 pub use clock::{CORE_HZ, Clock};
 pub use console::Console;
@@ -39,6 +42,7 @@ pub use machine::cmm2_memory;
 pub use memory::{
     AccessKind, DTCM_BASE, DTCM_SIZE, MemoryError, MemoryMap, REGIONS, RegionSpec, UnmappedAccess,
 };
+pub use otg::{OTG_BASE, OTG_SIZE, Otg, OtgRegisters};
 pub use peripheral::{Peripheral, PeripheralAccess, RegisterStub, ResetCause, StubRegisters};
 pub use pwr::{PWR_BASE, PWR_SIZE, Pwr, PwrRegisters};
 pub use rcc::{RCC_BASE, RCC_SIZE, Rcc, RccRegisters};
@@ -49,3 +53,5 @@ pub use sd_slot::SdSlot;
 pub use svd::{Field, Lookup, Svd, SvdError};
 pub use timer::{TIM5_BASE, TIM16_BASE, TIMER_SIZE, Timer, TimerRegisters};
 pub use usart::{USART_SIZE, USART1_BASE, Usart, UsartRegisters};
+pub use usb::{In, Out, UsbDevice, UsbPort};
+pub use usb_keyboard::{HidKeyboard, KeyReport};

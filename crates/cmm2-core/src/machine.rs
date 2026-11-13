@@ -6,6 +6,7 @@ use crate::gpio::{GPIO_BASE, GPIO_PORT_SIZE, GPIO_PORTS, Gpio};
 use crate::irq::Irqs;
 use crate::ltdc::{LTDC_BASE, LTDC_SIZE, Ltdc};
 use crate::memory::MemoryMap;
+use crate::otg::{OTG_BASE, OTG_SIZE, Otg};
 use crate::pwr::{PWR_BASE, PWR_SIZE, Pwr};
 use crate::rcc::{RCC_BASE, RCC_SIZE, Rcc};
 use crate::rtc::{RTC_BASE, RTC_SIZE, Rtc};
@@ -61,6 +62,18 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
             Box::new(Usart::new(USART1_BASE, memory.console(), irqs.clone())),
         )
         .expect("USART1 window is clear of RAM");
+    memory
+        .map_peripheral(
+            OTG_BASE,
+            OTG_SIZE,
+            Box::new(Otg::new(
+                OTG_BASE,
+                memory.clock(),
+                irqs.clone(),
+                memory.usb_port(),
+            )),
+        )
+        .expect("OTG window is clear of RAM");
     let flash = FlashController::new(irqs.clone(), memory.flash_ops());
     memory
         .map_peripheral(FLASH_REGS_BASE, FLASH_REGS_SIZE, Box::new(flash))
@@ -74,6 +87,7 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usb_keyboard::{HidKeyboard, KeyReport};
 
     #[test]
     fn pwr_is_served_by_the_model() {
@@ -175,6 +189,21 @@ mod tests {
         assert_eq!(m.read32(0x4000_441C), 0xC0); // USART2_ISR: reset value only
         m.write32(0x4000_4428, 0x42); // USART2_TDR
         assert!(console.take_output().is_empty());
+        assert!(m.take_unmapped().is_empty());
+    }
+
+    #[test]
+    fn the_otg_is_served_by_the_model_with_the_ports_device() {
+        let irqs = Irqs::new();
+        let mut m = cmm2_memory(&irqs);
+        assert_eq!(m.read32(0x4008_0040) >> 16, 0x4F54); // OTG_GSNPSID
+        assert_eq!(m.read32(0x4008_0010), 0xA000_0000); // OTG_GRSTCTL: AHBIDL, CSRST_DONE
+        m.usb_port().attach(HidKeyboard::new(KeyReport::new()));
+        m.write32(0x4008_0440, 1 << 12); // OTG_HPRT: PPWR
+        m.clock().set(480 * 200);
+        assert!(m.clock().take_due());
+        m.tick();
+        assert_eq!(m.read32(0x4008_0440) & 1, 1); // PCSTS
         assert!(m.take_unmapped().is_empty());
     }
 

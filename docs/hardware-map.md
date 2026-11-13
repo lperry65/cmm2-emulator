@@ -80,7 +80,9 @@ DAC CR 0x10001 and MCR 0x10001: both channels enabled. RNG CR 4: enabled.
 OTG controller at 0x4008_0000, with a keyboard plugged in: GUSBCFG 0x20001847 (forced host mode,
 embedded full-speed PHY), GAHBCFG 1 (global interrupt on, **DMA off**, so FIFO/slave mode),
 GCCFG 0x10000, HCFG 0x206, HPRT 0x41805 (device connected and enabled, **low speed**), GINTMSK
-0x23000014. No DMA is a favourable fact for emulation.
+0x23000014. No DMA is a favourable fact for emulation. The emulator models this block as a host controller
+with a low-speed keyboard behind it (docs/usb-host.md section 12); the ID and `GHWCFG` registers it
+returns are guesses, not board readings.
 
 ## GPIO [board]
 

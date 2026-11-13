@@ -15,6 +15,7 @@ use crate::flash_ops::FlashOps;
 use crate::peripheral::{Peripheral, PeripheralAccess, RegisterStub, ResetCause};
 use crate::sd_slot::SdSlot;
 use crate::svd::Svd;
+use crate::usb::UsbPort;
 
 /// DTCM RAM. Owned by the CPU core, like the flash.
 pub const DTCM_BASE: u32 = 0x2000_0000;
@@ -132,6 +133,7 @@ pub struct MemoryMap {
     clock: Clock,
     console: Console,
     sd_slot: SdSlot,
+    usb_port: UsbPort,
     display: Display,
 }
 
@@ -150,6 +152,7 @@ impl MemoryMap {
                 data: vec![0; spec.size].into_boxed_slice(),
             })
             .collect();
+        let clock = Clock::new();
         MemoryMap {
             regions,
             windows: Vec::new(),
@@ -159,7 +162,8 @@ impl MemoryMap {
             dropped: 0,
             pc: Rc::new(Cell::new(0)),
             flash_ops: FlashOps::new(),
-            clock: Clock::new(),
+            usb_port: UsbPort::new(clock.clone()),
+            clock,
             console: Console::new(),
             sd_slot: SdSlot::new(),
             display: Display::default(),
@@ -190,6 +194,11 @@ impl MemoryMap {
     /// The SD socket, shared with the front end, which puts a card image in and takes it back.
     pub fn sd_slot(&self) -> SdSlot {
         self.sd_slot.clone()
+    }
+
+    /// The USB host port, shared with the front end, which plugs devices into it.
+    pub fn usb_port(&self) -> UsbPort {
+        self.usb_port.clone()
     }
 
     /// The LTDC's side of the display, which the controller model keeps up to date.
