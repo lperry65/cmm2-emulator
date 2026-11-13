@@ -38,6 +38,8 @@ The firmware needs a few things zmu does not do, so I changed the following.
   instruction.
 - New instructions: REV.W, REV16.W and REVSH.W, RBIT, SSAT and USAT, which were
   decoded as undefined before. SSAT and USAT set the Q flag on saturation.
+- ORN with an immediate (T1) was decoded as undefined; it now runs. The firmware's
+  tokeniser uses it.
 - GDB: `GdbServer`, `ZmuTarget` and `Simulation` can be built from a processor
   that has already been set up and reset (`from_processor`).
 - IT state: the IF-THEN state is now saved in the stacked xPSR on exception

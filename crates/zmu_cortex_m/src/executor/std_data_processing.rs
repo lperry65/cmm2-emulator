@@ -43,6 +43,7 @@ pub trait IsaStandardDataProcessing {
     fn exec_mvn_reg(&mut self, params: &Reg2ShiftParams) -> ExecuteResult;
     fn exec_mvn_imm(&mut self, params: &RegImmCarryParams) -> ExecuteResult;
 
+    fn exec_orn_imm(&mut self, params: &Reg2ImmCarryParams) -> ExecuteResult;
     fn exec_orn_reg(&mut self, params: &Reg3ShiftParams) -> ExecuteResult;
 
     fn exec_orr_imm(&mut self, params: &Reg2ImmCarryParams) -> ExecuteResult;
@@ -424,6 +425,25 @@ impl IsaStandardDataProcessing for Processor {
             self.set_r(params.rd, result);
 
             if conditional_setflags(params.setflags, self.in_it_block()) {
+                self.psr.set_n(result);
+                self.psr.set_z(result);
+                self.psr.set_c(carry);
+            }
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+    fn exec_orn_imm(&mut self, params: &Reg2ImmCarryParams) -> ExecuteResult {
+        if self.condition_passed() {
+            let rn = self.get_r(params.rn);
+            let c = self.psr.get_c();
+            let (im, carry) = expand_conditional_carry(&params.imm32, c);
+
+            let result = rn | !im;
+
+            self.set_r(params.rd, result);
+
+            if params.setflags {
                 self.psr.set_n(result);
                 self.psr.set_z(result);
                 self.psr.set_c(carry);

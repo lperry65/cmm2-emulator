@@ -771,6 +771,10 @@ pub enum Instruction {
         params: RegImmCarryParams,
     },
     /// Bitwise OR NOT
+    ORN_imm {
+        params: Reg2ImmCarryParams,
+    },
+    /// Bitwise OR NOT
     ORN_reg {
         params: Reg3ShiftParams,
     },
@@ -2319,6 +2323,17 @@ impl fmt::Display for Instruction {
                     Imm32Carry::Carry { imm32_c0, imm32_c1 } => imm32_c0.0,
                 }
             ),
+            Self::ORN_imm { params } => write!(
+                f,
+                "orn{} {}, {}, #{}",
+                if params.setflags { "s" } else { "" },
+                params.rd,
+                params.rn,
+                match params.imm32 {
+                    Imm32Carry::NoCarry { imm32 } => imm32,
+                    Imm32Carry::Carry { imm32_c0, .. } => imm32_c0.0,
+                }
+            ),
             Self::ORN_reg { params } => write!(
                 f,
                 "orn{}.w {}, {}, {}{}",
@@ -3087,7 +3102,7 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
 
         Instruction::NOP { thumb32, .. } => isize_t(*thumb32),
 
-        //ORN_imm
+        Instruction::ORN_imm { .. } => 4,
         Instruction::ORN_reg { .. } => 4,
         Instruction::ORR_imm { .. } => 4,
         Instruction::ORR_reg { thumb32, .. } => isize_t(*thumb32),

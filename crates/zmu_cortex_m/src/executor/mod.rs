@@ -400,6 +400,7 @@ impl ExecutorHelper for Processor {
             Instruction::MVN_reg { params, .. } => self.exec_mvn_reg(params),
             Instruction::MVN_imm { params } => self.exec_mvn_imm(params),
 
+            Instruction::ORN_imm { params } => self.exec_orn_imm(params),
             Instruction::ORN_reg { params } => self.exec_orn_reg(params),
 
             Instruction::ORR_imm { params } => self.exec_orr_imm(params),

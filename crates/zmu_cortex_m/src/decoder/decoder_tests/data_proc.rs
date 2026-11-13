@@ -918,6 +918,26 @@ fn test_decode_orn_reg_t2() {
 }
 
 #[test]
+fn test_decode_orn_imm() {
+    // 0xf065_037f
+    // ORN r3, r5, #127
+    assert_eq!(
+        decode_32(0xf065_037f),
+        Instruction::ORN_imm {
+            params: Reg2ImmCarryParams {
+                rd: Reg::R3,
+                rn: Reg::R5,
+                imm32: Imm32Carry::Carry {
+                    imm32_c0: (127, false),
+                    imm32_c1: (127, true)
+                },
+                setflags: false
+            }
+        }
+    );
+}
+
+#[test]
 fn test_decode_orr() {
     // ORRS R3, R3, R1
     match decode_16(0x430b) {
