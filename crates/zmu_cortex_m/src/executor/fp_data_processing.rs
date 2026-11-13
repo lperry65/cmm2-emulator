@@ -320,8 +320,8 @@ impl IsaFloatingPointDataProcessing for Processor {
         if self.condition_passed() {
             self.execute_fp_check()?;
             let addend = self.get_sr(params.sd);
-            let op1 = self.get_sr(params.sn);
-            let op2 = self.get_sr(params.sm) ^ 0x8000_0000;
+            let op1 = self.get_sr(params.sn) ^ 0x8000_0000;
+            let op2 = self.get_sr(params.sm);
             let result = self.fp_mul_add::<u32>(addend, op1, op2, true);
             self.set_sr(params.sd, result);
             return Ok(ExecuteSuccess::Taken { cycles: 1 });
@@ -332,12 +332,9 @@ impl IsaFloatingPointDataProcessing for Processor {
     fn exec_vfms_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult {
         if self.condition_passed() {
             self.execute_fp_check()?;
-            let (dest_low, dest_high) = self.get_dr(params.dd);
-            let (op1_low, op1_high) = self.get_dr(params.dn);
-            let (op2_low, op2_high) = self.get_dr(params.dm);
-            let addend = (u64::from(dest_high) << 32) | u64::from(dest_low);
-            let op1 = (u64::from(op1_high) << 32) | u64::from(op1_low);
-            let op2 = ((u64::from(op2_high) << 32) | u64::from(op2_low)) ^ 0x8000_0000_0000_0000;
+            let addend = self.get_dr_bits(params.dd);
+            let op1 = self.get_dr_bits(params.dn) ^ 0x8000_0000_0000_0000;
+            let op2 = self.get_dr_bits(params.dm);
             let result = self.fp_mul_add::<u64>(addend, op1, op2, true);
             self.set_dr(params.dd, result as u32, (result >> 32) as u32);
             return Ok(ExecuteSuccess::Taken { cycles: 1 });
@@ -611,8 +608,8 @@ impl IsaFloatingPointDataProcessing for Processor {
     fn exec_vcvt_f64_f32(&mut self, params: VCVTParamsF64F32) -> ExecuteResult {
         if self.condition_passed() {
             self.execute_fp_check()?;
-            let source = f32::from_bits(self.get_sr(params.sm));
-            let result = f64::from(source).to_bits();
+            let source = self.get_sr(params.sm);
+            let result = self.fp_convert::<u32, u64>(source);
             self.set_dr(params.dd, result as u32, (result >> 32) as u32);
             return Ok(ExecuteSuccess::Taken { cycles: 1 });
         }
@@ -622,9 +619,8 @@ impl IsaFloatingPointDataProcessing for Processor {
     fn exec_vcvt_f32_f64(&mut self, params: VCVTParamsF32F64) -> ExecuteResult {
         if self.condition_passed() {
             self.execute_fp_check()?;
-            let (lower, upper) = self.get_dr(params.dm);
-            let source = f64::from_bits((u64::from(upper) << 32) | u64::from(lower));
-            let result = (source as f32).to_bits();
+            let source = self.get_dr_bits(params.dm);
+            let result = self.fp_convert::<u64, u32>(source);
             self.set_sr(params.sd, result);
             return Ok(ExecuteSuccess::Taken { cycles: 1 });
         }
@@ -2091,5 +2087,74 @@ mod tests {
             .unwrap();
 
         assert_eq!(processor.get_dr(DoubleReg::D2), (0xaaaa_bbbb, 0xcccc_dddd));
+    }
+
+    // The manual negates the first operand of VFMS, so a NaN there comes out with its sign turned,
+    // and one in the second operand comes out as it was.
+    #[test]
+    fn test_vfms_negates_the_first_operand_not_the_second() {
+        let mut processor = fp_test_processor();
+        let quiet_nan = 0x7FF8_0000_0000_0001u64;
+        let other_nan = 0x7FF8_0000_0000_0002u64;
+        processor.set_dr_bits(DoubleReg::D4, 1.0f64.to_bits());
+        processor.set_dr_bits(DoubleReg::D5, quiet_nan);
+        processor.set_dr_bits(DoubleReg::D6, 2.0f64.to_bits());
+        let params = VAddSubParamsf64 {
+            dd: DoubleReg::D4,
+            dn: DoubleReg::D5,
+            dm: DoubleReg::D6,
+        };
+        processor.exec_vfms_f64(&params).unwrap();
+        assert_eq!(processor.get_dr_bits(DoubleReg::D4), quiet_nan | 1 << 63);
+
+        processor.set_dr_bits(DoubleReg::D4, 1.0f64.to_bits());
+        processor.set_dr_bits(DoubleReg::D5, 2.0f64.to_bits());
+        processor.set_dr_bits(DoubleReg::D6, other_nan);
+        processor.exec_vfms_f64(&params).unwrap();
+        assert_eq!(processor.get_dr_bits(DoubleReg::D4), other_nan);
+
+        // The same in a single.
+        processor.set_sr(SingleReg::S4, 1.0f32.to_bits());
+        processor.set_sr(SingleReg::S5, 0x7FC0_0001);
+        processor.set_sr(SingleReg::S6, 2.0f32.to_bits());
+        let params = VAddSubParamsf32 {
+            sd: SingleReg::S4,
+            sn: SingleReg::S5,
+            sm: SingleReg::S6,
+        };
+        processor.exec_vfms_f32(&params).unwrap();
+        assert_eq!(processor.get_sr(SingleReg::S4), 0xFFC0_0001);
+
+        processor.set_sr(SingleReg::S4, 1.0f32.to_bits());
+        processor.set_sr(SingleReg::S5, 2.0f32.to_bits());
+        processor.set_sr(SingleReg::S6, 0x7FC0_0002);
+        processor.exec_vfms_f32(&params).unwrap();
+        assert_eq!(processor.get_sr(SingleReg::S4), 0x7FC0_0002);
+    }
+
+    #[test]
+    fn test_vcvt_between_single_and_double_follows_the_fpscr() {
+        let mut processor = fp_test_processor();
+        // A signalling NaN is quieted and signals, and a double too large for a single overflows.
+        processor.set_sr(SingleReg::S1, 0x7F80_0001);
+        processor
+            .exec_vcvt_f64_f32(VCVTParamsF64F32 {
+                dd: DoubleReg::D2,
+                sm: SingleReg::S1,
+            })
+            .unwrap();
+        assert_eq!(processor.get_dr_bits(DoubleReg::D2), 0x7FF8_0000_2000_0000);
+        assert_eq!(processor.fpscr & CUMULATIVE_FLAGS, IOC);
+
+        processor.fpscr = RZ;
+        processor.set_dr_bits(DoubleReg::D3, 1e300f64.to_bits());
+        processor
+            .exec_vcvt_f32_f64(VCVTParamsF32F64 {
+                sd: SingleReg::S4,
+                dm: DoubleReg::D3,
+            })
+            .unwrap();
+        assert_eq!(processor.get_sr(SingleReg::S4), f32::MAX.to_bits());
+        assert_eq!(processor.fpscr & CUMULATIVE_FLAGS, OFC | IXC);
     }
 }

@@ -117,7 +117,15 @@ pub(crate) const F32_VALUES: [f32; 36] = [
 ];
 
 pub(crate) const IOC: u32 = 1 << 0;
+pub(crate) const DZC: u32 = 1 << 1;
+pub(crate) const OFC: u32 = 1 << 2;
+pub(crate) const UFC: u32 = 1 << 3;
 pub(crate) const IXC: u32 = 1 << 4;
 pub(crate) const IDC: u32 = 1 << 7;
 pub(crate) const FZ: u32 = 1 << 24;
 pub(crate) const DN: u32 = 1 << 25;
+// The FPSCR rounding mode field, which sits in bits 22 and 23, and the bits of the flags.
+pub(crate) const RP: u32 = 1 << 22;
+pub(crate) const RM: u32 = 2 << 22;
+pub(crate) const RZ: u32 = 3 << 22;
+pub(crate) const CUMULATIVE_FLAGS: u32 = IOC | DZC | OFC | UFC | IXC | IDC;

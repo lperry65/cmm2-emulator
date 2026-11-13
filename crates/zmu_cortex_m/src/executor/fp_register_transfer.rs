@@ -27,57 +27,73 @@ pub trait IsaFloatingPointRegisterTransfer {
 
 impl IsaFloatingPointRegisterTransfer for Processor {
     fn exec_vmov_cr_sp(&mut self, params: &VMovCrSpParams) -> ExecuteResult {
-        self.execute_fp_check()?;
-        if params.to_arm_register {
-            let value = self.get_sr(params.sn);
-            self.set_r(params.rt, value);
-        } else {
-            self.set_sr(params.sn, self.get_r(params.rt));
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            if params.to_arm_register {
+                let value = self.get_sr(params.sn);
+                self.set_r(params.rt, value);
+            } else {
+                self.set_sr(params.sn, self.get_r(params.rt));
+            }
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
         }
-
-        Ok(ExecuteSuccess::Taken { cycles: 1 })
+        Ok(ExecuteSuccess::NotTaken)
     }
 
     fn exec_vmov_cr2_dp(&mut self, params: &VMovCr2DpParams) -> ExecuteResult {
-        self.execute_fp_check()?;
-        if params.to_arm_registers {
-            let (low, high) = self.get_dr(params.dm);
-            self.set_r(params.rt, low);
-            self.set_r(params.rt2, high);
-        } else {
-            let low = self.get_r(params.rt);
-            let high = self.get_r(params.rt2);
-            self.set_dr(params.dm, low, high);
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            if params.to_arm_registers {
+                let (low, high) = self.get_dr(params.dm);
+                self.set_r(params.rt, low);
+                self.set_r(params.rt2, high);
+            } else {
+                let low = self.get_r(params.rt);
+                let high = self.get_r(params.rt2);
+                self.set_dr(params.dm, low, high);
+            }
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
         }
-
-        Ok(ExecuteSuccess::Taken { cycles: 1 })
+        Ok(ExecuteSuccess::NotTaken)
     }
 
     fn exec_vmov_reg_f32(&mut self, params: VMovRegParamsf32) -> ExecuteResult {
-        self.execute_fp_check()?;
-        let value = self.get_sr(params.sm);
-        self.set_sr(params.sd, value);
-        Ok(ExecuteSuccess::Taken { cycles: 1 })
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let value = self.get_sr(params.sm);
+            self.set_sr(params.sd, value);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
     }
 
     fn exec_vmov_reg_f64(&mut self, params: VMovRegParamsf64) -> ExecuteResult {
-        self.execute_fp_check()?;
-        let (low, high) = self.get_dr(params.dm);
-        self.set_dr(params.dd, low, high);
-        Ok(ExecuteSuccess::Taken { cycles: 1 })
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let (low, high) = self.get_dr(params.dm);
+            self.set_dr(params.dd, low, high);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
     }
 
     fn exec_vmov_imm_32(&mut self, params: VMovImmParams32) -> ExecuteResult {
-        self.execute_fp_check()?;
-        self.set_sr(params.sd, params.imm32);
-        Ok(ExecuteSuccess::Taken { cycles: 1 })
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            self.set_sr(params.sd, params.imm32);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
     }
 
     fn exec_vmov_imm_64(&mut self, params: VMovImmParams64) -> ExecuteResult {
-        self.execute_fp_check()?;
-        let (low, high) = (params.imm64 as u32, (params.imm64 >> 32) as u32);
-        self.set_dr(params.dd, low, high);
-        Ok(ExecuteSuccess::Taken { cycles: 1 })
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let (low, high) = (params.imm64 as u32, (params.imm64 >> 32) as u32);
+            self.set_dr(params.dd, low, high);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
     }
 
     fn exec_vmrs(&mut self, params: VMRSTarget) -> ExecuteResult {
@@ -233,5 +249,85 @@ mod tests {
         processor.fpscr = 0xabcd_1234;
         processor.exec_vmrs(VMRSTarget::Register(Reg::R7)).unwrap();
         assert_eq!(processor.get_r(Reg::R7), 0xabcd_1234);
+    }
+
+    // A move inside an IT block whose condition fails does nothing. The firmware's strtod relies on
+    // it: a VMOV in an ITEE block overwrote the divisor of a quotient.
+    #[test]
+    fn test_vmov_obeys_the_it_condition() {
+        let mut processor = fp_test_processor();
+        processor.set_r(Reg::R0, 0x1111_1111);
+        processor.set_r(Reg::R1, 0x2222_2222);
+        processor.set_sr(SingleReg::S1, 0x3333_3333);
+        processor.set_dr(DoubleReg::D2, 0x4444_4444, 0x5555_5555);
+        processor.set_dr(DoubleReg::D3, 0x6666_6666, 0x7777_7777);
+        // In an IT NE block with the Z flag set, every instruction is skipped.
+        processor.psr.set_z_bit(true);
+        let skipped = |processor: &mut Processor| {
+            processor
+                .set_itstate(((crate::core::condition::Condition::NE.value() as u8) << 4) | 0b1000);
+        };
+
+        skipped(&mut processor);
+        let to_single = VMovCrSpParams {
+            to_arm_register: false,
+            rt: Reg::R0,
+            sn: SingleReg::S1,
+        };
+        let outcome = processor.exec_vmov_cr_sp(&to_single).unwrap();
+        assert!(matches!(outcome, ExecuteSuccess::NotTaken));
+        skipped(&mut processor);
+        let to_core = VMovCrSpParams {
+            to_arm_register: true,
+            ..to_single
+        };
+        processor.exec_vmov_cr_sp(&to_core).unwrap();
+        skipped(&mut processor);
+        let to_double = VMovCr2DpParams {
+            to_arm_registers: false,
+            rt: Reg::R0,
+            rt2: Reg::R1,
+            dm: DoubleReg::D2,
+        };
+        processor.exec_vmov_cr2_dp(&to_double).unwrap();
+        skipped(&mut processor);
+        let to_cores = VMovCr2DpParams {
+            to_arm_registers: true,
+            ..to_double
+        };
+        processor.exec_vmov_cr2_dp(&to_cores).unwrap();
+        skipped(&mut processor);
+        processor
+            .exec_vmov_reg_f32(VMovRegParamsf32 {
+                sd: SingleReg::S1,
+                sm: SingleReg::S0,
+            })
+            .unwrap();
+        skipped(&mut processor);
+        processor
+            .exec_vmov_reg_f64(VMovRegParamsf64 {
+                dd: DoubleReg::D2,
+                dm: DoubleReg::D3,
+            })
+            .unwrap();
+        skipped(&mut processor);
+        processor
+            .exec_vmov_imm_32(VMovImmParams32 {
+                sd: SingleReg::S1,
+                imm32: 0x4000_0000,
+            })
+            .unwrap();
+        skipped(&mut processor);
+        processor
+            .exec_vmov_imm_64(VMovImmParams64 {
+                dd: DoubleReg::D2,
+                imm64: 0x4000_0000_0000_0000,
+            })
+            .unwrap();
+
+        assert_eq!(processor.get_r(Reg::R0), 0x1111_1111);
+        assert_eq!(processor.get_r(Reg::R1), 0x2222_2222);
+        assert_eq!(processor.get_sr(SingleReg::S1), 0x3333_3333);
+        assert_eq!(processor.get_dr(DoubleReg::D2), (0x4444_4444, 0x5555_5555));
     }
 }

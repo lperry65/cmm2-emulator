@@ -58,6 +58,21 @@ The firmware needs a few things zmu does not do, so I changed the following.
   names. A tie in the FPSCR nearest mode went to the odd neighbour; it goes to the even one.
   A result that saturates now signals Invalid Operation, not Overflow. Fixed point to float scales
   by multiplying by 2^-n, because dividing by `BigFloat`'s 2^n lost digits.
+- Floating-point arithmetic: add, subtract, multiply, divide, square root, fused multiply-add,
+  VCMP, and the conversions between single and double and from integers now run on integers, in
+  `executor/fp_real.rs`, and no longer on `BigFloat`, which I dropped. `BigFloat` has a decimal
+  exponent of about 127 and 40 digits, so `1E300*10` never returned (the host looped on the
+  infinity it made), `1E-130/10` was 0, and a tie or a long mantissa was rounded wrong. A value
+  is kept as `sig * 2^exp` with a 128-bit `sig`; a sum, a quotient and a root drop what they have
+  to into a sticky bit, and one rounding, FPRound, does the rest: all four FPSCR rounding modes,
+  overflow to the largest number or infinity by mode, underflow decided before rounding, and the
+  IOC, DZC, OFC, UFC, IXC and IDC flags as the manual has them. Flush-to-zero and default NaN work
+  on inputs and results. VCVT between single and double used the host's `as`, with no flags, no
+  NaN rules and no FZ or DN; it goes through the same unpack and round now. VSUB had its sign wrong
+  for an infinite second operand (`1 - inf` was +inf). VFMS negated the second operand, and the
+  manual negates the first, which shows in the sign of a NaN. The six VMOV forms between the core
+  and the FPU registers ignored an IT condition that failed; the firmware's strtod has one in an
+  ITEE block, and that is what made `1E-50` loop.
 - GDB: `GdbServer`, `ZmuTarget` and `Simulation` can be built from a processor
   that has already been set up and reset (`from_processor`).
 - IT state: the IF-THEN state is now saved in the stacked xPSR on exception

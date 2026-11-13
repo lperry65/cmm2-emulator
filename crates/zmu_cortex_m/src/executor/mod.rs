@@ -33,12 +33,16 @@ mod signed_multiply;
 mod status_register;
 mod std_data_processing;
 
+#[cfg(all(test, feature = "has-fp"))]
+mod fp_arith_tests;
 #[cfg(feature = "has-fp")]
 mod fp_data_processing;
 #[cfg(feature = "has-fp")]
 mod fp_generic;
 #[cfg(feature = "has-fp")]
 mod fp_load_and_store;
+#[cfg(feature = "has-fp")]
+mod fp_real;
 #[cfg(feature = "has-fp")]
 mod fp_register_transfer;
 #[cfg(all(test, feature = "has-fp"))]

@@ -444,6 +444,48 @@ fn real_firmware_does_floating_point_at_the_prompt() {
     }
 }
 
+// The FPU used to do its arithmetic in a decimal type with a narrow exponent: 1E300*10 never
+// came back and 1E-130/10 printed 0. These are what the board prints (7.00.00b5, at the prompt),
+// subnormals kept and an overflow giving INF.
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_does_floating_point_over_the_whole_range_of_a_double() {
+    let firmware = firmware();
+    let irqs = Irqs::new();
+    let memory = cmm2_memory(&irqs);
+    let console = memory.console();
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
+    boot_to_second_prompt(&mut cpu, &console);
+    // The first error after the boot prints no message, so one goes before the one asserted.
+    answer_to(&mut cpu, &console, "PRINT INT(1E300)");
+
+    let cases = [
+        ("PRINT 1E300*10", " 1e+301"),
+        ("PRINT -1E300*10", "-1e+301"),
+        ("PRINT 1E-120/10", " 1e-121"),
+        ("PRINT 1E-300/1E10", " 1e-310"),
+        ("PRINT 1E-320", " 1.001980198e-320"),
+        ("PRINT 1E308*10/10", " INF"),
+        ("PRINT 0.1+0.2", " 0.3"),
+        ("PRINT 1/3*3", " 1"),
+        ("PRINT 1E15+0.3", " 1e+15"),
+        ("PRINT 2^0.5*2^0.5", " 2"),
+        ("PRINT SQR(1E300)", " 1e+150"),
+        ("PRINT EXP(800)", " INF"),
+        ("PRINT EXP(-800)", " 0"),
+        ("PRINT LOG(1E-300)", "-690.7755279"),
+        // An error is the console's cursor and colour codes, then its message.
+        (
+            "PRINT INT(1E300)",
+            "\u{1b}[?25h\u{1b}[37m\u{1b}[mNumber too large\r\n",
+        ),
+        ("PRINT STR$(1E300*1E10)", "INF"),
+    ];
+    for (line, expected) in cases {
+        assert_eq!(answer_to(&mut cpu, &console, line), expected, "{line}");
+    }
+}
+
 #[test]
 #[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
 fn real_firmware_keeps_its_saved_options_in_the_persistent_state() {
