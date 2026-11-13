@@ -236,11 +236,68 @@ and `0x08120000` (the program area).
 - Polling reads of `GPIOH_IDR`, `GPIOD_IDR` and `TIM5_CNT` are going to dominate the idle
   loops, so the cost of a peripheral read matters (see the speed ticket).
 
-## Where it blocks now
+## The LTDC line interrupt (issue 35)
 
 With the counting RTC the firmware reaches the second-boot `>` prompt (about 612 million
-instructions) and reads typed keys into its ring buffer, but does not run them. The main thread
-loops at `0x0809A508` to `0x0809A50C`, storing 0 to the byte at `0x20015584` and spinning until
-it is non-zero. The function at `0x08097DD4` sets it, and its object looks like the LTDC line-event
-callback (IRQ 88). That is my reading, not yet confirmed. Nothing models the LTDC, so the next
-step is the LTDC model (issue 35).
+instructions) and reads typed keys into its ring buffer, but did not run them. The main thread
+looped at `0x0809A508` to `0x0809A50C`, storing 0 to the byte at `0x20015584` and spinning
+until it was non-zero. I had guessed that this was the LTDC and have now confirmed it from the
+code and a trace of the LTDC registers (the firmware's display code runs from ITCM, which a
+disassembly of the flash image alone does not show; I dumped ITCM after the C startup):
+
+- Vector 88 (the LTDC global interrupt) is `0xF35`, in ITCM, which loads `0x20011E0C` into r0
+  and jumps to `0x4354`. That is the vendor HAL's LTDC interrupt handler. The object at
+  `0x20011E0C` is the HAL handle; its first word is `0x50001000`, the LTDC base.
+- The handler reads `LTDC_ISR` and `LTDC_IER`. For each of transfer error, FIFO underrun,
+  line and register reload it checks that the flag and its enable are both set, clears the
+  enable in `IER`, writes the flag to `ICR` and calls the callback. The line callback is
+  reached through `0x93D0`, which is a jump to `0x08097DD4`. The register reload callback is
+  empty.
+- `0x08097DD4` sets the byte at `0x20015584` to 1 (the flag the main thread waits on) and then
+  programs the next line event: it loads `AccumulatedActiveH + 1` (`0x270`, 624) from the
+  handle and jumps to the HAL's program-line-event function at `0x4570`, which clears
+  `IER.LIE`, writes `LTDC_LIPCR` and sets `LIE` again.
+
+So the wait is a wait for vertical blank, once per frame, after the active area. The firmware
+programs it during start-up like this (the writes in order):
+
+| Register | Value | |
+|---|---|---|
+| `LTDC_GCR` | `0xC0002220` | polarities set, `LTDCEN` clear |
+| `LTDC_SSCR`, `BPCR`, `AWCR`, `TWCR` | `0x004F0002`, `0x00EF0017`, `0x040F026F`, `0x041F0270` | 1056 x 625 total, 800 x 600 active |
+| `LTDC_IER` | `0x6` | FIFO underrun and transfer error |
+| `LTDC_GCR` | `0xC0002221` | `LTDCEN` set: the frame starts |
+| `LTDC_L1*` | | layer 1, L8, 800 x 600, framebuffer `0x24000000`, pitch `0x320` |
+| `LTDC_L1CLUTWR` | 256 writes | the colour table |
+| `LTDC_L1CR`, `LTDC_SRCR` | `0x11`, `0x1` | colour table on, reload (`IMR`) |
+| `LTDC_LIPCR`, `LTDC_IER` | `0x270`, `0x7` | line 624, line interrupt on |
+
+It never reads `CDSR` or `CPSR`, and never waits on `SRCR` clearing.
+
+The model (`ltdc.rs`) works the frame out from `TWCR` and the 49.5 MHz pixel clock: 1056 x 625
+pixels is 6.4 million core cycles, which is 75 Hz, and line 624 is reached at 6,389,760 cycles
+into the frame. `ISR.LIF` is set then, whether or not `IER.LIE` is, and with `LIE` set the
+interrupt is raised. Because the firmware does not touch the LTDC while it waits, the model asks
+the clock for a tick at that cycle (`Clock::wake_at`, `Peripheral::tick`), which is the first
+interrupt that comes from the passing of time alone. A reload through `SRCR`
+completes at once and sets `ISR.RRIF`.
+
+With that the main thread leaves the wait and the firmware takes the line, but it stopped at
+`0x08062AFA` with an undefined instruction: `orn r3, r5, #127`. The vendored core decoded
+ORN with an immediate as undefined, and the tokeniser uses it. That is fixed in `zmu_cortex_m`
+(see its `NOTICE.md`). Then, from the second prompt at 612 million instructions:
+
+| Typed | Printed | At |
+|---|---|---|
+| `PRINT 1+2` | ` 3` | 629 million |
+| `PRINT TIME$` | `12:00:01` | 637 million |
+| `PRINT DATE$` | `12-11-2026` | 644 million |
+
+The time and date are the ones set in the first-boot dialogue (12:00:00 on 12/11/26), counted by
+the RTC model. The first answer takes about 17 million instructions and later ones 7 to 8
+million. `real_firmware_runs_a_command_at_the_prompt` in `tests/real_firmware.rs` checks these.
+
+## Where it blocks now
+
+It does not block at the prompt: commands run. Nothing is drawn, because the LTDC model does no
+pixel work, so there is no display output yet. I have not run past `PRINT` to find the next wait.

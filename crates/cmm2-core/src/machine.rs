@@ -4,6 +4,7 @@
 use crate::flash::{FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController};
 use crate::gpio::{GPIO_BASE, GPIO_PORT_SIZE, GPIO_PORTS, Gpio};
 use crate::irq::Irqs;
+use crate::ltdc::{LTDC_BASE, LTDC_SIZE, Ltdc};
 use crate::memory::MemoryMap;
 use crate::pwr::{PWR_BASE, PWR_SIZE, Pwr};
 use crate::rcc::{RCC_BASE, RCC_SIZE, Rcc};
@@ -20,6 +21,13 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
     memory
         .map_peripheral(RCC_BASE, RCC_SIZE, Box::new(Rcc::new()))
         .expect("RCC window is clear of RAM");
+    memory
+        .map_peripheral(
+            LTDC_BASE,
+            LTDC_SIZE,
+            Box::new(Ltdc::new(memory.clock(), irqs.clone())),
+        )
+        .expect("LTDC window is clear of RAM");
     memory
         .map_peripheral(RTC_BASE, RTC_SIZE, Box::new(Rtc::new(memory.clock())))
         .expect("RTC window is clear of RAM");
@@ -94,6 +102,22 @@ mod tests {
         assert_eq!(m.read32(0x5800_4000), 0); // RTC_TR
         m.clock().set(480_000_000);
         assert_eq!(m.read32(0x5800_4000), 1);
+    }
+
+    #[test]
+    fn the_ltdc_is_served_by_the_model() {
+        let irqs = Irqs::new();
+        let mut m = cmm2_memory(&irqs);
+        m.write32(0x5000_1040, 0x270); // LTDC_LIPCR
+        m.write32(0x5000_1014, 0x041F_0270); // LTDC_TWCR
+        m.write32(0x5000_1018, 1); // LTDC_GCR: LTDCEN
+        m.write32(0x5000_1034, 1); // LTDC_IER: LIE
+        m.clock().set(624 * 10_240);
+        assert!(m.clock().take_due());
+        m.tick();
+        assert_eq!(irqs.take(), Some([0, 0, 1 << 24, 0, 0, 0, 0, 0])); // IRQ 88
+        assert_eq!(m.read32(0x5000_1038), 1); // LTDC_ISR: LIF
+        assert!(m.take_unmapped().is_empty());
     }
 
     #[test]

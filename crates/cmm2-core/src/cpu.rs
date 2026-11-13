@@ -179,6 +179,9 @@ impl Cpu {
         self.pc.set(self.processor.get_pc());
         // Before the instruction, so a register it reads sees the time at its start.
         self.clock.set(self.processor.cycle_count);
+        if self.clock.take_due() {
+            self.memory.borrow_mut().tick();
+        }
         self.processor.step();
         if self.processor.system_reset_requested {
             self.reset();
@@ -882,6 +885,26 @@ mod tests {
     }
 
     #[test]
+    fn orn_with_an_immediate_ors_the_complement() {
+        // orn r3,r5,#127 and orn r4,r5,#0x00FF00FF, with r5 = 0x45.
+        let code = assemble(
+            &[
+                Load(5, 0),
+                Raw(0xF065),
+                Raw(0x037F),
+                Raw(0xF065),
+                Raw(0x14FF),
+                Raw(SPIN_HERE),
+            ],
+            &[0x45],
+        );
+        let mut cpu = cpu(&code);
+        cpu.run(4);
+        assert_eq!(cpu.reg(3), 0xFFFF_FFC5);
+        assert_eq!(cpu.reg(4), 0xFF00_FF45);
+    }
+
+    #[test]
     fn the_clock_is_the_core_cycle_count_at_the_start_of_the_instruction() {
         let mut cpu = cpu(&SPIN);
         cpu.run(10);
@@ -889,6 +912,40 @@ mod tests {
         cpu.step();
         assert_eq!(cpu.memory().clock().now(), before);
         assert!(before > 0);
+    }
+
+    // Counts its ticks.
+    struct Ticking(Rc<std::cell::Cell<u32>>);
+
+    impl crate::Peripheral for Ticking {
+        fn read(&mut self, _offset: u32, _size: u8) -> u32 {
+            0
+        }
+
+        fn write(&mut self, _offset: u32, _size: u8, _value: u32) {}
+
+        fn tick(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn the_memory_is_ticked_once_when_a_wake_comes_due() {
+        let ticks = Rc::new(std::cell::Cell::new(0));
+        let mut memory = MemoryMap::new();
+        memory
+            .map_peripheral(0x5000_0000, 0x100, Box::new(Ticking(ticks.clone())))
+            .unwrap();
+        memory.clock().wake_at(50);
+        let mut cpu = Cpu::new(&image(&SPIN, &[]), memory, Irqs::new()).unwrap();
+        while cpu.cycle_count() < 50 {
+            assert_eq!(ticks.get(), 0);
+            cpu.step();
+        }
+        cpu.step();
+        assert_eq!(ticks.get(), 1);
+        cpu.run(100);
+        assert_eq!(ticks.get(), 1);
     }
 
     #[test]

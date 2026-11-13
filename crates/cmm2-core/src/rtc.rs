@@ -10,7 +10,7 @@
 //! counting through it: the time base is an absolute cycle count, which a reset does not
 //! change.
 
-use crate::clock::Clock;
+use crate::clock::{CORE_HZ, Clock};
 use crate::peripheral::StubRegisters;
 use crate::registers::{Registers, WordAccess};
 use crate::svd::Svd;
@@ -40,10 +40,8 @@ const TR_MASK: u32 = 0x007F_7F7F;
 const DR_MASK: u32 = 0x00FF_FF3F;
 const PRER_MASK: u32 = 0x007F_7FFF;
 
-/// The RTC runs from the 32.768 kHz crystal. The core clock the machine counts is taken to be
-/// 480 MHz, as it is in the timer model.
+/// The RTC runs from the 32.768 kHz crystal.
 const RTC_HZ: u128 = 32_768;
-const CORE_HZ: u128 = 480_000_000;
 
 fn bcd_pack(n: u32) -> u32 {
     ((n / 10) << 4) | (n % 10)
@@ -194,7 +192,7 @@ impl RtcRegisters {
         }
         let prediv_a = u64::from(prer >> 16 & 0x7F) + 1;
         let elapsed = u128::from(self.clock.now().saturating_sub(self.anchor));
-        let ticks = (elapsed * RTC_HZ / CORE_HZ) as u64;
+        let ticks = (elapsed * RTC_HZ / u128::from(CORE_HZ)) as u64;
         let (tr, dr) = DateTime::from_registers(tr, dr)
             .plus_seconds(ticks / (prediv_a * (prediv_s + 1)))
             .to_registers();

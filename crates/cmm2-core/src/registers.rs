@@ -14,6 +14,9 @@ pub trait Registers {
 
     /// See `Peripheral::reset`.
     fn reset(&mut self, _cause: ResetCause) {}
+
+    /// See `Peripheral::tick`.
+    fn tick(&mut self) {}
 }
 
 /// `flag` is set in `value` exactly when `enable` is.
@@ -82,6 +85,10 @@ impl<R: Registers> Peripheral for WordAccess<R> {
     fn reset(&mut self, cause: ResetCause) {
         self.0.reset(cause);
     }
+
+    fn tick(&mut self) {
+        self.0.tick();
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +127,23 @@ mod tests {
         let mut access = WordAccess::wrap(Toy::default());
         access.inner_mut().words = [0x4433_2211, 0x8877_6655, 0, 0];
         access
+    }
+
+    #[test]
+    fn tick_reaches_the_registers() {
+        struct Ticking(u32);
+        impl Registers for Ticking {
+            fn read(&mut self, _offset: u32) -> u32 {
+                0
+            }
+            fn write(&mut self, _offset: u32, _value: u32, _mask: u32) {}
+            fn tick(&mut self) {
+                self.0 += 1;
+            }
+        }
+        let mut a = WordAccess::wrap(Ticking(0));
+        a.tick();
+        assert_eq!(a.inner().0, 1);
     }
 
     #[test]

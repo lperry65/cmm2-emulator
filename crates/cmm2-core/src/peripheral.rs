@@ -25,6 +25,11 @@ pub trait Peripheral {
     /// Puts the device back as a reset leaves it. Devices that a system reset does not
     /// touch keep this default.
     fn reset(&mut self, _cause: ResetCause) {}
+
+    /// The cycle a device asked the clock to wake it at has come, or another device's has: a
+    /// device brings itself up to date and asks again if it wants to be woken later. Devices
+    /// that never ask keep this default.
+    fn tick(&mut self) {}
 }
 
 /// One access to a peripheral, as seen by the trace callback.

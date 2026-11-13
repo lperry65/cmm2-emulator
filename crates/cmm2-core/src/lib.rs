@@ -8,6 +8,7 @@ mod flash;
 mod flash_ops;
 mod gpio;
 mod irq;
+mod ltdc;
 mod machine;
 mod memory;
 mod peripheral;
@@ -27,6 +28,7 @@ pub use flash::{FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController, FlashRegister
 pub use flash_ops::{FlashOp, FlashOps};
 pub use gpio::{GPIO_BASE, GPIO_PORT_SIZE, GPIO_PORTS, Gpio, GpioRegisters};
 pub use irq::Irqs;
+pub use ltdc::{LTDC_BASE, LTDC_SIZE, Ltdc, LtdcRegisters};
 pub use machine::cmm2_memory;
 pub use memory::{
     AccessKind, DTCM_BASE, DTCM_SIZE, MemoryError, MemoryMap, REGIONS, RegionSpec, UnmappedAccess,

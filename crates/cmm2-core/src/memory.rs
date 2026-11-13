@@ -272,6 +272,14 @@ impl MemoryMap {
         }
     }
 
+    /// Ticks every window and fallback; the CPU calls it when the time a device asked to be
+    /// woken at (`Clock::wake_at`) has come.
+    pub fn tick(&mut self) {
+        for window in self.windows.iter_mut().chain(&mut self.fallbacks) {
+            window.device.tick();
+        }
+    }
+
     /// Calls `f` after every peripheral access, modelled or not, in order. `None` stops it.
     pub fn set_peripheral_trace(&mut self, f: Option<Trace>) {
         self.trace = f;
@@ -420,7 +428,7 @@ impl MemoryMap {
 mod tests {
     use super::*;
     use crate::{FLASH_BASE, Svd};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     fn region(name: &str) -> &'static RegionSpec {
@@ -1286,5 +1294,32 @@ mod tests {
         m.write32(0x7000_0000, 1);
         m.reset_peripherals(ResetCause::Software);
         assert_eq!(m.take_unmapped().len(), 1);
+    }
+
+    // Counts its ticks.
+    struct Ticking(Rc<Cell<u32>>);
+
+    impl Peripheral for Ticking {
+        fn read(&mut self, _offset: u32, _size: u8) -> u32 {
+            0
+        }
+
+        fn write(&mut self, _offset: u32, _size: u8, _value: u32) {}
+
+        fn tick(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn tick_reaches_windows_and_fallbacks() {
+        let ticks = Rc::new(Cell::new(0));
+        let mut m = MemoryMap::new();
+        m.map_peripheral(0x4000_0000, 0x100, Box::new(Ticking(ticks.clone())))
+            .unwrap();
+        m.map_fallback(0x5000_0000, 0x100, Box::new(Ticking(ticks.clone())))
+            .unwrap();
+        m.tick();
+        assert_eq!(ticks.get(), 2);
     }
 }
