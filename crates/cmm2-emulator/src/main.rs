@@ -3,6 +3,7 @@ mod keys;
 mod pacing;
 mod script;
 mod terminal;
+mod usb_keys;
 mod window;
 
 use std::cell::RefCell;
@@ -16,13 +17,14 @@ use std::thread;
 
 use args::{Command, RunOptions};
 use cmm2_core::{
-    AccessKind, CORE_HZ, Console, Cpu, CpuError, Firmware, FirmwareError, FrameError,
-    ImageSizeError, Irqs, MemoryError, PeripheralAccess, PersistentSizeError, SdSlot, Stop, Svd,
-    cmm2_memory,
+    AccessKind, CORE_HZ, Console, Cpu, CpuError, Firmware, FirmwareError, FrameError, HidKeyboard,
+    ImageSizeError, Irqs, KeyReport, MemoryError, PeripheralAccess, PersistentSizeError, SdSlot,
+    Stop, Svd, cmm2_memory,
 };
 use pacing::{Pacer, RealTime};
 use script::Script;
 use terminal::RawMode;
+use usb_keys::UsbKeys;
 use window::{Window, WindowError};
 
 /// How many unmapped accesses the summary lists; the count covers all of them.
@@ -345,10 +347,11 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
     Ok(ok)
 }
 
-/// Runs with the console on the host terminal and the screen and keyboard in a window, as asked, until the
-/// quit key, the window is closed, the limit, `--stop-at` or a fault. The machine is held to
+/// Runs with the console on the host terminal and the screen and keyboard in a window, as asked,
+/// until the quit key, the window is closed, the limit, `--stop-at` or a fault. The machine is held to
 /// its own speed unless `--unpaced`. The summary is left out, as the screen belongs to the
-/// guest. Without `--console` the guest's output is printed at the end. The `--flash` and `--sd`
+/// guest. The window's keys are a USB keyboard unless `--console-keys`. Without `--console` the
+/// guest's output is printed at the end. The `--flash` and `--sd`
 /// files are written whichever way the run ends.
 fn run_live(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
     let Machine {
@@ -357,9 +360,11 @@ fn run_live(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
         sd,
         trace,
     } = build_machine(path, &options)?;
+    // The window's keys are the USB keyboard's, unless it is asked to type into the console.
+    let usb_keys = (options.window && !options.console_keys).then(|| plug_in_keyboard(&cpu));
     let mut window = options
         .window
-        .then(Window::open)
+        .then(|| Window::open(usb_keys))
         .transpose()
         .map_err(RunError::Window)?;
     let _raw = options.console.then(RawMode::enable);
@@ -412,6 +417,16 @@ fn run_live(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
     write_screenshot(&mut cpu, &options)?;
     saved?;
     Ok(ok)
+}
+
+/// Plugs a USB keyboard into the port, and returns the keys that drive it. The core attaches
+/// nothing itself, so that a run with no window sees no keyboard.
+fn plug_in_keyboard(cpu: &Cpu) -> UsbKeys {
+    let report = KeyReport::new();
+    cpu.memory()
+        .usb_port()
+        .attach(HidKeyboard::new(report.clone()));
+    UsbKeys::new(report)
 }
 
 /// Writes the screen to `--screenshot`, if it was given.

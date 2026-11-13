@@ -1,5 +1,6 @@
 //! The screen in an SDL window, scaled to fit with the picture's proportions kept, and its
-//! keyboard as the console's input.
+//! keyboard as the guest's: the USB keyboard's report once the firmware polls it, and until then
+//! (or with no USB keys) the console's input.
 
 use std::fmt;
 use std::mem::{Discriminant, discriminant};
@@ -7,13 +8,14 @@ use std::time::{Duration, Instant};
 
 use cmm2_core::{Frame, FrameError};
 use sdl2::EventPump;
-use sdl2::event::Event;
+use sdl2::event::{Event, WindowEvent};
 use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::Rect;
 use sdl2::render::{Canvas, TextureCreator};
 use sdl2::video::{Window as SdlWindow, WindowContext};
 
 use crate::keys::{key_bytes, text_bytes};
+use crate::usb_keys::{UsbKeys, usage};
 
 /// The window opens at this size; it can be resized.
 const START_SIZE: (u32, u32) = (800, 600);
@@ -46,10 +48,14 @@ pub struct Window {
     last: Option<Frame>,
     complaint: Complaint,
     drawn: Option<Instant>,
+    /// The USB keyboard's keys, if the window drives it.
+    usb: Option<UsbKeys>,
 }
 
 impl Window {
-    pub fn open() -> Result<Window, WindowError> {
+    /// With `usb`, the keys go to the USB keyboard as soon as the firmware polls it; without,
+    /// they are always the console's.
+    pub fn open(usb: Option<UsbKeys>) -> Result<Window, WindowError> {
         let context = sdl(sdl2::init())?;
         let video = sdl(context.video())?;
         // Printable keys arrive as text, which has the layout and shift applied.
@@ -69,12 +75,14 @@ impl Window {
             last: None,
             complaint: Complaint::default(),
             drawn: None,
+            usb,
         })
     }
 
     /// Once the redraw interval has passed, shows the frame the emulator has now, or the last
     /// good one if there is none, and handles the window's events: the console bytes for
-    /// the keys typed are passed to `input`. Returns false when the window has been closed.
+    /// the keys that are the console's are passed to `input` as bytes, and the others set the USB
+    /// keyboard's report. Returns false when the window has been closed.
     /// `frame` is only called when it is time to draw.
     pub fn update(
         &mut self,
@@ -97,20 +105,48 @@ impl Window {
             }
         }
         self.draw()?;
+        if let Some(usb) = &mut self.usb {
+            usb.sync();
+        }
+        // Whether the keys are USB's is settled for the whole batch: the firmware cannot start
+        // polling while the events are handled.
+        let to_usb = self.usb.as_ref().is_some_and(UsbKeys::active);
         let mut open = true;
         for event in self.events.poll_iter() {
             match event {
                 Event::Quit { .. } => open = false,
                 Event::KeyDown {
-                    keycode: Some(keycode),
+                    keycode,
+                    scancode,
                     keymod,
+                    repeat,
                     ..
                 } => {
-                    if let Some(bytes) = key_bytes(keycode, keymod) {
+                    // The firmware repeats a key itself, so the report ignores SDL's repeats.
+                    if !repeat
+                        && let (Some(usb), Some(usage)) = (&mut self.usb, scancode.and_then(usage))
+                    {
+                        usb.press(usage);
+                    }
+                    if !to_usb && let Some(bytes) = keycode.and_then(|k| key_bytes(k, keymod)) {
                         input(bytes);
                     }
                 }
-                Event::TextInput { text, .. } => input(&text_bytes(&text)),
+                Event::KeyUp { scancode, .. } => {
+                    if let (Some(usb), Some(usage)) = (&mut self.usb, scancode.and_then(usage)) {
+                        usb.release(usage);
+                    }
+                }
+                Event::TextInput { text, .. } if !to_usb => input(&text_bytes(&text)),
+                // The releases will not come to a window that has lost the focus.
+                Event::Window {
+                    win_event: WindowEvent::FocusLost,
+                    ..
+                } => {
+                    if let Some(usb) = &mut self.usb {
+                        usb.release_all();
+                    }
+                }
                 _ => {}
             }
         }
@@ -178,10 +214,12 @@ impl Complaint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cmm2_core::{HidKeyboard, KeyReport, UsbDevice};
+    use sdl2::keyboard::Scancode;
     use sdl2::keyboard::{Keycode, Mod};
     use sdl2::sys::{
         SDL_Event, SDL_EventType, SDL_KeyboardEvent, SDL_Keysym, SDL_PRESSED, SDL_PushEvent,
-        SDL_TextInputEvent,
+        SDL_RELEASED, SDL_Scancode, SDL_TextInputEvent, SDL_WindowEvent, SDL_WindowEventID,
     };
 
     fn bounds(rect: Rect) -> (i32, i32, u32, u32) {
@@ -238,18 +276,32 @@ mod tests {
         assert_eq!(unsafe { SDL_PushEvent(&mut event) }, 1);
     }
 
-    fn push_key(keycode: Keycode, keymod: Mod) {
+    fn push_key(
+        keycode: Keycode,
+        scancode: Option<Scancode>,
+        keymod: Mod,
+        down: bool,
+        repeat: bool,
+    ) {
+        // SAFETY: SDL's scancode enum has the numbers the wrapper's Scancode has.
+        let scancode = scancode.map_or(SDL_Scancode::SDL_SCANCODE_UNKNOWN, |scancode| unsafe {
+            std::mem::transmute::<u32, SDL_Scancode>(scancode as u32)
+        });
         let mut event = SDL_Event {
             key: SDL_KeyboardEvent {
-                type_: SDL_EventType::SDL_KEYDOWN as u32,
+                type_: if down {
+                    SDL_EventType::SDL_KEYDOWN
+                } else {
+                    SDL_EventType::SDL_KEYUP
+                } as u32,
                 timestamp: 0,
                 windowID: 0,
-                state: SDL_PRESSED as u8,
-                repeat: 0,
+                state: if down { SDL_PRESSED } else { SDL_RELEASED } as u8,
+                repeat: u8::from(repeat),
                 padding2: 0,
                 padding3: 0,
                 keysym: SDL_Keysym {
-                    scancode: sdl2::sys::SDL_Scancode::SDL_SCANCODE_UNKNOWN,
+                    scancode,
                     sym: i32::from(keycode),
                     mod_: keymod.bits(),
                     unused: 0,
@@ -260,53 +312,137 @@ mod tests {
         assert_eq!(unsafe { SDL_PushEvent(&mut event) }, 1);
     }
 
-    // SDL allows one instance in a process, so the window is opened in this one test.
-    #[test]
-    fn the_windows_keys_reach_the_console_and_closing_it_ends_the_run() {
-        assert!(sdl2::hint::set("SDL_VIDEODRIVER", "dummy"));
-        let mut window = Window::open().unwrap();
-        let mut typed: Vec<u8> = Vec::new();
-        let no_picture = || Err(FrameError::Off);
+    // A key with nothing but its keycode, as the console path only needs that.
+    fn push_keycode(keycode: Keycode, keymod: Mod) {
+        push_key(keycode, None, keymod, true, false);
+    }
 
+    fn push_focus_lost() {
+        let mut event = SDL_Event {
+            window: SDL_WindowEvent {
+                type_: SDL_EventType::SDL_WINDOWEVENT as u32,
+                timestamp: 0,
+                windowID: 0,
+                event: SDL_WindowEventID::SDL_WINDOWEVENT_FOCUS_LOST as u8,
+                padding1: 0,
+                padding2: 0,
+                padding3: 0,
+                data1: 0,
+                data2: 0,
+            },
+        };
+        // SAFETY: the pointer is to a live event, which SDL copies.
+        assert_eq!(unsafe { SDL_PushEvent(&mut event) }, 1);
+    }
+
+    // The time that has passed since the last update, as far as the redraw interval goes.
+    fn update(window: &mut Window, typed: &mut Vec<u8>) -> bool {
+        window.drawn = None;
+        window
+            .update(|bytes| typed.extend(bytes), || Err(FrameError::Off))
+            .unwrap()
+    }
+
+    // SDL allows one instance in a process, so the window is opened in this one test. It has the
+    // USB keys, and the keyboard they drive is not polled yet.
+    #[test]
+    fn the_windows_keys_reach_the_console_then_the_usb_keyboard_and_closing_it_ends_the_run() {
+        assert!(sdl2::hint::set("SDL_VIDEODRIVER", "dummy"));
+        let report = KeyReport::new();
+        let mut keyboard = HidKeyboard::new(report.clone());
+        keyboard.setup([0x00, 0x09, 1, 0, 0, 0, 0, 0]);
+        keyboard.in_token(0, 8);
+        let mut window = Window::open(Some(UsbKeys::new(report.clone()))).unwrap();
+        let mut typed: Vec<u8> = Vec::new();
+
+        // Before the firmware polls, the keys are the console's.
         push_text("a");
-        push_key(Keycode::Left, Mod::NOMOD);
-        push_key(Keycode::C, Mod::LCTRLMOD);
+        push_keycode(Keycode::Left, Mod::NOMOD);
+        push_keycode(Keycode::C, Mod::LCTRLMOD);
         push_text("é");
-        push_key(Keycode::Return, Mod::NOMOD);
-        push_key(Keycode::LShift, Mod::NOMOD);
-        assert!(
-            window
-                .update(|bytes| typed.extend(bytes), no_picture)
-                .unwrap()
+        push_keycode(Keycode::Return, Mod::NOMOD);
+        push_keycode(Keycode::LShift, Mod::NOMOD);
+        assert!(update(&mut window, &mut typed));
+        assert_eq!(typed, b"a\x1b[D\x03\r");
+        assert_eq!(report.get(), [0; 8]);
+
+        // The modifiers are kept for the report all the while, other keys are not.
+        push_key(
+            Keycode::LShift,
+            Some(Scancode::LShift),
+            Mod::LSHIFTMOD,
+            true,
+            false,
         );
+        push_key(Keycode::B, Some(Scancode::B), Mod::LSHIFTMOD, true, false);
+        assert!(update(&mut window, &mut typed));
+        assert_eq!(report.get(), [2, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(typed, b"a\x1b[D\x03\r");
 
         // Within the redraw interval nothing is handled, and the keys wait for the next time.
         push_text("b");
-        assert!(
-            window
-                .update(|bytes| typed.extend(bytes), no_picture)
-                .unwrap()
-        );
+        window
+            .update(|bytes| typed.extend(bytes), || Err(FrameError::Off))
+            .unwrap();
         assert_eq!(typed, b"a\x1b[D\x03\r");
-        window.drawn = None;
-        assert!(
-            window
-                .update(|bytes| typed.extend(bytes), no_picture)
-                .unwrap()
-        );
+        assert!(update(&mut window, &mut typed));
         assert_eq!(typed, b"a\x1b[D\x03\rb");
+
+        // The firmware polls: from the next batch the keys are USB's and no longer the
+        // console's.
+        keyboard.in_token(1, 8);
+        push_text("c");
+        push_keycode(Keycode::Left, Mod::NOMOD);
+        push_key(Keycode::A, Some(Scancode::A), Mod::LSHIFTMOD, true, false);
+        push_key(Keycode::A, Some(Scancode::A), Mod::LSHIFTMOD, true, true);
+        push_key(
+            Keycode::Left,
+            Some(Scancode::Left),
+            Mod::LSHIFTMOD,
+            true,
+            false,
+        );
+        // B was held across the switch, and its repeats are not presses.
+        push_key(Keycode::B, Some(Scancode::B), Mod::LSHIFTMOD, true, true);
+        assert!(update(&mut window, &mut typed));
+        assert_eq!(typed, b"a\x1b[D\x03\rb");
+        assert_eq!(report.get(), [2, 0, 0x04, 0x50, 0, 0, 0, 0]);
+
+        // A release changes the report, and a key held across the switch (B) has no effect.
+        keyboard.in_token(1, 8);
+        push_key(Keycode::A, Some(Scancode::A), Mod::LSHIFTMOD, false, false);
+        push_key(Keycode::B, Some(Scancode::B), Mod::LSHIFTMOD, false, false);
+        assert!(update(&mut window, &mut typed));
+        assert_eq!(report.get(), [2, 0, 0x50, 0, 0, 0, 0, 0]);
+
+        // A key tapped between two polls is in the report until the firmware has it, and the
+        // next look, with no event, lets it go.
+        push_key(Keycode::C, Some(Scancode::C), Mod::LSHIFTMOD, true, false);
+        push_key(Keycode::C, Some(Scancode::C), Mod::LSHIFTMOD, false, false);
+        assert!(update(&mut window, &mut typed));
+        assert_eq!(report.get(), [2, 0, 0x50, 0x06, 0, 0, 0, 0]);
+        keyboard.in_token(1, 8);
+        assert!(update(&mut window, &mut typed));
+        assert_eq!(report.get(), [2, 0, 0x50, 0, 0, 0, 0, 0]);
+
+        // Losing the focus lets go of everything.
+        push_focus_lost();
+        assert!(update(&mut window, &mut typed));
+        assert_eq!(report.get(), [0; 8]);
+        assert_eq!(typed, b"a\x1b[D\x03\rb");
+
+        // Without USB keys the keys are the console's whatever the firmware does.
+        window.usb = None;
+        push_text("d");
+        push_keycode(Keycode::Left, Mod::NOMOD);
+        assert!(update(&mut window, &mut typed));
+        assert_eq!(typed, b"a\x1b[D\x03\rbd\x1b[D");
 
         let mut event = SDL_Event {
             type_: SDL_EventType::SDL_QUIT as u32,
         };
         // SAFETY: the pointer is to a live event, which SDL copies.
         assert_eq!(unsafe { SDL_PushEvent(&mut event) }, 1);
-        window.drawn = None;
-        assert!(
-            !window
-                .update(|bytes| typed.extend(bytes), no_picture)
-                .unwrap()
-        );
+        assert!(!update(&mut window, &mut typed));
     }
 }

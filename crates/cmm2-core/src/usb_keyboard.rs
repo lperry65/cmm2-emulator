@@ -49,19 +49,45 @@ const HID_REPORT: u8 = 0x22;
 /// to six usage codes. A cheap handle: clones share the report, so the keyboard device and
 /// whatever drives the keys each keep one.
 #[derive(Clone, Debug, Default)]
-pub struct KeyReport(Rc<Cell<[u8; 8]>>);
+pub struct KeyReport(Rc<Shared>);
+
+#[derive(Debug, Default)]
+struct Shared {
+    report: Cell<[u8; 8]>,
+    /// The firmware has had the report as it is now.
+    sent: Cell<bool>,
+    /// The firmware has asked for a report at least once since the keyboard was reset.
+    polled: Cell<bool>,
+}
 
 impl KeyReport {
     pub fn new() -> KeyReport {
         KeyReport::default()
     }
 
+    /// Changing the report makes it unsent; setting what is there changes nothing.
     pub fn set(&self, report: [u8; 8]) {
-        self.0.set(report);
+        if report != self.0.report.get() {
+            self.0.report.set(report);
+            self.0.sent.set(false);
+        }
     }
 
     pub fn get(&self) -> [u8; 8] {
-        self.0.get()
+        self.0.report.get()
+    }
+
+    /// Whether the firmware has been sent the report as it is now, or has it already: a key
+    /// pressed and let go between two polls is not seen, so the front end holds the key until
+    /// this is true.
+    pub fn was_sent(&self) -> bool {
+        self.0.sent.get()
+    }
+
+    /// Whether the firmware has started polling the keyboard (its first interrupt IN since the
+    /// keyboard was plugged in or reset), which is when it is listening for keys.
+    pub fn polled(&self) -> bool {
+        self.0.polled.get()
     }
 }
 
@@ -158,6 +184,9 @@ impl UsbDevice for HidKeyboard {
     }
 
     fn reset(&mut self) {
+        // The firmware starts again: it has no report and has not polled.
+        self.keys.0.sent.set(false);
+        self.keys.0.polled.set(false);
         *self = HidKeyboard::new(self.keys.clone());
     }
 
@@ -193,6 +222,9 @@ impl UsbDevice for HidKeyboard {
                 In::Data(packet)
             }
             (1, _) if self.configured => {
+                self.keys.0.polled.set(true);
+                // Either way the firmware has the report as it is after this.
+                self.keys.0.sent.set(true);
                 let report = self.keys.get();
                 if report == self.sent {
                     return In::Nak;
@@ -532,6 +564,64 @@ mod tests {
         kb.reset();
         assert!(control_no_data(&mut kb, [0x00, 0x09, 1, 0, 0, 0, 0, 0]));
         assert_eq!(kb.in_token(1, 8), In::Data(vec![0, 0, 4, 0, 0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn the_first_interrupt_in_is_the_first_poll() {
+        let (mut kb, report) = keyboard();
+        assert!(!report.polled());
+        // Before SET_CONFIGURATION the endpoint stalls, which is not a poll of a keyboard.
+        kb.in_token(1, 8);
+        assert!(!report.polled());
+        assert!(control_no_data(&mut kb, [0x00, 0x09, 1, 0, 0, 0, 0, 0]));
+        assert!(!report.polled());
+        kb.in_token(1, 8);
+        assert!(report.polled());
+    }
+
+    #[test]
+    fn a_bus_reset_makes_the_firmware_poll_again() {
+        let (mut kb, report) = configured();
+        kb.in_token(1, 8);
+        kb.reset();
+        assert!(!report.polled());
+    }
+
+    #[test]
+    fn a_report_is_sent_when_the_firmware_has_it() {
+        let (mut kb, report) = configured();
+        let a = [0, 0, 0x04, 0, 0, 0, 0, 0];
+        report.set(a);
+        assert!(!report.was_sent());
+        kb.in_token(1, 8);
+        assert!(report.was_sent());
+        // Setting the same report again changes nothing.
+        report.set(a);
+        assert!(report.was_sent());
+        report.set([0; 8]);
+        assert!(!report.was_sent());
+    }
+
+    #[test]
+    fn a_report_set_back_to_what_was_sent_counts_as_sent_at_the_next_poll() {
+        let (mut kb, report) = configured();
+        let a = [0, 0, 0x04, 0, 0, 0, 0, 0];
+        report.set(a);
+        kb.in_token(1, 8);
+        report.set([0; 8]);
+        report.set(a);
+        assert!(!report.was_sent());
+        assert_eq!(kb.in_token(1, 8), In::Nak);
+        assert!(report.was_sent());
+    }
+
+    #[test]
+    fn a_bus_reset_means_the_firmware_has_not_the_report() {
+        let (mut kb, report) = configured();
+        report.set([0, 0, 0x04, 0, 0, 0, 0, 0]);
+        kb.in_token(1, 8);
+        kb.reset();
+        assert!(!report.was_sent());
     }
 
     #[test]

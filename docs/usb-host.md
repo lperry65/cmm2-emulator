@@ -488,8 +488,8 @@ table for the keyboard. The gamepad is the real unknown and should not be promis
 
 Issues 50 and 51 are the first two steps of section 10: the OTG controller (`otg.rs`), the port and
 the device trait (`usb.rs`), a low-speed HID boot keyboard (`usb_keyboard.rs`), and ignored tests
-that boot the real firmware with the keyboard plugged in. The window does not drive the keys yet
-(issue 52): `KeyReport` is the shared report that it will set, and the tests set it directly.
+that boot the real firmware with the keyboard plugged in. The window drives the keys since issue 52 (below);
+`KeyReport` is the shared report that it sets, and the core tests set it directly.
 
 **What it is.** `Otg` is mapped at 0x40080000 for 0x20000 bytes, always, with IRQ 101. `UsbPort` is
 a handle like `SdSlot` (`MemoryMap::usb_port()`): `attach(device)` and `detach()`, and the core
@@ -566,8 +566,22 @@ the firmware within a few milliseconds of machine time: `KEYDOWN(0)` was 1 and `
 polls is never seen, which is also what a real keyboard does, so a front end should hold a key
 until it has been polled (issue 52).
 
-**Left for issue 52:** the window, scancodes to usages, the held-key list and `KeyReport` building,
-focus loss, routing to the UART until the first poll (the model knows when: the first interrupt IN
-write to channel 1; the test counts it from the MMIO trace), and attaching the keyboard from the CLI
-with the window. The mouse and the gamepad (issues after) need a composite device or a second
-device behind a hub, which the port does not have.
+**The window's keys (issue 52).** `cmm2-emulator` plugs a `HidKeyboard` into the port with `--window`
+(unless `--console-keys`) and `usb_keys.rs` drives its `KeyReport` from SDL: scancodes are the usages
+(0x04 to 0x65 and the modifiers 0xE0 to 0xE7), the report is the modifier byte and up to six keys in
+press order, more than six is `0x01` in all six slots, SDL's repeats are ignored and a lost focus lets
+go of everything. Two hooks in the core serve it: `KeyReport::polled()` is true from the first
+interrupt IN on the keyboard's endpoint after `SET_CONFIGURATION` (and false again after a bus reset),
+and `KeyReport::was_sent()` is true once the keyboard has handed over, or found the firmware already
+had, the report as it now is. A key that is let go stays in the report until `was_sent()`, so a tap
+between two polls is seen. Until `polled()` the window types console bytes, which the first-boot
+question needs; from then on it sends reports only. A key held across the switch was typed on the
+console, so it is typed once and is not in the report (its release is ignored and its next press is
+USB's); the modifiers are always in the report. Measured in the release build, with the keyboard
+attached from reset, the firmware polls about 299 million instructions after the second prompt: 1.4 s
+of machine time, and 5.5 to 6 s of host time unpaced. A modifier let go before a pending key has been
+sent goes out first, as in one run the firmware did not poll a running loop for two slices of about 10 ms,
+so a very quick Ctrl-C can arrive as `c`; a held Ctrl, as a finger does, is not affected.
+
+The mouse and the gamepad (issues after) need a composite device or a second device behind a hub,
+which the port does not have.

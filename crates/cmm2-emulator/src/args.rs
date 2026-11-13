@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--unpaced] [--flash <file>] [--sd <file>]";
+pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--console-keys] [--unpaced] [--flash <file>] [--sd <file>]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -31,6 +31,8 @@ pub struct RunOptions {
     pub screenshot: Option<String>,
     /// Show the screen in a window while the guest runs.
     pub window: bool,
+    /// The window's keys go to the console, as bytes, and not to the USB keyboard.
+    pub console_keys: bool,
     /// Run the live modes as fast as the host allows, not at the machine's own speed.
     pub unpaced: bool,
     /// A file that keeps the flash the user changes, and the clock, between runs: loaded at the start if it exists, written
@@ -57,6 +59,7 @@ pub enum ArgError {
     BadAddress(String),
     NeedsFirmware(String),
     NeedsConsole(String),
+    NeedsWindow(String),
     ConsoleMmioNeedsFile,
     TraceFromNeedsTrace,
     BadKeys(String),
@@ -76,6 +79,7 @@ impl fmt::Display for ArgError {
             ArgError::NeedsConsole(option) => {
                 writeln!(f, "cmm2-emulator: {option} needs --console")?
             }
+            ArgError::NeedsWindow(option) => writeln!(f, "cmm2-emulator: {option} needs --window")?,
             ArgError::ConsoleMmioNeedsFile => writeln!(
                 f,
                 "cmm2-emulator: --console with --trace-mmio needs --trace, the screen belongs to the guest"
@@ -123,8 +127,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, ArgError
         }
         Some(
             option @ ("--run" | "--stop-at" | "--trace" | "--trace-mmio" | "--trace-from"
-            | "--console" | "--on" | "--screenshot" | "--window" | "--unpaced"
-            | "--flash" | "--sd"),
+            | "--console" | "--on" | "--screenshot" | "--window" | "--console-keys"
+            | "--unpaced" | "--flash" | "--sd"),
         ) => Err(ArgError::NeedsFirmware(option.to_string())),
         Some(arg) => Err(ArgError::Unknown(arg.to_string())),
     }
@@ -145,6 +149,7 @@ fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOption
             }
             "--console" => options.console = true,
             "--window" => options.window = true,
+            "--console-keys" => options.console_keys = true,
             "--unpaced" => options.unpaced = true,
             "--flash" => options.flash = Some(args.next().ok_or(ArgError::Usage)?),
             "--sd" => options.sd = Some(args.next().ok_or(ArgError::Usage)?),
@@ -166,6 +171,9 @@ fn check_console(options: &RunOptions) -> Result<(), ArgError> {
     }
     if !options.console && !options.on.is_empty() {
         return Err(ArgError::NeedsConsole("--on".to_string()));
+    }
+    if options.console_keys && !options.window {
+        return Err(ArgError::NeedsWindow("--console-keys".to_string()));
     }
     Ok(())
 }
@@ -373,6 +381,33 @@ mod tests {
         let options = run_options(&["--window", "--console", "--run", "9"]);
         assert!(options.window && options.console);
         assert_eq!(options.run, Some(9));
+    }
+
+    #[test]
+    fn the_window_sends_usb_keys_unless_console_keys_is_given() {
+        assert!(!run_options(&["--window"]).console_keys);
+        let options = run_options(&["--window", "--console-keys"]);
+        assert!(options.window && options.console_keys);
+    }
+
+    #[test]
+    fn console_keys_needs_the_window() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--console", "--console-keys"]),
+            Err(ArgError::NeedsWindow("--console-keys".into()))
+        );
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--run", "9", "--console-keys"]),
+            Err(ArgError::NeedsWindow("--console-keys".into()))
+        );
+    }
+
+    #[test]
+    fn console_keys_needs_the_firmware() {
+        assert_eq!(
+            parse_args(&["--console-keys"]),
+            Err(ArgError::NeedsFirmware("--console-keys".into()))
+        );
     }
 
     #[test]

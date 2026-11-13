@@ -48,7 +48,7 @@ fn no_arguments_prints_usage() {
     );
 }
 
-const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--unpaced] [--flash <file>] [--sd <file>]";
+const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--console-keys] [--unpaced] [--flash <file>] [--sd <file>]";
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
@@ -335,6 +335,29 @@ fn window_goes_with_the_console() {
 
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn window_keys_can_go_to_the_console() {
+    let output = run_program(
+        "window-console-keys",
+        &SCREEN,
+        &["--window", "--console-keys", "--run", "40"],
+    );
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn console_keys_without_the_window_is_a_usage_error() {
+    let output = run_program("console-keys", &SCREEN, &["--console-keys", "--run", "40"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .starts_with("cmm2-emulator: --console-keys needs --window\n")
+    );
 }
 
 #[test]

@@ -80,18 +80,43 @@ To see the screen, add `--window`. It opens an SDL window that shows what the fi
 and scales it to fit, and closing the window ends the run. It works with or without `--console`
 (without it the run goes on until the window is closed, or `--run` or `--stop-at` ends it).
 
-The window is also the keyboard. Click it and type: printable keys come as SDL text input, so
-the layout and Shift apply, and the other keys are sent as the bytes the firmware's console
-reads from a terminal. Enter is CR, Backspace is 0x08 (the firmware ignores 0x7F), and Tab and
-Escape are themselves. The arrows are `ESC [ A` to `D`, Home and End are `ESC [ 1 ~` and
-`ESC [ 4 ~` (measured: the firmware does not read xterm's `ESC [ H` and `ESC [ F`), Insert,
-Delete, Page Up and Page Down are `ESC [ 2 ~`, `3~`, `5~` and `6~`, F1 to F4 are `ESC O P` to
-`S`, and F5 to F12 are `ESC [ 15 ~`, `17~`, `18~`, `19~`, `20~`, `21~`, `23~` and `24~`.
-Ctrl with a letter sends the control code, so Ctrl-C stops a running program. Held keys repeat
-as SDL repeats them; there is no held-key state yet (the USB keyboard comes later). With
-`--window` and no `--console` the window alone gives input; with both, the terminal and the
-window feed the same console. Text other than ASCII is dropped, as the console has no way to
-take it.
+The window is also the keyboard, and it reaches the firmware in one of two ways. With `--window`
+it is a USB keyboard, as on the real board: the window plugs a HID boot keyboard into the USB
+port, and sets its report from the keys that are down (SDL's scancodes are USB usages, so a key
+goes in as itself, modifiers in the first byte, up to six keys in the order they were pressed, and
+the rollover error in all six slots if more are held). SDL's key repeat is ignored, as the firmware
+does its own repeat. A key that goes down and up between two polls is held in the report until the
+keyboard has sent it, and when the window loses the focus every key is let go. So `KEYDOWN()` and
+`INKEY$` see held keys, and Ctrl-C stops a program as it does on the board.
+
+The firmware's keyboard layout (`OPTION USBKEYBOARD`, which the first boot sets to UK) now decides
+the characters, as it does on the board, so the layout of the host no longer matters for USB. A
+US host keyboard with a UK firmware layout gives UK characters for some keys (Shift with 2 types
+`"` and Shift with ' types `@`), which is what the real board would do with that keyboard.
+
+The firmware starts polling the keyboard about 300 million instructions after the prompt: 1.4 s of
+the machine's time, and about 6 s of host time in a release build (measured, the tests in
+`usb_keys.rs`). Until then the keys are the console's: the window types bytes into the UART, which
+is what answers the first-boot keyboard question and anything typed before USB is up. On that
+path printable keys come as SDL text input, so the host layout and Shift apply, and the other keys
+are sent as the bytes the firmware's console reads from a terminal. Enter is CR, Backspace is
+0x08 (the firmware ignores 0x7F), and Tab and Escape are themselves. The arrows are `ESC [ A` to `D`, Home and End are `ESC [ 1 ~` and `ESC [ 4 ~` (measured: the
+firmware does not read xterm's `ESC [ H` and `ESC [ F`), Insert, Delete, Page Up and Page Down are
+`ESC [ 2 ~`, `3~`, `5~` and `6~`, F1 to F4 are `ESC O P` to `S`, and F5 to F12 are `ESC [ 15 ~`,
+`17~`, `18~`, `19~`, `20~`, `21~`, `23~` and `24~`. Ctrl with a letter sends the control code,
+so Ctrl-C stops a running program. Held keys repeat as SDL repeats them. Text other than ASCII
+is dropped, as the console has no way to take it.
+
+Once the firmware polls the keyboard the window sends USB reports only, and no console bytes, or
+every key would be typed twice. A key that is held across that moment was typed on the console, so
+it is typed once, and it is not in the report: it counts again from its next press. Modifiers are
+always in the report, so Shift held across the switch still shifts the next key. A system reset
+takes the window back to the console until the firmware polls again.
+
+`--console-keys` keeps the old behaviour with `--window`: the keys are the console's all the while
+and no USB keyboard is plugged in, which is useful if USB misbehaves. The host terminal
+(`--console`) always feeds the UART, in both modes. With `--window` and no `--console` the
+window alone gives input; with both, the terminal and the window feed the same console.
 
 `--console` and `--window` run the machine at its own speed: the core's clock (480 MHz) is held
 to the wall clock by sleeping, in steps of at most 10 ms, whenever the emulation is ahead. When
