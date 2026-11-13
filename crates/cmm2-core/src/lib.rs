@@ -23,9 +23,11 @@ mod usart;
 
 pub use clock::{CORE_HZ, Clock};
 pub use console::Console;
-pub use cpu::{Cpu, CpuError, Fault, Stop};
+pub use cpu::{Cpu, CpuError, Fault, PERSISTENT_SIZE, PersistentSizeError, Stop};
 pub use display::{Frame, FrameError};
-pub use firmware::{FLASH_BASE, FLASH_SIZE, Firmware, FirmwareError, VectorTable};
+pub use firmware::{
+    FLASH_BASE, FLASH_SIZE, Firmware, FirmwareError, USER_FLASH_BASE, USER_FLASH_SIZE, VectorTable,
+};
 pub use flash::{FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController, FlashRegisters};
 pub use flash_ops::{FlashOp, FlashOps};
 pub use gpio::{GPIO_BASE, GPIO_PORT_SIZE, GPIO_PORTS, Gpio, GpioRegisters};

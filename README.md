@@ -87,6 +87,24 @@ the window, a suspended process) is forgotten rather than made up with a burst. 
 to run as fast as the host allows. A plain `--run` is never paced. Today the host is about 4 to
 7 times slower than the real machine, so pacing does nothing until the core gets faster.
 
+`--flash <file>` keeps the board's settings between runs, as a real board does. If the file
+exists it is loaded at the start, and the flash and the clock are written back to it when the run
+ends (quit key, window closed, `--run` limit, `--stop-at` or a fault), through a temporary file
+and a rename, so a crash never leaves half a file. The first run, with no file yet, goes through
+the first-boot setup and saves the options it makes. A second run with the same file reaches the
+prompt with no setup questions and no reset:
+
+```
+cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --flash board.flash
+```
+
+The file holds only what the user changes, never the firmware, so it stays valid when you move
+to a newer firmware `.bin`: the stored program and saved options (flash from 0x08120000 to the
+end, 896 KB) and then the clock's time and date (8 bytes), which a real board's battery keeps. The
+firmware asks its setup questions again if the clock has not been set, so the clock has to be
+saved too. The time stands still while the emulator is off. The file must be exactly 917,512
+bytes, or the run stops with an error and the file is left alone.
+
 Building needs the SDL2 development files (`libsdl2-dev` on Debian and Ubuntu).
 
 ## Firmware and documentation are not included

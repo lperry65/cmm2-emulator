@@ -387,6 +387,39 @@ fn real_firmware_runs_a_command_at_the_prompt() {
 
 #[test]
 #[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_keeps_its_saved_options_in_the_persistent_state() {
+    let firmware = firmware();
+    let irqs = Irqs::new();
+    let memory = cmm2_memory(&irqs);
+    let console = memory.console();
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
+    let first = boot_to_second_prompt(&mut cpu, &console);
+    let saved = cpu.persistent();
+    assert_ne!(cpu.read32(0x081E_0000), 0xFFFF_FFFF);
+
+    // A new machine, started from what the first one saved, is a board that was set up before:
+    // no setup questions and no reset on the way to the prompt.
+    let irqs = Irqs::new();
+    let memory = cmm2_memory(&irqs);
+    let console = memory.console();
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
+    cpu.load_persistent(&saved).unwrap();
+    let output = run_to_text(&mut cpu, &console, "\r\n> ", 500_000_000);
+    let second = cpu.instruction_count();
+    println!("first run to the prompt {first}, second {second}");
+
+    assert_eq!(cpu.resets(), 0);
+    assert!(output.contains("MMBasic Version"), "{output:?}");
+    assert!(!output.contains("Initial setup"), "{output:?}");
+    // Measured: 412 million instructions to the prompt, where the first run took 612 million.
+    assert!(second < first, "{second} against {first}");
+    console.push_input(b"PRINT 1+2\r");
+    let answer = run_to_text(&mut cpu, &console, "\r\n> ", 50_000_000);
+    assert_eq!(answer, "PRINT 1+2\r\n 3\r\n> ");
+}
+
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
 fn real_firmware_draws_a_frame_at_the_prompt() {
     let firmware = firmware();
     let irqs = Irqs::new();

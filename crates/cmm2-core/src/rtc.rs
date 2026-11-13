@@ -11,6 +11,7 @@
 //! change.
 
 use crate::clock::{CORE_HZ, Clock};
+use crate::memory::MemoryMap;
 use crate::peripheral::StubRegisters;
 use crate::registers::{Registers, WordAccess};
 use crate::svd::Svd;
@@ -282,6 +283,21 @@ impl Rtc {
             snapshot: None,
         })
     }
+}
+
+/// The time and date, TR and DR, as the firmware would read them from the clock on `memory`.
+pub(crate) fn read_calendar(memory: &mut MemoryMap) -> [u32; 2] {
+    // TR first: it keeps the snapshot that DR then agrees with.
+    [memory.read32(RTC_BASE + TR), memory.read32(RTC_BASE + DR)]
+}
+
+/// Sets the clock on `memory` to the time and date `[TR, DR]`, in initialisation mode like the
+/// firmware does, so it carries on from there.
+pub(crate) fn write_calendar(memory: &mut MemoryMap, [tr, dr]: [u32; 2]) {
+    memory.write32(RTC_BASE + ISR, INIT);
+    memory.write32(RTC_BASE + TR, tr);
+    memory.write32(RTC_BASE + DR, dr);
+    memory.write32(RTC_BASE + ISR, 0);
 }
 
 #[cfg(test)]

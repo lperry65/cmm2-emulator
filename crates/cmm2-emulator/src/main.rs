@@ -16,7 +16,7 @@ use std::thread;
 use args::{Command, RunOptions};
 use cmm2_core::{
     AccessKind, CORE_HZ, Console, Cpu, CpuError, Firmware, FirmwareError, FrameError, Irqs,
-    MemoryError, PeripheralAccess, Stop, Svd, cmm2_memory,
+    MemoryError, PeripheralAccess, PersistentSizeError, Stop, Svd, cmm2_memory,
 };
 use pacing::{Pacer, RealTime};
 use script::Script;
@@ -87,6 +87,16 @@ enum RunError {
         path: String,
         source: io::Error,
     },
+    /// The `--flash` file could not be read or written.
+    Flash {
+        path: String,
+        source: io::Error,
+    },
+    /// The `--flash` file is not the size of the saved state.
+    FlashSize {
+        path: String,
+        source: PersistentSizeError,
+    },
     /// The guest faulted; the text is the core's description.
     Fault(String),
 }
@@ -103,6 +113,8 @@ impl fmt::Display for RunError {
             RunError::Window(err) => err.fmt(f),
             RunError::Frame(err) => write!(f, "no screenshot: {err}"),
             RunError::Screenshot { path, source } => write!(f, "{path}: {source}"),
+            RunError::Flash { path, source } => write!(f, "{path}: {source}"),
+            RunError::FlashSize { path, source } => write!(f, "{path}: {source}"),
             RunError::Fault(description) => f.write_str(description),
         }
     }
@@ -207,12 +219,50 @@ fn build_machine(path: &str, options: &RunOptions) -> Result<Machine, RunError> 
     let memory = cmm2_memory(&irqs);
     let trace = trace_out(options)?;
     let console = memory.console();
-    let cpu = Cpu::new(&firmware, memory, irqs)?;
+    let mut cpu = Cpu::new(&firmware, memory, irqs)?;
+    if let Some(path) = &options.flash {
+        load_flash(&mut cpu, path)?;
+    }
     Ok(Machine {
         cpu,
         console,
         trace,
     })
+}
+
+/// Loads the saved flash and clock from the `--flash` file. A file that is not there yet is the first run:
+/// the flash stays as the firmware leaves it.
+fn load_flash(cpu: &mut Cpu, path: &str) -> Result<(), RunError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(RunError::Flash {
+                path: path.to_string(),
+                source,
+            });
+        }
+    };
+    cpu.load_persistent(&bytes)
+        .map_err(|source| RunError::FlashSize {
+            path: path.to_string(),
+            source,
+        })
+}
+
+/// Writes the flash and clock to the `--flash` file, if it was given. It goes to a file beside it
+/// first and is renamed over it, so a crash leaves the old file and not half of the new one.
+fn save_flash(cpu: &mut Cpu, options: &RunOptions) -> Result<(), RunError> {
+    let Some(path) = &options.flash else {
+        return Ok(());
+    };
+    let temp = format!("{path}.tmp");
+    std::fs::write(&temp, cpu.persistent())
+        .and_then(|()| std::fs::rename(&temp, path))
+        .map_err(|source| RunError::Flash {
+            path: path.clone(),
+            source,
+        })
 }
 
 /// Returns whether the run ended without a fault.
@@ -225,6 +275,7 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
 
     let limit = options.run.unwrap_or(u64::MAX);
     let stop = run_slice(&mut cpu, options, trace.as_ref(), limit);
+    let saved = save_flash(&mut cpu, options);
     report_resets(&cpu, 0);
     finish_trace(trace)?;
 
@@ -232,13 +283,15 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
     print_summary(&mut cpu, &stop);
     print_console(&console);
     write_screenshot(&mut cpu, options)?;
+    saved?;
     Ok(ok)
 }
 
 /// Runs with the console on the host terminal and the screen in a window, as asked, until the
 /// quit key, the window is closed, the limit, `--stop-at` or a fault. The machine is held to
 /// its own speed unless `--unpaced`. The summary is left out, as the screen belongs to the
-/// guest. Without `--console` the guest's output is printed at the end.
+/// guest. Without `--console` the guest's output is printed at the end. The `--flash` file is
+/// written whichever way the run ends.
 fn run_live(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
     let Machine {
         mut cpu,
@@ -290,12 +343,15 @@ fn run_live(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
             pacer.pace(clock.now());
         }
     };
+    // Saved on every way out, a fault included; a fault is reported ahead of a failed save.
+    let saved = save_flash(&mut cpu, &options);
     finish_trace(trace)?;
     let ok = result?;
     if keys.is_none() {
         print_console(&console);
     }
     write_screenshot(&mut cpu, &options)?;
+    saved?;
     Ok(ok)
 }
 

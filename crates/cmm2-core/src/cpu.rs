@@ -17,11 +17,12 @@ use zmu_cortex_m::executor::Executor;
 use zmu_cortex_m::peripheral::nvic::NVIC;
 
 use crate::clock::Clock;
-use crate::firmware::{FLASH_BASE, FLASH_SIZE, Firmware};
+use crate::firmware::{FLASH_BASE, FLASH_SIZE, Firmware, USER_FLASH_BASE, USER_FLASH_SIZE};
 use crate::flash_ops::{FlashOp, FlashOps};
 use crate::irq::Irqs;
 use crate::memory::MemoryMap;
 use crate::peripheral::ResetCause;
+use crate::rtc;
 
 /// Cortex-M7 r1p1.
 const CPUID: u32 = 0x411F_C271;
@@ -41,6 +42,28 @@ impl fmt::Display for CpuError {
 }
 
 impl std::error::Error for CpuError {}
+
+/// What a real board keeps with the power off: the user flash, then the clock's time and date
+/// (TR and DR, a word each), which its battery keeps going.
+pub const PERSISTENT_SIZE: usize = USER_FLASH_SIZE + 8;
+
+/// Saved state of the wrong length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistentSizeError {
+    pub got: usize,
+}
+
+impl fmt::Display for PersistentSizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the saved flash and clock are {PERSISTENT_SIZE} bytes, not {}",
+            self.got
+        )
+    }
+}
+
+impl std::error::Error for PersistentSizeError {}
 
 /// What stopped the CPU: the address of the instruction and the core's description.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +344,39 @@ impl Cpu {
         self.flash_ops.clear();
         boot(&mut self.processor).expect("the vector table is in flash, which always reads");
         self.resets += 1;
+    }
+
+    /// What the machine keeps with the power off: the user flash, the saved options and the
+    /// stored program, as the guest has left it, then the clock's time and date. The firmware
+    /// is not part of it.
+    pub fn persistent(&mut self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(PERSISTENT_SIZE);
+        for addr in (USER_FLASH_BASE..FLASH_BASE + FLASH_SIZE as u32).step_by(4) {
+            bytes.extend(self.read32(addr).to_le_bytes());
+        }
+        for word in rtc::read_calendar(&mut self.memory.borrow_mut()) {
+            bytes.extend(word.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Restores what `persistent` gave out. The firmware is not touched, so state saved from
+    /// an older firmware still loads.
+    pub fn load_persistent(&mut self, bytes: &[u8]) -> Result<(), PersistentSizeError> {
+        if bytes.len() != PERSISTENT_SIZE {
+            return Err(PersistentSizeError { got: bytes.len() });
+        }
+        let (flash, calendar) = bytes.split_at(USER_FLASH_SIZE);
+        let (words, _) = flash.as_chunks::<4>();
+        for (addr, word) in (USER_FLASH_BASE..).step_by(4).zip(words) {
+            self.processor
+                .write32(addr, u32::from_le_bytes(*word))
+                .expect("the user flash is inside the core's flash");
+        }
+        let (words, _) = calendar.as_chunks::<4>();
+        let calendar = [words[0], words[1]].map(u32::from_le_bytes);
+        rtc::write_calendar(&mut self.memory.borrow_mut(), calendar);
+        Ok(())
     }
 
     pub fn memory(&self) -> RefMut<'_, MemoryMap> {
@@ -691,6 +747,88 @@ mod tests {
         assert_eq!(cpu.read32(FLASH_BASE), SP);
         assert_eq!(cpu.read32(0x2000_0000), 0xCAFE_F00D);
         assert_eq!(cpu.read32(0x2400_0000), 0xCAFE_F00D);
+    }
+
+    /// A machine with the clock mapped, as the persistent state includes it.
+    fn board(code: &[u16]) -> Cpu {
+        Cpu::new(&image(code, &[]), cmm2_memory(&Irqs::new()), Irqs::new()).unwrap()
+    }
+
+    fn set_clock(cpu: &mut Cpu, tr: u32, dr: u32) {
+        crate::rtc::write_calendar(&mut cpu.memory(), [tr, dr]);
+    }
+
+    #[test]
+    fn the_persistent_state_is_the_end_of_the_flash_and_the_clock() {
+        let mut cpu = board(&THREE);
+        let state = cpu.persistent();
+        assert_eq!(state.len(), PERSISTENT_SIZE);
+        assert_eq!(USER_FLASH_BASE, 0x0812_0000);
+        assert_eq!(PERSISTENT_SIZE, 0xE_0008);
+        assert!(state[..USER_FLASH_SIZE].iter().all(|&byte| byte == 0xFF));
+        // The clock's reset values: 00:00:00 on Monday 01/01/00.
+        assert_eq!(state[USER_FLASH_SIZE..], [0, 0, 0, 0, 0x01, 0x21, 0, 0]);
+    }
+
+    #[test]
+    fn loaded_state_reads_back_and_leaves_the_firmware_alone() {
+        let mut cpu = board(&THREE);
+        let mut state = vec![0xFF; PERSISTENT_SIZE];
+        state[..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        let last = USER_FLASH_SIZE - 4;
+        state[last..USER_FLASH_SIZE].copy_from_slice(&0xCAFE_F00Du32.to_le_bytes());
+        state[USER_FLASH_SIZE..USER_FLASH_SIZE + 4].copy_from_slice(&0x12_00_00u32.to_le_bytes());
+        state[USER_FLASH_SIZE + 4..].copy_from_slice(&0x26_91_12u32.to_le_bytes());
+
+        cpu.load_persistent(&state).unwrap();
+
+        assert_eq!(cpu.read32(USER_FLASH_BASE), 0x1234_5678);
+        assert_eq!(cpu.read32(0x081E_0000 + 0x1_FFFC), 0xCAFE_F00D);
+        assert_eq!(cpu.persistent(), state);
+        assert_eq!(cpu.read32(FLASH_BASE), SP);
+        assert_eq!(cpu.read32(USER_FLASH_BASE - 4), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn flash_the_guest_wrote_is_saved() {
+        let code = [boot_program(1), COUNT_IN_AXI.to_vec()].concat();
+        let mut cpu = Cpu::new(&image(&code, &[]), cmm2_memory(&Irqs::new()), Irqs::new()).unwrap();
+        cpu.run(100);
+        let state = cpu.persistent();
+        let at = (FLASH_WORD - USER_FLASH_BASE) as usize;
+        assert_eq!(state[at..at + 4], 1u32.to_le_bytes());
+    }
+
+    #[test]
+    fn the_clock_is_saved_and_carries_on_in_a_new_machine() {
+        let mut first = board(&THREE);
+        set_clock(&mut first, 0x12_30_45, 0x26_91_12);
+        let state = first.persistent();
+        assert_eq!(
+            state[USER_FLASH_SIZE..USER_FLASH_SIZE + 4],
+            0x12_30_45u32.to_le_bytes()
+        );
+        assert_eq!(state[USER_FLASH_SIZE + 4..], 0x26_91_12u32.to_le_bytes());
+
+        let mut second = board(&THREE);
+        second.load_persistent(&state).unwrap();
+        assert_eq!(second.persistent(), state);
+    }
+
+    #[test]
+    fn state_of_the_wrong_length_is_refused() {
+        let mut cpu = board(&THREE);
+        for len in [0, USER_FLASH_SIZE, PERSISTENT_SIZE - 4, PERSISTENT_SIZE + 4] {
+            assert_eq!(
+                cpu.load_persistent(&vec![0; len]),
+                Err(PersistentSizeError { got: len })
+            );
+        }
+        assert!(
+            cpu.persistent()[..USER_FLASH_SIZE]
+                .iter()
+                .all(|&byte| byte == 0xFF)
+        );
     }
 
     /// An instruction that is either a halfword or a load of a pool word into a register.

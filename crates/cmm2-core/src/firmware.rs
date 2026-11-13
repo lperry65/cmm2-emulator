@@ -5,6 +5,11 @@ use std::path::{Path, PathBuf};
 pub const FLASH_BASE: u32 = 0x0800_0000;
 /// The STM32H743 has 2 MB of flash.
 pub const FLASH_SIZE: usize = 2 * 1024 * 1024;
+/// Where the flash the user changes starts: the stored BASIC program from here, then the saved
+/// options in the last sector, at 0x081E_0000. Below it is the firmware.
+pub const USER_FLASH_BASE: u32 = 0x0812_0000;
+/// The user flash runs to the end of the flash.
+pub const USER_FLASH_SIZE: usize = FLASH_SIZE - (USER_FLASH_BASE - FLASH_BASE) as usize;
 
 // On-chip RAM sits between the flash and peripheral windows.
 const RAM_START: u32 = 0x2000_0000;
