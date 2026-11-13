@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window]";
+pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--unpaced]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -31,6 +31,8 @@ pub struct RunOptions {
     pub screenshot: Option<String>,
     /// Show the screen in a window while the guest runs.
     pub window: bool,
+    /// Run the live modes as fast as the host allows, not at the machine's own speed.
+    pub unpaced: bool,
 }
 
 /// Keys to send once the guest has printed some text.
@@ -115,7 +117,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, ArgError
         }
         Some(
             option @ ("--run" | "--stop-at" | "--trace" | "--trace-mmio" | "--trace-from"
-            | "--console" | "--on" | "--screenshot" | "--window"),
+            | "--console" | "--on" | "--screenshot" | "--window" | "--unpaced"),
         ) => Err(ArgError::NeedsFirmware(option.to_string())),
         Some(arg) => Err(ArgError::Unknown(arg.to_string())),
     }
@@ -136,6 +138,7 @@ fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOption
             }
             "--console" => options.console = true,
             "--window" => options.window = true,
+            "--unpaced" => options.unpaced = true,
             "--screenshot" => options.screenshot = Some(args.next().ok_or(ArgError::Usage)?),
             "--on" => {
                 let text = args.next().ok_or(ArgError::Usage)?;
@@ -361,6 +364,28 @@ mod tests {
         let options = run_options(&["--window", "--console", "--run", "9"]);
         assert!(options.window && options.console);
         assert_eq!(options.run, Some(9));
+    }
+
+    #[test]
+    fn unpaced_turns_the_pacing_off() {
+        assert!(run_options(&["--console", "--unpaced"]).unpaced);
+        assert!(!run_options(&["--console"]).unpaced);
+    }
+
+    #[test]
+    fn unpaced_needs_the_firmware() {
+        assert_eq!(
+            parse_args(&["--unpaced"]),
+            Err(ArgError::NeedsFirmware("--unpaced".into()))
+        );
+    }
+
+    #[test]
+    fn unpaced_alone_has_nothing_to_run() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--unpaced"]),
+            Err(ArgError::NothingToRun)
+        );
     }
 
     #[test]

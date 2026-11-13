@@ -47,7 +47,7 @@ fn no_arguments_prints_usage() {
     );
 }
 
-const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window]";
+const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--unpaced]";
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
@@ -330,6 +330,18 @@ fn window_goes_with_the_console() {
         "window-console",
         &SCREEN,
         &["--window", "--console", "--run", "40"],
+    );
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn unpaced_goes_with_the_live_modes() {
+    let output = run_program(
+        "window-unpaced",
+        &SCREEN,
+        &["--window", "--unpaced", "--run", "40"],
     );
 
     assert!(output.status.success());

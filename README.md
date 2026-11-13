@@ -79,6 +79,14 @@ cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --run 260000000 \
 To see the screen, add `--window`. It opens an SDL window that shows what the firmware has drawn
 and scales it to fit, and closing the window ends the run. It works with or without `--console`
 (without it the run goes on until the window is closed, or `--run` or `--stop-at` ends it).
+
+`--console` and `--window` run the machine at its own speed: the core's clock (480 MHz) is held
+to the wall clock by sleeping, in steps of at most 10 ms, whenever the emulation is ahead. When
+the host is too slow it runs flat out and does not try to catch up later, and a stall (dragging
+the window, a suspended process) is forgotten rather than made up with a burst. Add `--unpaced`
+to run as fast as the host allows. A plain `--run` is never paced. Today the host is about 4 to
+7 times slower than the real machine, so pacing does nothing until the core gets faster.
+
 Building needs the SDL2 development files (`libsdl2-dev` on Debian and Ubuntu).
 
 ## Firmware and documentation are not included

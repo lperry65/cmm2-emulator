@@ -21,7 +21,7 @@ mod svd;
 mod timer;
 mod usart;
 
-pub use clock::Clock;
+pub use clock::{CORE_HZ, Clock};
 pub use console::Console;
 pub use cpu::{Cpu, CpuError, Fault, Stop};
 pub use display::{Frame, FrameError};

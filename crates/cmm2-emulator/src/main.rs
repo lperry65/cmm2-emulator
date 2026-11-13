@@ -1,4 +1,5 @@
 mod args;
+mod pacing;
 mod script;
 mod terminal;
 mod window;
@@ -14,9 +15,10 @@ use std::thread;
 
 use args::{Command, RunOptions};
 use cmm2_core::{
-    AccessKind, Console, Cpu, CpuError, Firmware, FirmwareError, FrameError, Irqs, MemoryError,
-    PeripheralAccess, Stop, Svd, cmm2_memory,
+    AccessKind, CORE_HZ, Console, Cpu, CpuError, Firmware, FirmwareError, FrameError, Irqs,
+    MemoryError, PeripheralAccess, Stop, Svd, cmm2_memory,
 };
+use pacing::{Pacer, RealTime};
 use script::Script;
 use terminal::RawMode;
 use window::{Window, WindowError};
@@ -234,9 +236,9 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
 }
 
 /// Runs with the console on the host terminal and the screen in a window, as asked, until the
-/// quit key, the window is closed, the limit, `--stop-at` or a fault. The summary is left out,
-/// as the screen belongs to the guest. Without `--console` the guest's output is printed at the
-/// end.
+/// quit key, the window is closed, the limit, `--stop-at` or a fault. The machine is held to
+/// its own speed unless `--unpaced`. The summary is left out, as the screen belongs to the
+/// guest. Without `--console` the guest's output is printed at the end.
 fn run_live(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
     let Machine {
         mut cpu,
@@ -254,6 +256,8 @@ fn run_live(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
     let limit = options.run.unwrap_or(u64::MAX);
     let mut stdout = io::stdout();
     let mut resets = 0;
+    let clock = cpu.memory().clock();
+    let mut pacer = (!options.unpaced).then(|| Pacer::new(RealTime::start(), CORE_HZ));
 
     let result = loop {
         let budget = limit.saturating_sub(cpu.instruction_count()).min(SLICE);
@@ -281,6 +285,9 @@ fn run_live(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
             && !send_keys(&console, keys)
         {
             break Ok(true);
+        }
+        if let Some(pacer) = &mut pacer {
+            pacer.pace(clock.now());
         }
     };
     finish_trace(trace)?;
