@@ -3,6 +3,7 @@
 
 use crate::peripheral::ResetCause;
 use crate::registers::{Registers, WordAccess};
+use crate::sd_slot::SdSlot;
 
 pub const GPIO_BASE: u32 = 0x5802_0000;
 pub const GPIO_PORT_SIZE: u32 = 0x400;
@@ -19,6 +20,15 @@ const BSRR: u32 = 0x18;
 const LCKR: u32 = 0x1C;
 const AFRL: u32 = 0x20;
 const AFRH: u32 = 0x24;
+
+// The ports and pins of the SD socket.
+const PORT_C: usize = 2;
+const PORT_D: usize = 3;
+const SD_SCK: u32 = 10;
+const SD_MISO: u32 = 11;
+const SD_MOSI: u32 = 12;
+const SD_CS: u32 = 2;
+const SD_DETECT: u32 = 3;
 
 // Reset values per port (MODER, OSPEEDR, PUPDR), A to K. They follow RM0433. The SVD gives
 // GPIOA's values to every port, which is wrong for B to K.
@@ -38,8 +48,10 @@ const RESETS: [[u32; 3]; GPIO_PORTS] = [
 
 // Pins the board itself holds low, A to K. They read low even with a pull-up on. The real
 // board read D3, F9 and H12 low with their pull-ups enabled (2026-11-12, at the idle prompt,
-// with a USB keyboard attached), so something outside the chip drives them.
-const HELD_LOW: [u16; GPIO_PORTS] = [0, 0, 0, 1 << 3, 0, 1 << 9, 0, 1 << 12, 0, 0, 0];
+// with a USB keyboard attached), so something outside the chip drives them. D3 is the SD
+// socket's card-detect switch, so it comes from the SD slot instead and is not in this table.
+// H12 is the write-protect switch: nothing in the socket sets it.
+const HELD_LOW: [u16; GPIO_PORTS] = [0, 0, 0, 0, 0, 1 << 9, 0, 1 << 12, 0, 0, 0];
 
 // Pins in alternate-function mode that read high, A to K: the levels the real board read at
 // the idle prompt (same occasion, same keyboard). They stand in for the peripherals that
@@ -61,10 +73,11 @@ pub struct GpioRegisters {
     afrh: u32,
     held_low: u16,
     af_high: u16,
+    sd: SdSlot,
 }
 
 impl GpioRegisters {
-    fn new(port: usize) -> GpioRegisters {
+    fn new(port: usize, sd: SdSlot) -> GpioRegisters {
         let [moder, ospeedr, pupdr] = RESETS[port];
         GpioRegisters {
             port,
@@ -78,13 +91,49 @@ impl GpioRegisters {
             afrh: 0,
             held_low: HELD_LOW[port],
             af_high: AF_HIGH[port],
+            sd,
         }
     }
 
     // The level of pin `pin` when nothing on the chip drives it. A pin with no pull has no
     // defined level; it reads low here.
     fn input_level(&self, pin: u32) -> bool {
-        self.held_low >> pin & 1 == 0 && self.pupdr >> (2 * pin) & 3 == 0b01
+        self.held_low >> pin & 1 == 0
+            && !self.card_pulls_low(pin)
+            && self.pupdr >> (2 * pin) & 3 == 0b01
+    }
+
+    // The SD card holds its data-out wire low for a 0 bit, and the card-detect switch closes
+    // when a card is in.
+    fn card_pulls_low(&self, pin: u32) -> bool {
+        match (self.port, pin) {
+            (PORT_C, SD_MISO) => !self.sd.miso(),
+            (PORT_D, SD_DETECT) => self.sd.present(),
+            _ => false,
+        }
+    }
+
+    // The level the SD card sees on one of its inputs: what this port drives, or `released`
+    // when the pin is not an output.
+    fn card_input(&self, pin: u32, released: bool) -> bool {
+        if self.moder >> (2 * pin) & 3 == 0b01 {
+            self.odr >> pin & 1 != 0
+        } else {
+            released
+        }
+    }
+
+    // Tells the SD slot the levels this port now drives onto its wires. Chip select is pulled
+    // up on the board, and the clock idles low in SPI mode 0.
+    fn drive_sd(&self) {
+        match self.port {
+            PORT_C => self.sd.set_clock(
+                self.card_input(SD_SCK, false),
+                self.card_input(SD_MOSI, true),
+            ),
+            PORT_D => self.sd.set_chip_select(self.card_input(SD_CS, true)),
+            _ => {}
+        }
     }
 
     fn pin_level(&self, pin: u32) -> bool {
@@ -125,17 +174,22 @@ impl Registers for GpioRegisters {
 
     fn write(&mut self, offset: u32, value: u32, mask: u32) {
         match offset {
-            MODER => store(&mut self.moder, value, mask),
+            MODER => {
+                store(&mut self.moder, value, mask);
+                self.drive_sd();
+            }
             OTYPER => store(&mut self.otyper, value, mask),
             OSPEEDR => store(&mut self.ospeedr, value, mask),
             PUPDR => store(&mut self.pupdr, value, mask),
             ODR => {
                 store(&mut self.odr, value, mask);
                 self.odr &= 0xFFFF;
+                self.drive_sd();
             }
             BSRR => {
                 let value = value & mask;
                 self.odr = (self.odr & !(value >> 16) | value) & 0xFFFF;
+                self.drive_sd();
             }
             LCKR => store(&mut self.lckr, value, mask),
             AFRL => store(&mut self.afrl, value, mask),
@@ -146,16 +200,18 @@ impl Registers for GpioRegisters {
 
     // A system reset puts the port back to its reset values.
     fn reset(&mut self, _cause: ResetCause) {
-        *self = GpioRegisters::new(self.port);
+        *self = GpioRegisters::new(self.port, self.sd.clone());
+        self.drive_sd();
     }
 }
 
 pub type Gpio = WordAccess<GpioRegisters>;
 
 impl Gpio {
-    /// `port` is 0 for GPIOA.
-    pub fn new(port: usize) -> Gpio {
-        WordAccess::wrap(GpioRegisters::new(port))
+    /// `port` is 0 for GPIOA. `sd` is the socket whose wires pass through the ports that carry
+    /// them (C and D) and whose switches are read from D3.
+    pub fn new(port: usize, sd: SdSlot) -> Gpio {
+        WordAccess::wrap(GpioRegisters::new(port, sd))
     }
 }
 
@@ -174,17 +230,29 @@ mod tests {
     const GPIOH: u32 = GPIO_BASE + 7 * GPIO_PORT_SIZE;
     const GPIOK: u32 = GPIO_BASE + 10 * GPIO_PORT_SIZE;
 
-    fn machine() -> MemoryMap {
+    fn machine_with(sd: &SdSlot) -> MemoryMap {
         let mut m = MemoryMap::new();
         for i in 0..GPIO_PORTS {
             m.map_peripheral(
                 GPIO_BASE + i as u32 * GPIO_PORT_SIZE,
                 GPIO_PORT_SIZE,
-                Box::new(Gpio::new(i)),
+                Box::new(Gpio::new(i, sd.clone())),
             )
             .unwrap();
         }
         m
+    }
+
+    // A slot with a card in it, a 4-block image of 0x42.
+    fn card_in() -> SdSlot {
+        let sd = SdSlot::new();
+        sd.insert(vec![0x42; 4 * 512]).unwrap();
+        sd
+    }
+
+    // The board as the firmware found it: with a card in the socket.
+    fn machine() -> MemoryMap {
+        machine_with(&card_in())
     }
 
     // Sets pin `pin` of the port at `base` to `mode` (0 input, 1 output, 2 AF, 3 analog)
@@ -393,6 +461,144 @@ mod tests {
                 (b'A' + i as u8) as char
             );
         }
+    }
+
+    #[test]
+    fn card_detect_reads_high_with_no_card_and_low_with_one() {
+        let sd = SdSlot::new();
+        let mut m = machine_with(&sd);
+        configure(&mut m, GPIOD, 3, 0, 1);
+        assert_eq!(pin(&mut m, GPIOD, 3), 1);
+        sd.insert(vec![0; 512]).unwrap();
+        assert_eq!(pin(&mut m, GPIOD, 3), 0);
+        configure(&mut m, GPIOD, 3, 0, 0);
+        assert_eq!(pin(&mut m, GPIOD, 3), 0);
+        sd.eject();
+        configure(&mut m, GPIOD, 3, 0, 1);
+        assert_eq!(pin(&mut m, GPIOD, 3), 1);
+    }
+
+    #[test]
+    fn write_protect_reads_low_with_or_without_a_card() {
+        for sd in [SdSlot::new(), card_in()] {
+            let mut m = machine_with(&sd);
+            configure(&mut m, GPIOH, 12, 0, 1);
+            assert_eq!(pin(&mut m, GPIOH, 12), 0);
+        }
+    }
+
+    #[test]
+    fn the_card_detect_pin_is_only_d3() {
+        let mut m = machine();
+        configure(&mut m, GPIOD, 4, 0, 1);
+        assert_eq!(pin(&mut m, GPIOD, 4), 1);
+        configure(&mut m, GPIOC, 3, 0, 1);
+        assert_eq!(pin(&mut m, GPIOC, 3), 1);
+    }
+
+    // The pins as the firmware sets them up for the bit-bang: PD2, PC10 and PC12 outputs,
+    // PC11 an input with a pull-up. Chip select is high.
+    fn socket_wired(sd: &SdSlot) -> MemoryMap {
+        let mut m = machine_with(sd);
+        m.write32(GPIOD + BSRR, 1 << SD_CS);
+        configure(&mut m, GPIOD, SD_CS, 1, 0);
+        configure(&mut m, GPIOC, SD_SCK, 1, 0);
+        configure(&mut m, GPIOC, SD_MOSI, 1, 0);
+        configure(&mut m, GPIOC, SD_MISO, 0, 1);
+        m
+    }
+
+    // A byte the way the firmware's loop sends it: out through BSRR, the clock up, MISO read
+    // while it is high, the clock down.
+    fn transfer(m: &mut MemoryMap, byte: u8) -> u8 {
+        let mut read = 0;
+        for bit in (0..8).rev() {
+            let mosi = if byte >> bit & 1 != 0 {
+                1 << SD_MOSI
+            } else {
+                1 << (SD_MOSI + 16)
+            };
+            m.write32(GPIOC + BSRR, mosi);
+            m.write32(GPIOC + BSRR, 1 << SD_SCK);
+            read = read << 1 | pin(m, GPIOC, SD_MISO) as u8;
+            m.write32(GPIOC + BSRR, 1 << (SD_SCK + 16));
+        }
+        read
+    }
+
+    fn cmd0_reply(m: &mut MemoryMap) -> Vec<u8> {
+        for byte in [0x40, 0, 0, 0, 0, 0x95] {
+            transfer(m, byte);
+        }
+        (0..3).map(|_| transfer(m, 0xFF)).collect()
+    }
+
+    #[test]
+    fn cmd0_clocked_out_of_the_pins_is_answered_on_miso() {
+        let mut m = socket_wired(&card_in());
+        m.write32(GPIOD + BSRR, 1 << (SD_CS + 16));
+        assert_eq!(cmd0_reply(&mut m), [0xFF, 0x01, 0xFF]);
+    }
+
+    #[test]
+    fn nothing_answers_with_chip_select_high() {
+        let mut m = socket_wired(&card_in());
+        assert_eq!(cmd0_reply(&mut m), [0xFF; 3]);
+    }
+
+    #[test]
+    fn nothing_answers_with_no_card() {
+        let mut m = socket_wired(&SdSlot::new());
+        m.write32(GPIOD + BSRR, 1 << (SD_CS + 16));
+        assert_eq!(cmd0_reply(&mut m), [0xFF; 3]);
+    }
+
+    #[test]
+    fn taking_the_clock_pin_off_its_output_does_not_clock_the_card() {
+        let mut m = socket_wired(&card_in());
+        m.write32(GPIOD + BSRR, 1 << (SD_CS + 16));
+        configure(&mut m, GPIOC, SD_SCK, 0, 0);
+        configure(&mut m, GPIOC, SD_SCK, 1, 0);
+        assert_eq!(cmd0_reply(&mut m), [0xFF, 0x01, 0xFF]);
+    }
+
+    #[test]
+    fn chip_select_goes_through_odr_as_well_as_bsrr() {
+        let mut m = socket_wired(&card_in());
+        m.write32(GPIOD + ODR, 0);
+        assert_eq!(cmd0_reply(&mut m), [0xFF, 0x01, 0xFF]);
+        m.write32(GPIOD + ODR, 1 << SD_CS);
+        assert_eq!(cmd0_reply(&mut m), [0xFF; 3]);
+    }
+
+    #[test]
+    fn the_wires_only_count_when_the_pins_are_outputs() {
+        // Chip select low in ODR but PD2 an input: the board pulls it high, so no card hears.
+        let mut m = socket_wired(&card_in());
+        m.write32(GPIOD + MODER, !(3 << (2 * SD_CS)));
+        m.write32(GPIOD + ODR, 0);
+        assert_eq!(cmd0_reply(&mut m), [0xFF; 3]);
+        // Switching it to an output with ODR low selects the card.
+        configure(&mut m, GPIOD, SD_CS, 1, 0);
+        assert_eq!(cmd0_reply(&mut m), [0xFF, 0x01, 0xFF]);
+    }
+
+    // A reset puts PD2 back to a released pin, which the board pulls high.
+    #[test]
+    fn a_reset_deselects_the_card() {
+        let mut m = socket_wired(&card_in());
+        m.write32(GPIOD + BSRR, 1 << (SD_CS + 16));
+        m.reset_peripherals(ResetCause::Software);
+        configure(&mut m, GPIOC, SD_SCK, 1, 0);
+        configure(&mut m, GPIOC, SD_MOSI, 1, 0);
+        configure(&mut m, GPIOC, SD_MISO, 0, 1);
+        assert_eq!(cmd0_reply(&mut m), [0xFF; 3]);
+    }
+
+    #[test]
+    fn miso_is_the_pull_up_with_no_card() {
+        let mut m = socket_wired(&SdSlot::new());
+        assert_eq!(pin(&mut m, GPIOC, SD_MISO), 1);
     }
 
     #[test]

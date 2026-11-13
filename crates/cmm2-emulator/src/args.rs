@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--unpaced] [--flash <file>]";
+pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--unpaced] [--flash <file>] [--sd <file>]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -36,6 +36,9 @@ pub struct RunOptions {
     /// A file that keeps the flash the user changes, and the clock, between runs: loaded at the start if it exists, written
     /// back at the end.
     pub flash: Option<String>,
+    /// A card image for the SD socket, which has to exist already and is written back at the
+    /// end.
+    pub sd: Option<String>,
 }
 
 /// Keys to send once the guest has printed some text.
@@ -121,7 +124,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, ArgError
         Some(
             option @ ("--run" | "--stop-at" | "--trace" | "--trace-mmio" | "--trace-from"
             | "--console" | "--on" | "--screenshot" | "--window" | "--unpaced"
-            | "--flash"),
+            | "--flash" | "--sd"),
         ) => Err(ArgError::NeedsFirmware(option.to_string())),
         Some(arg) => Err(ArgError::Unknown(arg.to_string())),
     }
@@ -144,6 +147,7 @@ fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOption
             "--window" => options.window = true,
             "--unpaced" => options.unpaced = true,
             "--flash" => options.flash = Some(args.next().ok_or(ArgError::Usage)?),
+            "--sd" => options.sd = Some(args.next().ok_or(ArgError::Usage)?),
             "--screenshot" => options.screenshot = Some(args.next().ok_or(ArgError::Usage)?),
             "--on" => {
                 let text = args.next().ok_or(ArgError::Usage)?;
@@ -443,6 +447,33 @@ mod tests {
     fn flash_alone_has_nothing_to_run() {
         assert_eq!(
             parse_args(&["--firmware", "f", "--flash", "f.flash"]),
+            Err(ArgError::NothingToRun)
+        );
+    }
+
+    #[test]
+    fn sd_takes_a_file() {
+        let options = run_options(&["--run", "9", "--sd", "card.img"]);
+        assert_eq!(options.sd.as_deref(), Some("card.img"));
+        assert_eq!(run_options(&["--run", "9"]).sd, None);
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--run", "9", "--sd"]),
+            Err(ArgError::Usage)
+        );
+    }
+
+    #[test]
+    fn sd_needs_the_firmware() {
+        assert_eq!(
+            parse_args(&["--sd", "card.img"]),
+            Err(ArgError::NeedsFirmware("--sd".into()))
+        );
+    }
+
+    #[test]
+    fn sd_alone_has_nothing_to_run() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--sd", "card.img"]),
             Err(ArgError::NothingToRun)
         );
     }

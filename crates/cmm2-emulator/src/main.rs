@@ -15,8 +15,9 @@ use std::thread;
 
 use args::{Command, RunOptions};
 use cmm2_core::{
-    AccessKind, CORE_HZ, Console, Cpu, CpuError, Firmware, FirmwareError, FrameError, Irqs,
-    MemoryError, PeripheralAccess, PersistentSizeError, Stop, Svd, cmm2_memory,
+    AccessKind, CORE_HZ, Console, Cpu, CpuError, Firmware, FirmwareError, FrameError,
+    ImageSizeError, Irqs, MemoryError, PeripheralAccess, PersistentSizeError, SdSlot, Stop, Svd,
+    cmm2_memory,
 };
 use pacing::{Pacer, RealTime};
 use script::Script;
@@ -97,6 +98,16 @@ enum RunError {
         path: String,
         source: PersistentSizeError,
     },
+    /// The `--sd` file could not be read or written.
+    Sd {
+        path: String,
+        source: io::Error,
+    },
+    /// The `--sd` file is not a whole number of blocks.
+    SdSize {
+        path: String,
+        source: ImageSizeError,
+    },
     /// The guest faulted; the text is the core's description.
     Fault(String),
 }
@@ -115,6 +126,8 @@ impl fmt::Display for RunError {
             RunError::Screenshot { path, source } => write!(f, "{path}: {source}"),
             RunError::Flash { path, source } => write!(f, "{path}: {source}"),
             RunError::FlashSize { path, source } => write!(f, "{path}: {source}"),
+            RunError::Sd { path, source } => write!(f, "{path}: {source}"),
+            RunError::SdSize { path, source } => write!(f, "{path}: {source}"),
             RunError::Fault(description) => f.write_str(description),
         }
     }
@@ -210,6 +223,7 @@ fn access_line(access: &PeripheralAccess) -> String {
 struct Machine {
     cpu: Cpu,
     console: Console,
+    sd: SdSlot,
     trace: Option<Rc<RefCell<TraceOut>>>,
 }
 
@@ -219,13 +233,18 @@ fn build_machine(path: &str, options: &RunOptions) -> Result<Machine, RunError> 
     let memory = cmm2_memory(&irqs);
     let trace = trace_out(options)?;
     let console = memory.console();
+    let sd = memory.sd_slot();
     let mut cpu = Cpu::new(&firmware, memory, irqs)?;
     if let Some(path) = &options.flash {
         load_flash(&mut cpu, path)?;
     }
+    if let Some(path) = &options.sd {
+        load_sd(&sd, path)?;
+    }
     Ok(Machine {
         cpu,
         console,
+        sd,
         trace,
     })
 }
@@ -250,19 +269,56 @@ fn load_flash(cpu: &mut Cpu, path: &str) -> Result<(), RunError> {
         })
 }
 
-/// Writes the flash and clock to the `--flash` file, if it was given. It goes to a file beside it
-/// first and is renamed over it, so a crash leaves the old file and not half of the new one.
+/// Puts the card image from the `--sd` file in the socket. The file has to exist: a card is
+/// never made out of nothing.
+fn load_sd(sd: &SdSlot, path: &str) -> Result<(), RunError> {
+    let image = std::fs::read(path).map_err(|source| RunError::Sd {
+        path: path.to_string(),
+        source,
+    })?;
+    sd.insert(image).map_err(|source| RunError::SdSize {
+        path: path.to_string(),
+        source,
+    })
+}
+
+/// Writes `bytes` to a file beside `path` first and renames it over `path`, so a crash leaves
+/// the old file and not half of the new one.
+fn write_atomically(path: &str, bytes: &[u8]) -> io::Result<()> {
+    let temp = format!("{path}.tmp");
+    std::fs::write(&temp, bytes).and_then(|()| std::fs::rename(&temp, path))
+}
+
+/// Writes the flash and clock to the `--flash` file, if it was given.
 fn save_flash(cpu: &mut Cpu, options: &RunOptions) -> Result<(), RunError> {
     let Some(path) = &options.flash else {
         return Ok(());
     };
-    let temp = format!("{path}.tmp");
-    std::fs::write(&temp, cpu.persistent())
-        .and_then(|()| std::fs::rename(&temp, path))
-        .map_err(|source| RunError::Flash {
-            path: path.clone(),
-            source,
-        })
+    write_atomically(path, &cpu.persistent()).map_err(|source| RunError::Flash {
+        path: path.clone(),
+        source,
+    })
+}
+
+/// Writes the card in the socket back to the `--sd` file, if it was given.
+fn save_sd(sd: &SdSlot, options: &RunOptions) -> Result<(), RunError> {
+    let Some(path) = &options.sd else {
+        return Ok(());
+    };
+    let Some(image) = sd.eject() else {
+        return Ok(());
+    };
+    write_atomically(path, &image).map_err(|source| RunError::Sd {
+        path: path.clone(),
+        source,
+    })
+}
+
+/// Writes back everything the run changed that a file keeps. Both are tried, and the first
+/// error is the one returned.
+fn save_files(cpu: &mut Cpu, sd: &SdSlot, options: &RunOptions) -> Result<(), RunError> {
+    let flash = save_flash(cpu, options);
+    flash.and(save_sd(sd, options))
 }
 
 /// Returns whether the run ended without a fault.
@@ -270,12 +326,13 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
     let Machine {
         mut cpu,
         console,
+        sd,
         trace,
     } = build_machine(path, options)?;
 
     let limit = options.run.unwrap_or(u64::MAX);
     let stop = run_slice(&mut cpu, options, trace.as_ref(), limit);
-    let saved = save_flash(&mut cpu, options);
+    let saved = save_files(&mut cpu, &sd, options);
     report_resets(&cpu, 0);
     finish_trace(trace)?;
 
@@ -290,12 +347,13 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
 /// Runs with the console on the host terminal and the screen in a window, as asked, until the
 /// quit key, the window is closed, the limit, `--stop-at` or a fault. The machine is held to
 /// its own speed unless `--unpaced`. The summary is left out, as the screen belongs to the
-/// guest. Without `--console` the guest's output is printed at the end. The `--flash` file is
-/// written whichever way the run ends.
+/// guest. Without `--console` the guest's output is printed at the end. The `--flash` and `--sd`
+/// files are written whichever way the run ends.
 fn run_live(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
     let Machine {
         mut cpu,
         console,
+        sd,
         trace,
     } = build_machine(path, &options)?;
     let mut window = options
@@ -344,7 +402,7 @@ fn run_live(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
         }
     };
     // Saved on every way out, a fault included; a fault is reported ahead of a failed save.
-    let saved = save_flash(&mut cpu, &options);
+    let saved = save_files(&mut cpu, &sd, &options);
     finish_trace(trace)?;
     let ok = result?;
     if keys.is_none() {

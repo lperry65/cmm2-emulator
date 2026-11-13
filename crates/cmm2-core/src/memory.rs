@@ -13,6 +13,7 @@ use crate::console::Console;
 use crate::display::{Display, Frame, FrameError};
 use crate::flash_ops::FlashOps;
 use crate::peripheral::{Peripheral, PeripheralAccess, RegisterStub, ResetCause};
+use crate::sd_slot::SdSlot;
 use crate::svd::Svd;
 
 /// DTCM RAM. Owned by the CPU core, like the flash.
@@ -130,6 +131,7 @@ pub struct MemoryMap {
     flash_ops: FlashOps,
     clock: Clock,
     console: Console,
+    sd_slot: SdSlot,
     display: Display,
 }
 
@@ -159,6 +161,7 @@ impl MemoryMap {
             flash_ops: FlashOps::new(),
             clock: Clock::new(),
             console: Console::new(),
+            sd_slot: SdSlot::new(),
             display: Display::default(),
         }
     }
@@ -182,6 +185,11 @@ impl MemoryMap {
     /// The text channel of the console USART, shared with the front end.
     pub fn console(&self) -> Console {
         self.console.clone()
+    }
+
+    /// The SD socket, shared with the front end, which puts a card image in and takes it back.
+    pub fn sd_slot(&self) -> SdSlot {
+        self.sd_slot.clone()
     }
 
     /// The LTDC's side of the display, which the controller model keeps up to date.

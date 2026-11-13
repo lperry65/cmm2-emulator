@@ -105,6 +105,30 @@ firmware asks its setup questions again if the clock has not been set, so the cl
 saved too. The time stands still while the emulator is off. The file must be exactly 917,512
 bytes, or the run stops with an error and the file is left alone.
 
+`--sd <file>` puts an SD card in the socket, with the file as its contents. The firmware drives the
+card in SPI mode over GPIO pins, and the card is a model of that: it answers the commands the
+firmware sends (initialisation, single-block read and write) from the image. The file has to exist
+and has to be a whole number of 512-byte blocks, or the run stops with an error and the file is
+left alone; the emulator never makes a card out of nothing. When the run ends, by any of the ways
+above, the card is written back to the file, through a temporary file and a rename as `--flash`
+is. Without `--sd` the socket is empty and the firmware says "SD card not present".
+
+The image needs a FAT file system on it, which I make with the usual tools and not with the
+emulator. For a 64 MB FAT32 card:
+
+```
+truncate -s 64M card.img
+mkfs.vfat -F 32 -n CMM2 card.img
+cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --flash board.flash --sd card.img
+```
+
+`7z l card.img` lists what is on it after a run. To put a file on it before a run, mtools'
+`mcopy -i card.img file.bas ::` should do it, though I have not tried that here. The firmware sets the card up the first time it is used, which costs
+about 5 million instructions; after that it is quick. The CMM2 has no `SAVE` or `LOAD` for
+programs: `FILES`, `RUN "T.BAS"`, `LIST "T.BAS"`, `EDIT "T.BAS"` and `AUTOSAVE "T.BAS"` use the
+card. `OPTION SD TIMING FAST` (the SPI3 peripheral) is not modelled yet, and nor are the multi-block
+commands, which the firmware does not use for anything I have tried.
+
 Building needs the SDL2 development files (`libsdl2-dev` on Debian and Ubuntu).
 
 ## Firmware and documentation are not included

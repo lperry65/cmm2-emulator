@@ -283,3 +283,21 @@ Surprising, and worth knowing before starting:
   table. FatFS will read sector 0 as an MBR and then the partition's boot sector; the card side is
   the same CMD17.
 - The Gen 2 pin 3, 4 and 6 connections on the socket (not traced).
+
+## 8. What is built
+
+Issue 43 is the first step of section 6: the byte-level card (`sd.rs`), the socket with the
+bit-bang pins (`sd_slot.rs`, read and driven by the GPIO ports C and D), the `--sd` option, and an
+ignored test that boots the real firmware on a FAT32 image from `mkfs.vfat`, lists it, saves a
+program with `AUTOSAVE`, lists and runs it back and finds the file in the image.
+
+- The card answers CMD0, CMD8, CMD55/ACMD41, CMD58, CMD17 and CMD24, with R1 `0x04` (illegal
+  command) for the rest, and R1 `0x40` for a block past the end. CMD9, CMD10, CMD18/12, CMD25 and
+  ACMD23 are not there, as nothing I ran needed them. SPI3 (`OPTION SD TIMING FAST`) is not there.
+- PD3 reads low with a card in the socket and high without, and then the firmware says "SD card
+  not present" without sending anything to the card. PH12 still reads low, as the board does, so a
+  card is never write protected.
+- Measured on the real firmware: the first command that reaches the card is 5.9 million
+  instructions, nearly all of it the slow bit-bang of the initialisation; a `FILES` after that is
+  about 0.4 to 0.5 million, an `AUTOSAVE` that writes a file about 6 million and a `RUN` of it
+  about 4 million.

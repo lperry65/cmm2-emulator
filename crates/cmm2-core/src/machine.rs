@@ -50,7 +50,7 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
             .map_peripheral(
                 GPIO_BASE + port as u32 * GPIO_PORT_SIZE,
                 GPIO_PORT_SIZE,
-                Box::new(Gpio::new(port)),
+                Box::new(Gpio::new(port, memory.sd_slot())),
             )
             .expect("GPIO window is clear of RAM");
     }
@@ -213,6 +213,17 @@ mod tests {
         let mut m = cmm2_memory(&Irqs::new());
         assert_eq!(m.read32(0x5802_0400), 0xFFFF_FEBF); // GPIOB_MODER, not the SVD's
         assert_eq!(m.read32(0x5802_2800), 0xFFFF_FFFF); // GPIOK_MODER
+    }
+
+    #[test]
+    fn the_sd_slot_of_the_map_is_the_one_the_gpio_ports_read() {
+        let mut m = cmm2_memory(&Irqs::new());
+        let sd = m.sd_slot();
+        m.write32(0x5802_0C0C, 1 << 6); // GPIOD_PUPDR: pull-up on PD3
+        m.write32(0x5802_0C00, !(3 << 6)); // GPIOD_MODER: PD3 an input
+        assert_eq!(m.read32(0x5802_0C10) >> 3 & 1, 1); // GPIOD_IDR: no card
+        sd.insert(vec![0; 512]).unwrap();
+        assert_eq!(m.read32(0x5802_0C10) >> 3 & 1, 0);
     }
 
     #[test]

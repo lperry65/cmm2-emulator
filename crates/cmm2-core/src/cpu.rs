@@ -394,7 +394,7 @@ mod tests {
     use crate::{AccessKind, FLASH_BASE, Firmware, PeripheralAccess, Svd, UnmappedAccess};
     use crate::{Console, FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController, cmm2_memory};
     use crate::{GPIO_PORT_SIZE, Gpio, RCC_BASE, RCC_SIZE, RTC_BASE, RTC_SIZE, Rcc, Rtc};
-    use crate::{TIM16_BASE, TIMER_SIZE, Timer};
+    use crate::{SdSlot, TIM16_BASE, TIMER_SIZE, Timer};
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
@@ -1276,7 +1276,11 @@ mod tests {
         );
         let mut memory = MemoryMap::new();
         memory
-            .map_peripheral(GPIOB_MODER, GPIO_PORT_SIZE, Box::new(Gpio::new(1)))
+            .map_peripheral(
+                GPIOB_MODER,
+                GPIO_PORT_SIZE,
+                Box::new(Gpio::new(1, SdSlot::new())),
+            )
             .unwrap();
         memory
             .map_peripheral(RCC_BASE, RCC_SIZE, Box::new(Rcc::new()))

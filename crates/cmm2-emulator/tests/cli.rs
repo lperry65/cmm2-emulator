@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
@@ -47,7 +48,7 @@ fn no_arguments_prints_usage() {
     );
 }
 
-const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--unpaced] [--flash <file>]";
+const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--unpaced] [--flash <file>] [--sd <file>]";
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
@@ -1109,6 +1110,169 @@ fn a_flash_file_that_cannot_be_written_is_an_error() {
         format!(
             "cmm2-emulator: {}: No such file or directory (os error 2)\n",
             missing.display()
+        )
+    );
+}
+
+// A card image of four blocks, each filled with its own number, and its inode. The image is
+// written back through a temporary file and a rename, so a card that was written back has a
+// new inode, and the same bytes, as the guest never touches this card.
+fn sd_card(name: &str) -> (PathBuf, Vec<u8>) {
+    let path = temp_path(name, "img");
+    let image: Vec<u8> = (1..=4u8).flat_map(|b| [b; 512]).collect();
+    std::fs::write(&path, &image).unwrap();
+    (path, image)
+}
+
+fn written_back(path: &PathBuf, image: &[u8], inode: u64) -> bool {
+    std::fs::metadata(path).unwrap().ino() != inode && std::fs::read(path).unwrap() == image
+}
+
+#[test]
+fn the_sd_file_is_written_back_whichever_way_the_run_ends() {
+    let cases: [(&str, &[u16], &[&str]); 4] = [
+        ("sd-limit", &THREE, &["--run", "10"]),
+        ("sd-console", &THREE, &["--console", "--run", "10"]),
+        ("sd-stop-at", &THREE, &["--stop-at", "0x08000106"]),
+        ("sd-fault", &UNDEFINED, &["--run", "100"]),
+    ];
+    for (name, code, args) in cases {
+        let (card, image) = sd_card(name);
+        let inode = std::fs::metadata(&card).unwrap().ino();
+        let mut all = vec!["--sd", card.to_str().unwrap()];
+        all.extend_from_slice(args);
+
+        run_program(name, code, &all);
+
+        assert!(written_back(&card, &image, inode), "{name}");
+        std::fs::remove_file(&card).unwrap();
+    }
+}
+
+#[test]
+fn the_sd_file_is_written_back_when_a_live_run_faults() {
+    let (card, image) = sd_card("sd-fault-live");
+    let inode = std::fs::metadata(&card).unwrap().ino();
+
+    let output = run_program(
+        "sd-fault-live",
+        &UNDEFINED,
+        &["--console", "--sd", card.to_str().unwrap()],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(written_back(&card, &image, inode));
+    std::fs::remove_file(&card).unwrap();
+}
+
+#[test]
+fn the_sd_file_is_written_back_when_the_quit_key_ends_the_run() {
+    let (card, image) = sd_card("sd-quit");
+    let inode = std::fs::metadata(&card).unwrap().ino();
+    let path = temp_program("sd-quit", &THREE);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        .args(["--firmware", path.to_str().unwrap(), "--console", "--sd"])
+        .arg(&card)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("failed to run cmm2-emulator");
+    child.stdin.as_mut().unwrap().write_all(b"\x1D").unwrap();
+    let status = child.wait().unwrap();
+
+    assert!(status.success());
+    assert!(written_back(&card, &image, inode));
+    std::fs::remove_file(&card).unwrap();
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn saving_the_sd_file_leaves_no_temporary_file() {
+    let (card, _) = sd_card("sd-temp");
+    let temp = PathBuf::from(format!("{}.tmp", card.display()));
+
+    run_program(
+        "sd-temp",
+        &THREE,
+        &["--run", "10", "--sd", card.to_str().unwrap()],
+    );
+
+    assert!(!temp.exists());
+    std::fs::remove_file(&card).unwrap();
+}
+
+#[test]
+fn a_missing_sd_file_is_an_error_and_is_not_made() {
+    let card = temp_path("sd-missing", "img");
+    let _ = std::fs::remove_file(&card);
+
+    let output = run_program(
+        "sd-missing",
+        &THREE,
+        &["--run", "10", "--sd", card.to_str().unwrap()],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "cmm2-emulator: {}: No such file or directory (os error 2)\n",
+            card.display()
+        )
+    );
+    assert!(!card.exists());
+}
+
+#[test]
+fn an_sd_file_that_is_not_whole_blocks_is_an_error_and_is_left_alone() {
+    for (name, bytes) in [("sd-ragged", vec![7; 1000]), ("sd-empty", Vec::new())] {
+        let card = temp_path(name, "img");
+        std::fs::write(&card, &bytes).unwrap();
+
+        let output = run_program(
+            name,
+            &THREE,
+            &["--run", "10", "--sd", card.to_str().unwrap()],
+        );
+
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        assert_eq!(
+            stderr(&output),
+            format!(
+                "cmm2-emulator: {}: {} bytes is not a whole number of 512-byte blocks\n",
+                card.display(),
+                bytes.len()
+            ),
+            "{name}"
+        );
+        assert_eq!(std::fs::read(&card).unwrap(), bytes, "{name}");
+        std::fs::remove_file(&card).unwrap();
+    }
+}
+
+#[test]
+fn an_sd_file_that_cannot_be_written_back_is_an_error() {
+    // The temporary file the card is written to first is in the way, as a directory.
+    let (card, _) = sd_card("sd-unwritable");
+    let temp = PathBuf::from(format!("{}.tmp", card.display()));
+    std::fs::create_dir(&temp).unwrap();
+
+    let output = run_program(
+        "sd-unwritable",
+        &THREE,
+        &["--run", "10", "--sd", card.to_str().unwrap()],
+    );
+
+    std::fs::remove_dir(&temp).unwrap();
+    std::fs::remove_file(&card).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "cmm2-emulator: {}: Is a directory (os error 21)\n",
+            card.display()
         )
     );
 }
