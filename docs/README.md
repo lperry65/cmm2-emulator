@@ -7,5 +7,7 @@ Project documentation lives here as markdown.
 - [background.md](background.md): what existed before, the three levels of emulator, and the sources.
 - `decisions/`: short records of design decisions and the evidence for them.
 - `boot-trace.md`: what the real firmware does at boot (written in iteration 1).
+- [sd-card.md](sd-card.md): how the firmware drives the SD card (SPI mode) and the card model.
+- [usb-host.md](usb-host.md): how the firmware's USB host stack sees a keyboard, and the plan to emulate it.
 
 Local copies of manuals, schematics and firmware are kept in `reference/`, which is not tracked.
