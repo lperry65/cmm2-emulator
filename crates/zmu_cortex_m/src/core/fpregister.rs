@@ -17,6 +17,45 @@ pub enum FPSCRRounding {
     RoundTowardsZero,
 }
 
+/// The rounding modes of the pseudocode's FPRounding. The FPSCR names four of them; VRINTA and
+/// VCVTA name the fifth, ties away from zero.
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub enum FPRounding {
+    /// Nearest, a tie going to the even neighbour
+    TieEven,
+    /// Towards plus infinity
+    PosInf,
+    /// Towards minus infinity
+    NegInf,
+    /// Towards zero
+    Zero,
+    /// Nearest, a tie going to the neighbour away from zero
+    TieAway,
+}
+
+impl FPRounding {
+    /// The rounding the two RM bits of VRINTA/N/P/M and VCVTA/N/P/M name, in that order.
+    pub fn from_rm(rm: u32) -> Self {
+        match rm {
+            0 => Self::TieAway,
+            1 => Self::TieEven,
+            2 => Self::PosInf,
+            _ => Self::NegInf,
+        }
+    }
+}
+
+impl From<FPSCRRounding> for FPRounding {
+    fn from(mode: FPSCRRounding) -> Self {
+        match mode {
+            FPSCRRounding::RoundToNearest => Self::TieEven,
+            FPSCRRounding::RoundTowardsPlusInfinity => Self::PosInf,
+            FPSCRRounding::RoundTowardsMinusInfinity => Self::NegInf,
+            FPSCRRounding::RoundTowardsZero => Self::Zero,
+        }
+    }
+}
+
 /// Trait for accessing Floating Point registers
 pub trait Fpscr {
     ///

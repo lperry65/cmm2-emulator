@@ -41,6 +41,8 @@ mod fp_generic;
 mod fp_load_and_store;
 #[cfg(feature = "has-fp")]
 mod fp_register_transfer;
+#[cfg(all(test, feature = "has-fp"))]
+mod fp_test_support;
 
 use branch::IsaBranch;
 use coproc::IsaCoprocessor;
@@ -512,6 +514,10 @@ impl ExecutorHelper for Processor {
             //
             // --------------------------------------------
             Instruction::UXTAB { params } => self.exec_uxtab(params),
+            Instruction::UXTAH { params } => self.exec_uxtah(params),
+            Instruction::SXTAB { params } => self.exec_sxtab(params),
+            Instruction::SXTAH { params } => self.exec_sxtah(params),
+            Instruction::PKH { params, tb_form } => self.exec_pkh(params, *tb_form),
 
             // --------------------------------------------
             //
@@ -754,6 +760,10 @@ impl ExecutorHelper for Processor {
             #[cfg(feature = "has-fp")]
             Instruction::VFNMS_f64 { params } => self.exec_vfnms_f64(params),
             #[cfg(feature = "has-fp")]
+            Instruction::VFNMA_f32 { params } => self.exec_vfnma_f32(params),
+            #[cfg(feature = "has-fp")]
+            Instruction::VFNMA_f64 { params } => self.exec_vfnma_f64(params),
+            #[cfg(feature = "has-fp")]
             Instruction::VDIV_f32 { params } => self.exec_vdiv_f32(params),
             #[cfg(feature = "has-fp")]
             Instruction::VDIV_f64 { params } => self.exec_vdiv_f64(params),
@@ -770,15 +780,21 @@ impl ExecutorHelper for Processor {
             #[cfg(feature = "has-fp")]
             Instruction::VSQRT_f64 { params } => self.exec_vsqrt_f64(*params),
             #[cfg(feature = "has-fp")]
-            Instruction::VRINTZ_f32 { params } => self.exec_vrintz_f32(*params),
+            Instruction::VRINT_f32 { params } => self.exec_vrint_f32(*params),
             #[cfg(feature = "has-fp")]
-            Instruction::VRINTZ_f64 { params } => self.exec_vrintz_f64(*params),
+            Instruction::VRINT_f64 { params } => self.exec_vrint_f64(*params),
+            #[cfg(feature = "has-fp")]
+            Instruction::VMINMAXNM_f32 { params } => self.exec_vminmaxnm_f32(params),
+            #[cfg(feature = "has-fp")]
+            Instruction::VMINMAXNM_f64 { params } => self.exec_vminmaxnm_f64(params),
             #[cfg(feature = "has-fp")]
             Instruction::VSUB_f32 { params } => self.exec_vsub_f32(params),
             #[cfg(feature = "has-fp")]
             Instruction::VSUB_f64 { params } => self.exec_vsub_f64(params),
             #[cfg(feature = "has-fp")]
             Instruction::VCVT { params } => self.exec_vcvt(params),
+            #[cfg(feature = "has-fp")]
+            Instruction::VCVT_fixed { params } => self.exec_vcvt_fixed(params),
             #[cfg(feature = "has-fp")]
             Instruction::VCVT_f64_f32 { params } => self.exec_vcvt_f64_f32(*params),
             #[cfg(feature = "has-fp")]

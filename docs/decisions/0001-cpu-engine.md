@@ -22,7 +22,7 @@ I ran a time-boxed spike on each candidate against the real firmware (v7.00.00b5
 | | Unicorn 2.1.5 | zmu, with local fixes |
 |---|---|---|
 | Licence | GPL-2.0 only | Apache-2.0 |
-| Thumb-2 and double-precision FPU | correct, no unsupported instruction in about 1 G instructions | correct on everything executed; some instructions still missing (below) |
+| Thumb-2 and double-precision FPU | correct, no unsupported instruction in about 1 G instructions | correct on everything executed; the instructions it lacked are added (below) |
 | Interrupts, NVIC, SysTick | none: the M-profile code is stubbed out (`return; // FIXME`), so all of it would be mine to write | present: priorities, nesting, SysTick, SVC/PendSV, FPU stack frames with lazy stacking |
 | Debugging | no GDB support; registers, memory, single step and breakpoints are available | GDB server exists, attaches and steps; `continue` with a breakpoint did not work |
 | Speed, tight loop | 434 million instructions/s with no hooks | 92 million/s |
@@ -56,9 +56,13 @@ counting instructions costs a hook that takes much of the speed advantage back.
   wrong shift in the NVIC clear-pending scan. That is five bugs in code the firmware actually runs, in a core
   with a passing test suite, so I expect more.
 - **It is not on crates.io.** The repo is the only source, so it is vendored.
-- **Instructions are still missing.** From a scan of the whole image: `vrint*`, `vfnma`, `vmaxnm`,
-  `orn` with an immediate, `uxtah`, `sxtah`, `pkhbt` and a few more. The firmware hasn't executed them
-  yet, but MMBasic programs probably will. Each is about 20 to 40 lines to add.
+- **Instructions were missing.** From a scan of the whole image: `vrint*`, `vfnma`, `orn` with an
+  immediate, `uxtah`, `sxtah` and `pkhbt`, and the fixed-point forms of `vcvt`, which were decoded as
+  the plain conversion and so gave wrong answers. I added them (and `vmaxnm`, `vminnm`, `vcvta` and
+  its kin) when a plain BASIC `FOR` loop stopped at a `vrintm.f64`; `crates/zmu_cortex_m/NOTICE.md`
+  lists each change. Nothing else the scan finds looks like code the firmware runs, except `fstmiax`
+  at 0x080018c0 (the VFP save helper beside `fldmiax`, called from what looks like libgcc's
+  unwinder), which none of my runs reached and which is still undecoded.
 - **It is slow.** At about 90 million instructions a second it is roughly 3 to 5 times slower than Unicorn.
   Its own cycle estimate suggests the firmware averages about 2.2 cycles per instruction, so the real board
   may do about 220 million per second, not 480. If so, zmu is about 2.5 to 3 times slower than real. I have not

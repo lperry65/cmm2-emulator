@@ -113,6 +113,21 @@ pub trait ExtensionRegOperations {
     /// Get value of double precision floating point register
     ///
     fn get_dr(&mut self, r: DoubleReg) -> (u32, u32);
+
+    ///
+    /// Get the value of a double precision floating point register as one 64-bit word
+    ///
+    fn get_dr_bits(&mut self, r: DoubleReg) -> u64 {
+        let (low_word, high_word) = self.get_dr(r);
+        u64::from(high_word) << 32 | u64::from(low_word)
+    }
+
+    ///
+    /// Set the value of a double precision floating point register from one 64-bit word
+    ///
+    fn set_dr_bits(&mut self, r: DoubleReg, value: u64) {
+        self.set_dr(r, value as u32, (value >> 32) as u32);
+    }
 }
 
 impl BaseReg for Processor {

@@ -3,6 +3,7 @@
 //!
 
 use crate::core::condition::Condition;
+use crate::core::fpregister::FPRounding;
 use crate::core::register::{DoubleReg, ExtensionReg, Reg, SingleReg};
 use crate::core::thumb::ThumbCode;
 use enum_set::EnumSet;
@@ -422,8 +423,63 @@ pub struct VCVTParams {
     pub to_integer: bool,
     pub unsigned: bool,
     pub dp_operation: bool,
-    pub round_zero: bool,
-    pub round_nearest: bool,
+    /// The rounding a conversion to an integer is told to use, or `None` for the FPSCR's.
+    pub rounding: Option<FPRounding>,
+}
+
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub struct VCVTFixedParams {
+    /// The register, single or double, that is both the source and the destination.
+    pub reg: ExtensionReg,
+    /// Floating point to fixed point when set, fixed point to floating point when not.
+    pub to_fixed: bool,
+    pub unsigned: bool,
+    /// The width of the fixed-point number: 16 or 32.
+    pub size: u8,
+    pub fraction_bits: u8,
+}
+
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub struct VRintParamsf32 {
+    pub sd: SingleReg,
+    pub sm: SingleReg,
+    /// The rounding the instruction names, or `None` for the FPSCR's.
+    pub rounding: Option<FPRounding>,
+    /// Whether a result that differs from the operand raises Inexact.
+    pub exact: bool,
+}
+
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub struct VRintParamsf64 {
+    pub dd: DoubleReg,
+    pub dm: DoubleReg,
+    /// The rounding the instruction names, or `None` for the FPSCR's.
+    pub rounding: Option<FPRounding>,
+    /// Whether a result that differs from the operand raises Inexact.
+    pub exact: bool,
+}
+
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub struct VMinMaxNumParamsf32 {
+    pub sd: SingleReg,
+    pub sn: SingleReg,
+    pub sm: SingleReg,
+    /// VMAXNM when set, VMINNM when not.
+    pub max: bool,
+}
+
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub struct VMinMaxNumParamsf64 {
+    pub dd: DoubleReg,
+    pub dn: DoubleReg,
+    pub dm: DoubleReg,
+    /// VMAXNM when set, VMINNM when not.
+    pub max: bool,
 }
 
 #[allow(missing_docs)]
@@ -1056,16 +1112,31 @@ pub enum Instruction {
     //
     // Subgroup: Packing and unpacking instructions, Armv7-M DSP extension
     //
-    //PKHBT, PKHTB
-    //SXTAB
+    /// Pack Halfword: the bottom half of Rn with the top half of the shifted Rm (PKHBT), or
+    /// the top half of Rn with the bottom half of the shifted Rm (PKHTB, `tb_form`)
+    PKH {
+        params: Reg3ShiftParams,
+        tb_form: bool,
+    },
     //SXTAB16
-    //SXTAH
+    /// Signed Extend Byte and Add
+    SXTAB {
+        params: Reg3UsizeParams,
+    },
+    /// Signed Extend Halfword and Add
+    SXTAH {
+        params: Reg3UsizeParams,
+    },
     //SXTB16
+    /// Unsigned Extend Byte and Add
     UXTAB {
         params: Reg3UsizeParams,
     },
     //UXTAB16
-    //UXTAH
+    /// Unsigned Extend Halfword and Add
+    UXTAH {
+        params: Reg3UsizeParams,
+    },
     //UXTB16
 
     // --------------------------------------------
@@ -1592,6 +1663,14 @@ pub enum Instruction {
         params: VAddSubParamsf64,
     },
     #[cfg(feature = "has-fp")]
+    VFNMA_f32 {
+        params: VAddSubParamsf32,
+    },
+    #[cfg(feature = "has-fp")]
+    VFNMA_f64 {
+        params: VAddSubParamsf64,
+    },
+    #[cfg(feature = "has-fp")]
     VCMP_f32 {
         params: VCmpParamsf32,
     },
@@ -1602,6 +1681,10 @@ pub enum Instruction {
     #[cfg(feature = "has-fp")]
     VCVT {
         params: VCVTParams,
+    },
+    #[cfg(feature = "has-fp")]
+    VCVT_fixed {
+        params: VCVTFixedParams,
     },
     #[cfg(feature = "has-fp")]
     VCVT_f64_f32 {
@@ -1649,14 +1732,22 @@ pub enum Instruction {
         params: VAddSubParamsf64,
     },
     //VNMLA
-    //VRINTA
+    // VRINTA, VRINTN, VRINTP, VRINTM, VRINTR, VRINTX and VRINTZ
     #[cfg(feature = "has-fp")]
-    VRINTZ_f32 {
-        params: VMovRegParamsf32,
+    VRINT_f32 {
+        params: VRintParamsf32,
     },
     #[cfg(feature = "has-fp")]
-    VRINTZ_f64 {
-        params: VMovRegParamsf64,
+    VRINT_f64 {
+        params: VRintParamsf64,
+    },
+    #[cfg(feature = "has-fp")]
+    VMINMAXNM_f32 {
+        params: VMinMaxNumParamsf32,
+    },
+    #[cfg(feature = "has-fp")]
+    VMINMAXNM_f64 {
+        params: VMinMaxNumParamsf64,
     },
     //VSEL
     #[cfg(feature = "has-fp")]
@@ -1806,42 +1897,74 @@ fn fmt_add_imm(params: Reg2ImmParams, thumb32: bool) -> String {
     }
 }
 
+// The letter after "vrint": the rounding the instruction names, or R or X when it takes the
+// FPSCR's.
+#[cfg(feature = "has-fp")]
+fn vrint_suffix(rounding: Option<FPRounding>, exact: bool) -> &'static str {
+    match (rounding, exact) {
+        (None, false) => "r",
+        (None, true) => "x",
+        (Some(rounding), _) => rounding_suffix(rounding),
+    }
+}
+
+// The letter that follows "vcvt" or "vrint" for a rounding the instruction names.
+#[cfg(feature = "has-fp")]
+fn rounding_suffix(rounding: FPRounding) -> &'static str {
+    match rounding {
+        FPRounding::Zero => "z",
+        FPRounding::TieAway => "a",
+        FPRounding::TieEven => "n",
+        FPRounding::PosInf => "p",
+        FPRounding::NegInf => "m",
+    }
+}
+
 #[cfg(feature = "has-fp")]
 fn fmt_vcvt(params: VCVTParams) -> String {
-    let fpscr_rounding = params.round_nearest;
+    let integer = if params.unsigned { "u32" } else { "s32" };
+    let precision = if params.dp_operation { "f64" } else { "f32" };
     if params.to_integer {
-        if params.dp_operation {
-            format!(
-                "vcvt{}.{}.f64 {}, {}",
-                if fpscr_rounding { "r" } else { "" },
-                if params.unsigned { "u32" } else { "s32" },
-                params.d,
-                params.m
-            )
-        } else {
-            format!(
-                "vcvt{}.{}.f32 {}, {}",
-                if fpscr_rounding { "r" } else { "" },
-                if params.unsigned { "u32" } else { "s32" },
-                params.d,
-                params.m
-            )
-        }
-    } else if params.dp_operation {
+        // Plain VCVT always rounds towards zero, so it has no letter; VCVTR follows the FPSCR.
+        let suffix = match params.rounding {
+            None => "r",
+            Some(FPRounding::Zero) => "",
+            Some(rounding) => rounding_suffix(rounding),
+        };
         format!(
-            "vcvt.f64.{} {}, {}",
-            if params.unsigned { "u32" } else { "s32" },
-            params.d,
-            params.m
+            "vcvt{suffix}.{integer}.{precision} {}, {}",
+            params.d, params.m
         )
     } else {
-        format!(
-            "vcvt.f32.{} {}, {}",
-            if params.unsigned { "u32" } else { "s32" },
-            params.d,
-            params.m
-        )
+        format!("vcvt.{precision}.{integer} {}, {}", params.d, params.m)
     }
+}
+
+#[cfg(feature = "has-fp")]
+fn fmt_vcvt_fixed(params: VCVTFixedParams) -> String {
+    let (precision, reg) = match params.reg {
+        ExtensionReg::Single { reg } => ("f32", reg.to_string()),
+        ExtensionReg::Double { reg } => ("f64", reg.to_string()),
+    };
+    let fixed = format!("{}{}", if params.unsigned { "u" } else { "s" }, params.size);
+    let (to, from) = if params.to_fixed {
+        (fixed, precision.to_string())
+    } else {
+        (precision.to_string(), fixed)
+    };
+    format!("vcvt.{to}.{from} {reg}, {reg}, #{}", params.fraction_bits)
+}
+
+fn fmt_extend_add(mnemonic: &str, params: Reg3UsizeParams) -> String {
+    let rotation = if params.rotation > 0 {
+        format!(", ror #{}", params.rotation)
+    } else {
+        String::new()
+    };
+    format!(
+        "{mnemonic} {}, {}, {}{rotation}",
+        params.rd, params.rn, params.rm
+    )
 }
 
 #[allow(clippy::cognitive_complexity)]
@@ -2649,17 +2772,17 @@ impl fmt::Display for Instruction {
                     String::new()
                 }
             ),
-            Self::UXTAB { params } => write!(
+            Self::SXTAB { params } => write!(f, "{}", fmt_extend_add("sxtab", params)),
+            Self::SXTAH { params } => write!(f, "{}", fmt_extend_add("sxtah", params)),
+            Self::UXTAB { params } => write!(f, "{}", fmt_extend_add("uxtab", params)),
+            Self::UXTAH { params } => write!(f, "{}", fmt_extend_add("uxtah", params)),
+            Self::PKH { params, tb_form } => write!(
                 f,
-                "uxtb.w {},{},{} {}",
+                "pkh{} {}, {}, {}",
+                if tb_form { "tb" } else { "bt" },
                 params.rd,
                 params.rn,
-                params.rm,
-                if params.rotation > 0 {
-                    format!("{}", params.rotation)
-                } else {
-                    String::new()
-                }
+                params.rm
             ),
             Self::UXTH { params, thumb32 } => write!(
                 f,
@@ -2891,13 +3014,51 @@ impl fmt::Display for Instruction {
                 write!(f, "vfnms.f64 {}, {}, {}", params.dd, params.dn, params.dm,)
             }
             #[cfg(feature = "has-fp")]
+            Self::VFNMA_f32 { params } => {
+                write!(f, "vfnma.f32 {}, {}, {}", params.sd, params.sn, params.sm,)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VFNMA_f64 { params } => {
+                write!(f, "vfnma.f64 {}, {}, {}", params.dd, params.dn, params.dm,)
+            }
+            #[cfg(feature = "has-fp")]
             Self::VSQRT_f32 { params } => write!(f, "vsqrt.f32 {}, {}", params.sd, params.sm),
             #[cfg(feature = "has-fp")]
             Self::VSQRT_f64 { params } => write!(f, "vsqrt.f64 {}, {}", params.dd, params.dm),
             #[cfg(feature = "has-fp")]
-            Self::VRINTZ_f32 { params } => write!(f, "vrintz.f32 {}, {}", params.sd, params.sm),
+            Self::VRINT_f32 { params } => write!(
+                f,
+                "vrint{}.f32 {}, {}",
+                vrint_suffix(params.rounding, params.exact),
+                params.sd,
+                params.sm
+            ),
             #[cfg(feature = "has-fp")]
-            Self::VRINTZ_f64 { params } => write!(f, "vrintz.f64 {}, {}", params.dd, params.dm),
+            Self::VRINT_f64 { params } => write!(
+                f,
+                "vrint{}.f64 {}, {}",
+                vrint_suffix(params.rounding, params.exact),
+                params.dd,
+                params.dm
+            ),
+            #[cfg(feature = "has-fp")]
+            Self::VMINMAXNM_f32 { params } => write!(
+                f,
+                "v{}nm.f32 {}, {}, {}",
+                if params.max { "max" } else { "min" },
+                params.sd,
+                params.sn,
+                params.sm
+            ),
+            #[cfg(feature = "has-fp")]
+            Self::VMINMAXNM_f64 { params } => write!(
+                f,
+                "v{}nm.f64 {}, {}, {}",
+                if params.max { "max" } else { "min" },
+                params.dd,
+                params.dn,
+                params.dm
+            ),
             #[cfg(feature = "has-fp")]
             Self::VSUB_f32 { params } => {
                 write!(f, "vsub.f32 {}, {}, {}", params.sd, params.sn, params.sm,)
@@ -2908,6 +3069,8 @@ impl fmt::Display for Instruction {
             }
             #[cfg(feature = "has-fp")]
             Self::VCVT { params } => write!(f, "{}", fmt_vcvt(params)),
+            #[cfg(feature = "has-fp")]
+            Self::VCVT_fixed { params } => write!(f, "{}", fmt_vcvt_fixed(params)),
             #[cfg(feature = "has-fp")]
             Self::VCVT_f64_f32 { params } => write!(f, "vcvt.f64.f32 {}, {}", params.dd, params.sm),
             #[cfg(feature = "has-fp")]
@@ -3234,9 +3397,12 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         //USAX
         //USUB16
         //USUB8
+        Instruction::SXTAB { .. } => 4,
+        Instruction::SXTAH { .. } => 4,
         Instruction::UXTAB { .. } => 4,
         //UXTAB16
-        //UXTAH
+        Instruction::UXTAH { .. } => 4,
+        Instruction::PKH { .. } => 4,
         Instruction::UXTB { thumb32, .. } => isize_t(*thumb32),
         Instruction::UXTH { thumb32, .. } => isize_t(*thumb32),
 
@@ -3281,6 +3447,10 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         #[cfg(feature = "has-fp")]
         Instruction::VFNMS_f64 { .. } => 4,
         #[cfg(feature = "has-fp")]
+        Instruction::VFNMA_f32 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VFNMA_f64 { .. } => 4,
+        #[cfg(feature = "has-fp")]
         Instruction::VLDM_T1 { .. } => 4,
         #[cfg(feature = "has-fp")]
         Instruction::VLDM_T2 { .. } => 4,
@@ -3323,17 +3493,20 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         Instruction::VPUSH { .. } => 4,
         #[cfg(feature = "has-fp")]
         Instruction::VPOP { .. } => 4,
-        //VRINTA, VRINTN, VRINTP, VRiNTM
-        //VRINTX,
         #[cfg(feature = "has-fp")]
-        Instruction::VRINTZ_f32 { .. } => 4,
+        Instruction::VRINT_f32 { .. } => 4,
         #[cfg(feature = "has-fp")]
-        Instruction::VRINTZ_f64 { .. } => 4,
-        //VRINTR
+        Instruction::VRINT_f64 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VMINMAXNM_f32 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VMINMAXNM_f64 { .. } => 4,
         #[cfg(feature = "has-fp")]
         Instruction::VSQRT_f32 { .. } => 4,
         #[cfg(feature = "has-fp")]
         Instruction::VSQRT_f64 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VCVT_fixed { .. } => 4,
         #[cfg(feature = "has-fp")]
         Instruction::VCVT_f64_f32 { .. } => 4,
         #[cfg(feature = "has-fp")]

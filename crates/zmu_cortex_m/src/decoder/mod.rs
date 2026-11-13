@@ -76,6 +76,7 @@ mod nop;
 mod orn;
 mod orr;
 
+mod pkh;
 mod pld;
 mod pli;
 mod pop;
@@ -133,6 +134,8 @@ mod vfma;
 mod vldm;
 #[cfg(feature = "has-fp")]
 mod vldr;
+#[cfg(feature = "has-fp")]
+mod vminmaxnm;
 #[cfg(feature = "has-fp")]
 mod vmov;
 #[cfg(feature = "has-fp")]
@@ -241,6 +244,7 @@ use {
     nop::{decode_NOP_t1, decode_NOP_t2},
     orn::{decode_ORN_imm_t1, decode_ORN_reg_t1},
     orr::{decode_ORR_imm_t1, decode_ORR_reg_t1, decode_ORR_reg_t2},
+    pkh::decode_PKH_t1,
     pld::{decode_PLD_imm_t1, decode_PLD_imm_t2, decode_PLD_lit_t1, decode_PLD_reg_t1},
     pli::{decode_PLI_lit_imm_t1, decode_PLI_lit_imm_t2, decode_PLI_lit_imm_t3, decode_PLI_reg_t1},
     pop::{decode_POP_reg_t1, decode_POP_t2, decode_POP_t3},
@@ -279,7 +283,7 @@ use {
     umull::decode_UMULL_t1,
     usat::decode_USAT_t1,
     uxt::{decode_UXTB_t1, decode_UXTB_t2, decode_UXTH_t1, decode_UXTH_t2},
-    uxtab::decode_UXTAB_t1,
+    uxtab::{decode_SXTAB_t1, decode_SXTAH_t1, decode_UXTAB_t1, decode_UXTAH_t1},
     wfe::{decode_WFE_t1, decode_WFE_t2},
     wfi::{decode_WFI_t1, decode_WFI_t2},
     yield_::{decode_YIELD_t1, decode_YIELD_t2},
@@ -298,10 +302,11 @@ use {
     vabs::decode_VABS_t1,
     vadd_vsub::{decode_VADD_t1, decode_VSUB_t1},
     vcmp::{decode_VCMP_t1, decode_VCMP_t2},
-    vcvt::{decode_VCVT_ds_t1, decode_VCVT_t1},
-    vfma::{decode_VFMA_t1, decode_VFMS_t1, decode_VFNMS_t1},
+    vcvt::{decode_VCVT_ds_t1, decode_VCVT_fixed_t1, decode_VCVT_rm_t1, decode_VCVT_t1},
+    vfma::{decode_VFMA_t1, decode_VFMS_t1, decode_VFNMA_t1, decode_VFNMS_t1},
     vldm::{decode_VLDM_t1, decode_VLDM_t2},
     vldr::{decode_VLDR_t1, decode_VLDR_t2},
+    vminmaxnm::decode_VMINMAXNM_t1,
     vmov::decode_VMOV_cr_scalar,
     vmov::decode_VMOV_cr_sp,
     vmov::decode_VMOV_cr2_dp,
@@ -316,7 +321,7 @@ use {
     vpop::decode_VPOP_t2,
     vpush::decode_VPUSH_t1,
     vpush::decode_VPUSH_t2,
-    vrint::decode_VRINTZ_t1,
+    vrint::{decode_VRINT_rm_t1, decode_VRINTR_VRINTZ_t1, decode_VRINTX_t1},
     vsel::decode_VSEL_t1,
     vsqrt::decode_VSQRT_t1,
     vstm::{decode_VSTM_t1, decode_VSTM_t2},

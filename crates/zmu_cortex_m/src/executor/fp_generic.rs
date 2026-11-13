@@ -6,7 +6,7 @@ use crate::{
     core::{
         bits::Bits,
         fault::Fault,
-        fpregister::{FPSCRRounding, Fpscr},
+        fpregister::{FPRounding, FPSCRRounding, Fpscr},
         register::{ExtensionRegOperations, SingleReg},
     },
     peripheral::{
@@ -55,6 +55,82 @@ fn round_down(value: BigFloat) -> i128 {
     } else {
         i128::MAX
     })
+}
+
+// The significand and the exponent of a finite nonzero value, such that the value is
+// `significand * 2^exponent`. It reads the bits, so it is exact for the whole range of the format.
+fn significand<T: FloatOps>(op: T::Bits) -> (u128, i32) {
+    let bits: u64 = op.into();
+    let e = if T::n() == 32 { 8 } else { 11 };
+    let f = T::n() - e - 1;
+    let bias = (1 << (e - 1)) - 1;
+    let exp = ((bits >> f) & ((1 << e) - 1)) as i32;
+    let frac = u128::from(bits & ((1 << f) - 1));
+    if exp == 0 {
+        // A subnormal has no leading one, and the exponent of the smallest normal.
+        (frac, 1 - bias - f as i32)
+    } else {
+        (frac | 1 << f, exp - bias - f as i32)
+    }
+}
+
+// A value rounded to an integer: the magnitude, and whether rounding lost anything.
+struct Rounded {
+    magnitude: u128,
+    inexact: bool,
+}
+
+// Rounds the magnitude `significand * 2^exponent` of a value of the given sign to an integer.
+// The rounding is done on the bits, not on a decimal approximation of the value, so a tie, or
+// a whole number, is seen as one. A magnitude too large for 128 bits comes back as the largest.
+fn round_magnitude(significand: u128, exponent: i32, sign: bool, rounding: FPRounding) -> Rounded {
+    if exponent >= 0 {
+        let magnitude = if exponent <= 64 {
+            significand << exponent
+        } else {
+            u128::MAX
+        };
+        return Rounded {
+            magnitude,
+            inexact: false,
+        };
+    }
+
+    // The bits below the units are the remainder, to compare with a half.
+    let shift = exponent.unsigned_abs();
+    let (whole, above_half, at_half, inexact) = if shift >= 128 {
+        (0, false, false, significand != 0)
+    } else {
+        let remainder = significand & ((1 << shift) - 1);
+        let half = 1 << (shift - 1);
+        (
+            significand >> shift,
+            remainder > half,
+            remainder == half,
+            remainder != 0,
+        )
+    };
+    let up = match rounding {
+        FPRounding::TieEven => above_half || (at_half && whole & 1 == 1),
+        FPRounding::TieAway => above_half || at_half,
+        FPRounding::PosInf => inexact && !sign,
+        FPRounding::NegInf => inexact && sign,
+        FPRounding::Zero => false,
+    };
+    Rounded {
+        magnitude: whole + u128::from(up),
+        inexact,
+    }
+}
+
+// The bits of the whole number `magnitude`, which has to be exactly representable.
+fn whole_number_bits<T: FloatOps>(sign: bool, magnitude: u64) -> T::Bits {
+    let e = if T::n() == 32 { 8 } else { 11 };
+    let f = T::n() - e - 1;
+    let bias = (1u64 << (e - 1)) - 1;
+    let top = 63 - magnitude.leading_zeros() as usize;
+    let fraction = (magnitude << (f - top)) & ((1 << f) - 1);
+    T::from_integer(u64::from(sign) << (T::n() - 1) | (bias + top as u64) << f | fraction)
 }
 
 /// Trait for floating point operations
@@ -195,22 +271,31 @@ pub trait FloatingPointPublicOperations {
 
     fn fp_sqrt<T: FloatOps>(&mut self, op: T::Bits, fpscr_controlled: bool) -> T::Bits;
 
+    /// Rounds to an integral value in the same format. `rounding` is the mode the instruction
+    /// names, or `None` for the one in the FPSCR.
     fn fp_round_int<T: FloatOps>(
         &mut self,
         op: T::Bits,
-        zero_rounding: bool,
+        rounding: Option<FPRounding>,
         exact: bool,
         fpscr_controlled: bool,
     ) -> T::Bits;
 
-    fn fp_to_fixed<N: FloatOps, M: FloatOps>(
+    /// VMAXNM and VMINNM: the larger or the smaller of the two, where a quiet NaN gives way to
+    /// a number. Takes its flush and NaN modes from the FPSCR.
+    fn fp_min_max_num<T: FloatOps>(&mut self, op1: T::Bits, op2: T::Bits, max: bool) -> T::Bits;
+
+    /// Converts to a fixed-point integer of `size` bits with saturation. `rounding` is the mode the instruction
+    /// names, or `None` for the one in the FPSCR.
+    fn fp_to_fixed<N: FloatOps>(
         &mut self,
         op: N::Bits,
+        size: usize,
         fraction_bits: usize,
         unsigned: bool,
-        round_towards_zero: bool,
+        rounding: Option<FPRounding>,
         fpscr_controlled: bool,
-    ) -> M::Bits;
+    ) -> u64;
 
     fn fixed_to_fp<N: FloatOps, M: FloatOps>(
         &mut self,
@@ -1129,7 +1214,7 @@ impl FloatingPointPublicOperations for Processor {
     fn fp_round_int<T: FloatOps>(
         &mut self,
         op: T::Bits,
-        zero_rounding: bool,
+        rounding: Option<FPRounding>,
         exact: bool,
         fpscr_controlled: bool,
     ) -> T::Bits {
@@ -1139,13 +1224,9 @@ impl FloatingPointPublicOperations for Processor {
             standard_fpscr_value(self.fpscr)
         };
 
-        let rounding = if zero_rounding {
-            FPSCRRounding::RoundTowardsZero
-        } else {
-            fpscr_val.get_rounding_mode()
-        };
+        let rounding = rounding.unwrap_or_else(|| fpscr_val.get_rounding_mode().into());
 
-        let (fptype, sign, value) = self.fp_unpack::<T>(op, fpscr_val);
+        let (fptype, sign, _) = self.fp_unpack::<T>(op, fpscr_val);
 
         if fptype == FPType::SNaN || fptype == FPType::QNaN {
             return self.fp_process_nan::<T>(fptype, op, fpscr_val);
@@ -1159,38 +1240,88 @@ impl FloatingPointPublicOperations for Processor {
             return T::fp_zero(sign);
         }
 
-        let mut int_result = round_down(value);
-        let error = value - BigFloat::from(int_result);
-
-        let round_up = match rounding {
-            FPSCRRounding::RoundToNearest => {
-                error > BigFloat::from(0.5)
-                    || (error == BigFloat::from(0.5) && int_result.get_bit(0))
-            }
-            FPSCRRounding::RoundTowardsPlusInfinity => error != BigFloat::default(),
-            FPSCRRounding::RoundTowardsMinusInfinity => false,
-            FPSCRRounding::RoundTowardsZero => error != BigFloat::default() && int_result < 0,
-        };
-
-        if round_up {
-            int_result += 1;
+        let (significand, exponent) = significand::<T>(op);
+        let rounded = round_magnitude(significand, exponent, sign, rounding);
+        if !rounded.inexact {
+            // A whole number is its own result.
+            return op;
         }
 
-        let real_result = BigFloat::from(int_result);
-
-        let result = if real_result == BigFloat::default() {
-            T::fp_zero(sign)
-        } else {
-            let mut round_fpscr = fpscr_val;
-            round_fpscr.set_rounding_mode(FPSCRRounding::RoundTowardsZero);
-            self.fp_round::<T>(real_result, round_fpscr)
-        };
-
-        if error != BigFloat::default() && exact {
+        if exact {
             self.fp_process_exception(FPExc::Inexact, fpscr_val);
         }
 
-        result
+        // Rounding a value that has a fraction gives a whole number that fits the format, or
+        // zero, which keeps the sign.
+        if rounded.magnitude == 0 {
+            T::fp_zero(sign)
+        } else {
+            whole_number_bits::<T>(sign, rounded.magnitude as u64)
+        }
+    }
+
+    fn fp_min_max_num<T: FloatOps>(&mut self, op1: T::Bits, op2: T::Bits, max: bool) -> T::Bits {
+        let fpscr_val = self.fpscr;
+        let (type1, sign1, _) = self.fp_unpack::<T>(op1, fpscr_val);
+        let (type2, sign2, _) = self.fp_unpack::<T>(op2, fpscr_val);
+
+        // A quiet NaN gives way to anything that is not one, so the other operand is the only
+        // one that counts. It is still a signalling NaN that wins over it.
+        let drop1 = type1 == FPType::QNaN && type2 != FPType::QNaN;
+        let drop2 = type2 == FPType::QNaN && type1 != FPType::QNaN;
+        let counted = |dropped: bool, fptype: FPType| {
+            if dropped { FPType::Infinity } else { fptype }
+        };
+        let (done, nan) = self.fp_process_nans::<T>(
+            counted(drop1, type1),
+            counted(drop2, type2),
+            op1,
+            op2,
+            fpscr_val,
+        );
+        if done {
+            return nan;
+        }
+
+        // Compare as integers: the magnitude of the bits runs in the order of the values, and
+        // a zero, which a flushed subnormal is too, is 0 whichever its sign.
+        let key = |fptype: FPType, sign: bool, op: T::Bits| {
+            let magnitude = if fptype == FPType::Zero {
+                0
+            } else {
+                i128::from(op.into() & !(1 << (T::n() - 1)))
+            };
+            if sign { -magnitude } else { magnitude }
+        };
+        let (key1, key2) = (key(type1, sign1, op1), key(type2, sign2, op2));
+        let first = if drop1 {
+            false
+        } else if drop2 {
+            true
+        } else if max {
+            key1 > key2
+        } else {
+            key1 < key2
+        };
+        let (fptype, sign, op) = if first {
+            (type1, sign1, op1)
+        } else {
+            (type2, sign2, op2)
+        };
+        match fptype {
+            FPType::Infinity => T::fp_infinity(sign),
+            // Of two zeros, +0 is the larger.
+            FPType::Zero => T::fp_zero(if drop1 {
+                sign2
+            } else if drop2 {
+                sign1
+            } else if max {
+                sign1 && sign2
+            } else {
+                sign1 || sign2
+            }),
+            _ => op,
+        }
     }
 
     fn fixed_to_fp<N: FloatOps, M: FloatOps>(
@@ -1210,18 +1341,13 @@ impl FloatingPointPublicOperations for Processor {
             fpscr_val.set_rounding_mode(FPSCRRounding::RoundToNearest);
         }
 
+        // Scale by 2^-fraction_bits. Multiplying by the power of two is exact; dividing by 2^n
+        // from `powf2` is not, it keeps only some of the digits.
+        let scale = M::powf2(BigFloat::from(-(fraction_bits as i32)));
         let real_operand = if unsigned {
-            let int_operand = op;
-            BigFloat::div(
-                &M::bits_to_bigfloat(int_operand),
-                &M::powf2(BigFloat::from(fraction_bits as u32)),
-            )
+            M::bits_to_bigfloat(op) * scale
         } else {
-            let int_operand = M::unsigned_to_signed(op);
-            BigFloat::div(
-                &M::signedbits_to_bigfloat(int_operand),
-                &M::powf2(BigFloat::from(fraction_bits as u32)),
-            )
+            M::signedbits_to_bigfloat(M::unsigned_to_signed(op)) * scale
         };
 
         if real_operand == BigFloat::default() {
@@ -1231,54 +1357,56 @@ impl FloatingPointPublicOperations for Processor {
         }
     }
 
-    fn fp_to_fixed<N: FloatOps, M: FloatOps>(
+    fn fp_to_fixed<N: FloatOps>(
         &mut self,
         op: N::Bits,
+        size: usize,
         fraction_bits: usize,
         unsigned: bool,
-        round_towards_zero: bool,
+        rounding: Option<FPRounding>,
         fpscr_controlled: bool,
-    ) -> M::Bits {
-        let mut fpscr_val = if fpscr_controlled {
+    ) -> u64 {
+        let fpscr_val = if fpscr_controlled {
             self.fpscr
         } else {
             standard_fpscr_value(self.fpscr)
         };
 
-        if round_towards_zero {
-            fpscr_val.set_rounding_mode(FPSCRRounding::RoundTowardsZero);
-        }
-        let (type_t, _sign, mut value) = self.fp_unpack::<N>(op, fpscr_val);
-        if type_t == FPType::SNaN || type_t == FPType::QNaN {
-            self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
-        }
+        let rounding = rounding.unwrap_or_else(|| fpscr_val.get_rounding_mode().into());
+        let (type_t, sign, _) = self.fp_unpack::<N>(op, fpscr_val);
 
-        value *= N::powf2(BigFloat::from(fraction_bits as u32));
-        let mut int_result = round_down(value);
-        let error = value - BigFloat::from(int_result);
-
-        let round_up = match fpscr_val.get_rounding_mode() {
-            FPSCRRounding::RoundToNearest => {
-                error > BigFloat::from(0.5)
-                    || (error == BigFloat::from(0.5) && !int_result.get_bit(0))
+        let rounded = match type_t {
+            FPType::SNaN | FPType::QNaN => {
+                self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
+                Rounded {
+                    magnitude: 0,
+                    inexact: false,
+                }
             }
-            FPSCRRounding::RoundTowardsPlusInfinity => error != BigFloat::default(),
-            FPSCRRounding::RoundTowardsMinusInfinity => false,
-            FPSCRRounding::RoundTowardsZero => error != BigFloat::default() && int_result < 0,
+            FPType::Zero => Rounded {
+                magnitude: 0,
+                inexact: false,
+            },
+            // An infinity is too large for any integer.
+            FPType::Infinity => Rounded {
+                magnitude: u128::MAX,
+                inexact: false,
+            },
+            FPType::Nonzero => {
+                let (significand, exponent) = significand::<N>(op);
+                round_magnitude(significand, exponent + fraction_bits as i32, sign, rounding)
+            }
         };
-        if round_up {
-            int_result = int_result.saturating_add(1);
-        }
-
-        let (result, overflow) = satq(int_result, M::n(), unsigned);
+        let magnitude = i128::try_from(rounded.magnitude).unwrap_or(i128::MAX);
+        let (result, overflow) = satq(if sign { -magnitude } else { magnitude }, size, unsigned);
 
         if overflow {
-            self.fp_process_exception(FPExc::Overflow, fpscr_val);
-        } else if error != BigFloat::default() {
+            self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
+        } else if rounded.inexact {
             self.fp_process_exception(FPExc::Inexact, fpscr_val);
         }
 
-        M::from_integer(result)
+        result
     }
 }
 
@@ -1366,6 +1494,7 @@ mod tests {
     use crate::core::bits::Bits;
     use crate::core::fault::Fault;
     use crate::core::register::{ExtensionRegOperations, SingleReg};
+    use crate::executor::fp_test_support::*;
 
     #[test]
     fn test_fp_compare_f32() {
@@ -1816,7 +1945,7 @@ mod tests {
             .set_rounding_mode(FPSCRRounding::RoundTowardsPlusInfinity);
 
         let op = (-2.9f32).to_bits();
-        let result = processor.fp_round_int::<u32>(op, true, false, true);
+        let result = processor.fp_round_int::<u32>(op, Some(FPRounding::Zero), false, true);
 
         assert_eq!(result, (-2.0f32).to_bits());
     }
@@ -1827,7 +1956,7 @@ mod tests {
         processor.fpscr = 0;
 
         let op = 1.25f32.to_bits();
-        let _ = processor.fp_round_int::<u32>(op, true, true, true);
+        let _ = processor.fp_round_int::<u32>(op, Some(FPRounding::Zero), true, true);
 
         assert!(processor.fpscr.get_bit(4));
     }
@@ -1838,7 +1967,7 @@ mod tests {
         processor.fpscr = 0;
 
         let op = 1.25f32.to_bits();
-        let _ = processor.fp_round_int::<u32>(op, true, false, true);
+        let _ = processor.fp_round_int::<u32>(op, Some(FPRounding::Zero), false, true);
 
         assert!(!processor.fpscr.get_bit(4));
     }
@@ -1847,8 +1976,18 @@ mod tests {
     fn test_fp_round_int_keeps_infinity() {
         let mut processor = Processor::new();
 
-        let pos = processor.fp_round_int::<u32>(f32::INFINITY.to_bits(), true, false, true);
-        let neg = processor.fp_round_int::<u32>(f32::NEG_INFINITY.to_bits(), true, false, true);
+        let pos = processor.fp_round_int::<u32>(
+            f32::INFINITY.to_bits(),
+            Some(FPRounding::Zero),
+            false,
+            true,
+        );
+        let neg = processor.fp_round_int::<u32>(
+            f32::NEG_INFINITY.to_bits(),
+            Some(FPRounding::Zero),
+            false,
+            true,
+        );
 
         assert_eq!(pos, f32::INFINITY.to_bits());
         assert_eq!(neg, f32::NEG_INFINITY.to_bits());
@@ -1858,22 +1997,24 @@ mod tests {
     fn test_fp_round_int_preserves_signed_zero() {
         let mut processor = Processor::new();
 
-        let pos = processor.fp_round_int::<u32>(0.0f32.to_bits(), true, false, true);
-        let neg = processor.fp_round_int::<u32>((-0.0f32).to_bits(), true, false, true);
+        let pos =
+            processor.fp_round_int::<u32>(0.0f32.to_bits(), Some(FPRounding::Zero), false, true);
+        let neg =
+            processor.fp_round_int::<u32>((-0.0f32).to_bits(), Some(FPRounding::Zero), false, true);
 
         assert_eq!(pos, 0.0f32.to_bits());
         assert_eq!(neg, (-0.0f32).to_bits());
     }
 
     #[test]
-    fn test_fp_round_int_uses_fpscr_mode_when_zero_rounding_is_false() {
+    fn test_fp_round_int_uses_fpscr_mode_when_no_rounding_is_named() {
         let mut processor = Processor::new();
         processor
             .fpscr
             .set_rounding_mode(FPSCRRounding::RoundTowardsPlusInfinity);
 
         let op = 2.1f32.to_bits();
-        let result = processor.fp_round_int::<u32>(op, false, false, true);
+        let result = processor.fp_round_int::<u32>(op, None, false, true);
 
         assert_eq!(result, 3.0f32.to_bits());
     }
@@ -1943,55 +2084,55 @@ mod tests {
 
         // 1.0 -> 1 (signed)
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0x3F80_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u32>(0x3F80_0000, 32, 0, false, None, false),
             0x0000_0001
         );
 
         // 0.00001 -> 0 (signed) (rounding towards zero)
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0x3C23_D70A, 0, false, false, true),
+            processor.fp_to_fixed::<u32>(0x3C23_D70A, 32, 0, false, None, true),
             0x0000_0000
         );
 
         // 42.0 -> 42 (signed)
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0x4228_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u32>(0x4228_0000, 32, 0, false, None, false),
             0x0000_002A
         );
 
         // -1.0 -> -1 (signed)
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0xBF80_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u32>(0xBF80_0000, 32, 0, false, None, false),
             0xFFFF_FFFF
         );
 
         // -42.0 -> -42 (signed)
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0xC228_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u32>(0xC228_0000, 32, 0, false, None, false),
             0xFFFF_FFD6
         );
 
         // positive infinity -> max value
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0x7F80_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u32>(0x7F80_0000, 32, 0, false, None, false),
             0x7FFF_FFFF
         );
 
         // negative infinity -> min value
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0xFF80_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u32>(0xFF80_0000, 32, 0, false, None, false),
             0x8000_0000
         );
 
         // QNAN -> 0
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0x7FC0_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u32>(0x7FC0_0000, 32, 0, false, None, false),
             0x0000_0000
         );
 
         // SNAN -> 0
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0x7F80_0001, 0, false, false, false),
+            processor.fp_to_fixed::<u32>(0x7F80_0001, 32, 0, false, None, false),
             0x0000_0000
         );
     }
@@ -2002,43 +2143,43 @@ mod tests {
 
         // 1.0 -> 1 (unsigned)
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0x3F80_0000, 0, true, false, false),
+            processor.fp_to_fixed::<u32>(0x3F80_0000, 32, 0, true, None, false),
             0x0000_0001
         );
 
         // 42.0 -> 42 (unsigned)
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0x4228_0000, 0, true, false, false),
+            processor.fp_to_fixed::<u32>(0x4228_0000, 32, 0, true, None, false),
             0x0000_002A
         );
 
         // positive infinity -> max value
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0x7F80_0000, 0, true, false, false),
+            processor.fp_to_fixed::<u32>(0x7F80_0000, 32, 0, true, None, false),
             0xFFFF_FFFF
         );
 
         // negative infinity -> 0
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0xFF80_0000, 0, true, false, false),
+            processor.fp_to_fixed::<u32>(0xFF80_0000, 32, 0, true, None, false),
             0x0000_0000
         );
 
         // -42.0 -> 0 (unsigned)
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0xC228_0000, 0, true, false, false),
+            processor.fp_to_fixed::<u32>(0xC228_0000, 32, 0, true, None, false),
             0x0000_0000
         );
 
         // QNAN -> 0
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0x7FC0_0000, 0, true, false, false),
+            processor.fp_to_fixed::<u32>(0x7FC0_0000, 32, 0, true, None, false),
             0x0000_0000
         );
 
         //SNAN -> 0
         assert_eq!(
-            processor.fp_to_fixed::<u32, u32>(0x7F80_0001, 0, true, false, false),
+            processor.fp_to_fixed::<u32>(0x7F80_0001, 32, 0, true, None, false),
             0x0000_0000
         );
     }
@@ -2049,49 +2190,49 @@ mod tests {
 
         // 1.0 -> 1 (signed)
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0x3FF0_0000_0000_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u64>(0x3FF0_0000_0000_0000, 32, 0, false, None, false),
             0x0000_0001
         );
 
         // 42.0 -> 42 (signed)
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0x4045_0000_0000_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u64>(0x4045_0000_0000_0000, 32, 0, false, None, false),
             0x0000_002A
         );
 
         // -1.0 -> -1 (signed)
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0xBFF0_0000_0000_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u64>(0xBFF0_0000_0000_0000, 32, 0, false, None, false),
             0xFFFF_FFFF
         );
 
         // -42.0 -> -42 (signed)
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0xC045_0000_0000_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u64>(0xC045_0000_0000_0000, 32, 0, false, None, false),
             0xFFFF_FFD6
         );
 
         // positive infinity -> max value
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0x7FF0_0000_0000_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u64>(0x7FF0_0000_0000_0000, 32, 0, false, None, false),
             0x7FFF_FFFF
         );
 
         // negative infinity -> min value
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0xFFF0_0000_0000_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u64>(0xFFF0_0000_0000_0000, 32, 0, false, None, false),
             0x8000_0000
         );
 
         // QNAN -> 0
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0x7FF8_0000_0000_0000, 0, false, false, false),
+            processor.fp_to_fixed::<u64>(0x7FF8_0000_0000_0000, 32, 0, false, None, false),
             0x0000_0000
         );
 
         // SNAN -> 0
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0x7FF0_0000_0000_0001, 0, false, false, false),
+            processor.fp_to_fixed::<u64>(0x7FF0_0000_0000_0001, 32, 0, false, None, false),
             0x0000_0000
         );
     }
@@ -2102,43 +2243,43 @@ mod tests {
 
         // 1.0 -> 1 (unsigned)
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0x3FF0_0000_0000_0000, 0, true, false, false),
+            processor.fp_to_fixed::<u64>(0x3FF0_0000_0000_0000, 32, 0, true, None, false),
             0x0000_0001
         );
 
         // 42.0 -> 42 (unsigned)
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0x4045_0000_0000_0000, 0, true, false, false),
+            processor.fp_to_fixed::<u64>(0x4045_0000_0000_0000, 32, 0, true, None, false),
             0x0000_002A
         );
 
         // positive infinity -> max value
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0x7FF0_0000_0000_0000, 0, true, false, false),
+            processor.fp_to_fixed::<u64>(0x7FF0_0000_0000_0000, 32, 0, true, None, false),
             0xFFFF_FFFF
         );
 
         // negative infinity -> 0
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0xFFF0_0000_0000_0000, 0, true, false, false),
+            processor.fp_to_fixed::<u64>(0xFFF0_0000_0000_0000, 32, 0, true, None, false),
             0x0000_0000
         );
 
         // -42.0 -> 0 (unsigned)
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0xC045_0000_0000_0000, 0, true, false, false),
+            processor.fp_to_fixed::<u64>(0xC045_0000_0000_0000, 32, 0, true, None, false),
             0x0000_0000
         );
 
         // QNAN -> 0
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0x7FF8_0000_0000_0000, 0, true, false, false),
+            processor.fp_to_fixed::<u64>(0x7FF8_0000_0000_0000, 32, 0, true, None, false),
             0x0000_0000
         );
 
         // SNAN -> 0
         assert_eq!(
-            processor.fp_to_fixed::<u64, u32>(0x7FF0_0000_0000_0001, 0, true, false, false),
+            processor.fp_to_fixed::<u64>(0x7FF0_0000_0000_0001, 32, 0, true, None, false),
             0x0000_0000
         );
     }
@@ -2268,5 +2409,383 @@ mod tests {
                 .get_bits(FPSCR_STATUS_CONTROL_START..FPSCR_STATUS_CONTROL_END)
         );
         assert!(processor.control.fpca);
+    }
+
+    #[test]
+    fn fp_round_int_f64_matches_the_host_for_every_rounding() {
+        for rounding in ALL_ROUNDINGS {
+            for x in F64_VALUES {
+                let mut processor = Processor::new();
+                let result =
+                    processor.fp_round_int::<u64>(x.to_bits(), Some(rounding), false, true);
+                assert_eq!(
+                    result,
+                    host_rint64(x, rounding).to_bits(),
+                    "{rounding:?} {x:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fp_round_int_f32_matches_the_host_for_every_rounding() {
+        for rounding in ALL_ROUNDINGS {
+            for x in F32_VALUES {
+                let mut processor = Processor::new();
+                let result =
+                    processor.fp_round_int::<u32>(x.to_bits(), Some(rounding), false, true);
+                assert_eq!(
+                    result,
+                    host_rint32(x, rounding).to_bits(),
+                    "{rounding:?} {x:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fp_round_int_takes_the_fpscr_mode_when_none_is_named() {
+        let modes = [
+            (FPSCRRounding::RoundToNearest, FPRounding::TieEven),
+            (FPSCRRounding::RoundTowardsPlusInfinity, FPRounding::PosInf),
+            (FPSCRRounding::RoundTowardsMinusInfinity, FPRounding::NegInf),
+            (FPSCRRounding::RoundTowardsZero, FPRounding::Zero),
+        ];
+        for (mode, rounding) in modes {
+            for x in [2.5f64, -2.5, 3.5, 0.3, -0.3] {
+                let mut processor = Processor::new();
+                processor.fpscr.set_rounding_mode(mode);
+                let result = processor.fp_round_int::<u64>(x.to_bits(), None, false, true);
+                assert_eq!(result, host_rint64(x, rounding).to_bits(), "{mode:?} {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn fp_round_int_leaves_the_flags_alone_unless_exact_is_asked_for() {
+        for rounding in ALL_ROUNDINGS {
+            let mut processor = Processor::new();
+            processor.fp_round_int::<u64>(2.5f64.to_bits(), Some(rounding), false, true);
+            assert_eq!(processor.fpscr, 0, "{rounding:?}");
+
+            processor.fp_round_int::<u64>(2.5f64.to_bits(), Some(rounding), true, true);
+            assert_eq!(processor.fpscr, IXC, "{rounding:?}");
+        }
+        // A whole number is exact, large ones included.
+        for x in [
+            2.0f64,
+            -7.0,
+            0.0,
+            4_503_599_627_370_496.0,
+            1e300,
+            f64::INFINITY,
+        ] {
+            let mut processor = Processor::new();
+            processor.fp_round_int::<u64>(x.to_bits(), Some(FPRounding::Zero), true, true);
+            assert_eq!(processor.fpscr, 0, "{x}");
+        }
+    }
+
+    #[test]
+    fn fp_round_int_quiets_a_signalling_nan_and_keeps_a_quiet_one() {
+        let mut processor = Processor::new();
+        let quiet = 0x7FF8_0000_0000_1234u64;
+        assert_eq!(
+            processor.fp_round_int::<u64>(quiet, Some(FPRounding::TieAway), false, true),
+            quiet
+        );
+        assert_eq!(processor.fpscr, 0);
+
+        let signalling = 0x7FF0_0000_0000_1234u64;
+        assert_eq!(
+            processor.fp_round_int::<u64>(signalling, Some(FPRounding::TieAway), false, true),
+            quiet
+        );
+        assert_eq!(processor.fpscr, IOC);
+
+        let mut processor = Processor::new();
+        processor.fpscr = DN;
+        assert_eq!(
+            processor.fp_round_int::<u32>(0x7FC0_1234, Some(FPRounding::TieAway), false, true),
+            0x7FC0_0000
+        );
+    }
+
+    #[test]
+    fn fp_round_int_flushes_a_subnormal_input_when_fz_is_set() {
+        let mut processor = Processor::new();
+        processor.fpscr = FZ;
+        // Rounded up it would be 1.0 and rounded down it is -0.0; flushed first, both are zero.
+        let tiny = f32::from_bits(0x0000_0001);
+        assert_eq!(
+            processor.fp_round_int::<u32>(tiny.to_bits(), Some(FPRounding::PosInf), false, true),
+            0
+        );
+        assert_eq!(processor.fpscr, FZ | IDC);
+        assert_eq!(
+            processor.fp_round_int::<u32>((-tiny).to_bits(), Some(FPRounding::NegInf), false, true),
+            (-0.0f32).to_bits()
+        );
+
+        let mut processor = Processor::new();
+        assert_eq!(
+            processor.fp_round_int::<u32>(tiny.to_bits(), Some(FPRounding::PosInf), false, true),
+            1.0f32.to_bits()
+        );
+        assert_eq!(processor.fpscr, 0);
+    }
+
+    // The conversion the host does with `as` saturates and sends a NaN to zero, which is what
+    // the instruction does to a result that does not fit.
+    #[test]
+    fn fp_to_fixed_matches_the_host_for_every_rounding() {
+        for rounding in ALL_ROUNDINGS {
+            for x in F64_VALUES {
+                let mut processor = Processor::new();
+                let rounded = host_rint64(x, rounding);
+                let signed =
+                    processor.fp_to_fixed::<u64>(x.to_bits(), 32, 0, false, Some(rounding), true);
+                assert_eq!(
+                    signed as u32, rounded as i32 as u32,
+                    "{rounding:?} {x:e} signed"
+                );
+                let unsigned =
+                    processor.fp_to_fixed::<u64>(x.to_bits(), 32, 0, true, Some(rounding), true);
+                assert_eq!(
+                    unsigned as u32, rounded as u32,
+                    "{rounding:?} {x:e} unsigned"
+                );
+            }
+            for x in F32_VALUES {
+                let mut processor = Processor::new();
+                let rounded = host_rint32(x, rounding);
+                let signed =
+                    processor.fp_to_fixed::<u32>(x.to_bits(), 32, 0, false, Some(rounding), true);
+                assert_eq!(
+                    signed as u32, rounded as i32 as u32,
+                    "{rounding:?} {x:e} signed"
+                );
+                let unsigned =
+                    processor.fp_to_fixed::<u32>(x.to_bits(), 32, 0, true, Some(rounding), true);
+                assert_eq!(
+                    unsigned as u32, rounded as u32,
+                    "{rounding:?} {x:e} unsigned"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fp_to_fixed_sends_a_nan_to_zero_and_signals_it() {
+        for nan in [0x7FF8_0000_0000_0000u64, 0x7FF0_0000_0000_0001] {
+            let mut processor = Processor::new();
+            assert_eq!(
+                processor.fp_to_fixed::<u64>(nan, 32, 0, false, Some(FPRounding::TieEven), true),
+                0
+            );
+            assert_eq!(processor.fpscr & IOC, IOC);
+        }
+    }
+
+    #[test]
+    fn fp_to_fixed_signals_invalid_operation_when_the_result_saturates() {
+        for (x, unsigned) in [(3e9f32, false), (-1.0, true), (f32::INFINITY, false)] {
+            let mut processor = Processor::new();
+            processor.fp_to_fixed::<u32>(x.to_bits(), 32, 0, unsigned, None, true);
+            assert_eq!(processor.fpscr, IOC, "{x} unsigned {unsigned}");
+        }
+        // 16 bits saturate sooner than 32, and so do 32 with fraction bits.
+        let mut processor = Processor::new();
+        processor.fp_to_fixed::<u32>(40000.0f32.to_bits(), 16, 0, false, None, true);
+        assert_eq!(processor.fpscr, IOC);
+        let mut processor = Processor::new();
+        processor.fp_to_fixed::<u32>(40000.0f32.to_bits(), 32, 16, false, None, true);
+        assert_eq!(processor.fpscr, IOC);
+    }
+
+    #[test]
+    fn fp_to_fixed_signals_inexact_only_when_it_drops_a_fraction() {
+        let mut processor = Processor::new();
+        processor.fp_to_fixed::<u32>(2.5f32.to_bits(), 32, 0, false, None, true);
+        assert_eq!(processor.fpscr, IXC);
+
+        // 2.5 with one fraction bit is exactly 5.
+        let mut processor = Processor::new();
+        let result = processor.fp_to_fixed::<u32>(2.5f32.to_bits(), 32, 1, false, None, true);
+        assert_eq!((result, processor.fpscr), (5, 0));
+
+        let mut processor = Processor::new();
+        processor.fp_to_fixed::<u32>(7.0f32.to_bits(), 32, 0, false, None, true);
+        assert_eq!(processor.fpscr, 0);
+    }
+
+    #[test]
+    fn fp_to_fixed_scales_by_the_fraction_bits() {
+        let mut processor = Processor::new();
+        // 1.5 * 2^16, and -1.5 * 2^16 of a double, which is 32 bits of the two's complement.
+        assert_eq!(
+            processor.fp_to_fixed::<u32>(1.5f32.to_bits(), 32, 16, false, None, true),
+            0x1_8000
+        );
+        assert_eq!(
+            processor.fp_to_fixed::<u64>((-1.5f64).to_bits(), 32, 16, false, None, true),
+            0xFFFE_8000
+        );
+    }
+
+    #[test]
+    fn fp_to_fixed_rounds_a_tie_to_the_even_neighbour_in_the_fpscr_nearest_mode() {
+        let mut processor = Processor::new();
+        for (x, expected) in [
+            (0.5f32, 0u32),
+            (1.5, 2),
+            (2.5, 2),
+            (3.5, 4),
+            (-0.5, 0),
+            (-1.5, !1),
+            (-2.5, !1),
+        ] {
+            assert_eq!(
+                processor.fp_to_fixed::<u32>(x.to_bits(), 32, 0, false, None, true) as u32,
+                expected,
+                "{x}"
+            );
+        }
+    }
+
+    fn max_num64(processor: &mut Processor, a: f64, b: f64) -> u64 {
+        processor.fp_min_max_num::<u64>(a.to_bits(), b.to_bits(), true)
+    }
+
+    fn min_num64(processor: &mut Processor, a: f64, b: f64) -> u64 {
+        processor.fp_min_max_num::<u64>(a.to_bits(), b.to_bits(), false)
+    }
+
+    #[test]
+    fn fp_min_max_num_f64_matches_the_host_on_numbers() {
+        // The host leaves the order of the two zeros open, so they are checked below.
+        let mut processor = Processor::new();
+        for a in F64_VALUES {
+            for b in F64_VALUES {
+                if a == 0.0 && b == 0.0 {
+                    continue;
+                }
+                assert_eq!(
+                    max_num64(&mut processor, a, b),
+                    a.max(b).to_bits(),
+                    "max {a:e} {b:e}"
+                );
+                assert_eq!(
+                    min_num64(&mut processor, a, b),
+                    a.min(b).to_bits(),
+                    "min {a:e} {b:e}"
+                );
+            }
+        }
+        assert_eq!(processor.fpscr, 0);
+    }
+
+    #[test]
+    fn fp_min_max_num_f32_matches_the_host_on_numbers() {
+        let mut processor = Processor::new();
+        for a in F32_VALUES {
+            for b in F32_VALUES {
+                if a == 0.0 && b == 0.0 {
+                    continue;
+                }
+                assert_eq!(
+                    processor.fp_min_max_num::<u32>(a.to_bits(), b.to_bits(), true),
+                    a.max(b).to_bits(),
+                    "max {a:e} {b:e}"
+                );
+                assert_eq!(
+                    processor.fp_min_max_num::<u32>(a.to_bits(), b.to_bits(), false),
+                    a.min(b).to_bits(),
+                    "min {a:e} {b:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fp_min_max_num_treats_plus_zero_as_larger_than_minus_zero() {
+        let mut processor = Processor::new();
+        for (a, b) in [(0.0, -0.0), (-0.0, 0.0)] {
+            assert_eq!(max_num64(&mut processor, a, b), 0.0f64.to_bits());
+            assert_eq!(min_num64(&mut processor, a, b), (-0.0f64).to_bits());
+        }
+        assert_eq!(max_num64(&mut processor, -0.0, -0.0), (-0.0f64).to_bits());
+        assert_eq!(min_num64(&mut processor, 0.0, 0.0), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn fp_min_max_num_prefers_a_number_to_a_quiet_nan() {
+        let mut processor = Processor::new();
+        let nan = f64::NAN.to_bits();
+        for number in [1.5f64, -1.5, 0.0, -0.0, f64::INFINITY, f64::NEG_INFINITY] {
+            for max in [true, false] {
+                assert_eq!(
+                    processor.fp_min_max_num::<u64>(nan, number.to_bits(), max),
+                    number.to_bits()
+                );
+                assert_eq!(
+                    processor.fp_min_max_num::<u64>(number.to_bits(), nan, max),
+                    number.to_bits()
+                );
+            }
+        }
+        assert_eq!(processor.fpscr, 0);
+        // Two quiet NaNs give the first one.
+        let first = 0x7FF8_0000_0000_0001u64;
+        let second = 0x7FF8_0000_0000_0002u64;
+        assert_eq!(processor.fp_min_max_num::<u64>(first, second, true), first);
+        assert_eq!(processor.fpscr, 0);
+    }
+
+    #[test]
+    fn fp_min_max_num_returns_a_signalling_nan_quieted_and_signals_it() {
+        let signalling = 0x7FF0_0000_0000_0001u64;
+        let quiet = 0x7FF8_0000_0000_0001u64;
+        for (a, b) in [
+            (signalling, 1.0f64.to_bits()),
+            (1.0f64.to_bits(), signalling),
+            (f64::NAN.to_bits(), signalling),
+        ] {
+            let mut processor = Processor::new();
+            assert_eq!(processor.fp_min_max_num::<u64>(a, b, true), quiet);
+            assert_eq!(processor.fpscr, IOC);
+        }
+        let mut processor = Processor::new();
+        processor.fpscr = DN;
+        assert_eq!(
+            processor.fp_min_max_num::<u64>(signalling, 1.0f64.to_bits(), false),
+            0x7FF8_0000_0000_0000
+        );
+    }
+
+    #[test]
+    fn fp_min_max_num_flushes_a_subnormal_when_fz_is_set() {
+        let mut processor = Processor::new();
+        processor.fpscr = FZ;
+        let tiny = f32::from_bits(1).to_bits();
+        // max(tiny, -1) would be tiny; flushed, it is zero.
+        assert_eq!(
+            processor.fp_min_max_num::<u32>(tiny, (-1.0f32).to_bits(), true),
+            0
+        );
+        assert_eq!(processor.fpscr, FZ | IDC);
+    }
+
+    #[test]
+    fn fp_round_int_f64_leaves_a_value_past_the_fraction_bits_alone() {
+        // These are whole numbers too large for the 128-bit integer the rounding works in.
+        for x in [1e40f64, -1e100, f64::MAX, f64::MIN] {
+            let mut processor = Processor::new();
+            assert_eq!(
+                processor.fp_round_int::<u64>(x.to_bits(), Some(FPRounding::TieEven), true, true),
+                x.to_bits()
+            );
+            assert_eq!(processor.fpscr, 0);
+        }
     }
 }

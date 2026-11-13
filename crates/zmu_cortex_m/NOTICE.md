@@ -40,6 +40,24 @@ The firmware needs a few things zmu does not do, so I changed the following.
   decoded as undefined before. SSAT and USAT set the Q flag on saturation.
 - ORN with an immediate (T1) was decoded as undefined; it now runs. The firmware's
   tokeniser uses it.
+- Floating-point rounding instructions: VRINTA, VRINTN, VRINTP, VRINTM, VRINTR and VRINTX were
+  decoded as undefined (only VRINTZ ran), and now run. The firmware's maths library uses VRINTA,
+  VRINTM and VRINTP, and a plain BASIC `FOR` loop stopped at the first VRINTM.F64.
+- VMAXNM and VMINNM, VFNMA, and VCVTA, VCVTN, VCVTP and VCVTM (convert to an integer with a named
+  rounding) were decoded as undefined; they now run. A quiet NaN gives way to a number in VMAXNM
+  and VMINNM, and +0 counts as larger than -0.
+- VCVT with fraction bits (float to and from 16 and 32-bit fixed point) was decoded as the plain
+  integer conversion, with the wrong source register and no fraction bits, so it ran and gave wrong
+  answers. It now has its own decoder and executor. The firmware has about thirty of them.
+- DSP extension: UXTAH, SXTAH and SXTAB (UXTAB already ran), and PKHBT and PKHTB, were decoded as
+  undefined. The extend-and-add forms share one executor. The firmware has about thirty-five UXTAH and SXTAH.
+- Rounding to an integer (FPRoundInt, FPToFixed): they now round on the bits of the value, not on
+  the `BigFloat` approximation, which keeps 40 digits and so does not hold a double with a long
+  mantissa exactly (a floor of such a whole number could come back one low). The rounding modes,
+  ties to even and ties away included, are one `FPRounding` that the instruction or the FPSCR
+  names. A tie in the FPSCR nearest mode went to the odd neighbour; it goes to the even one.
+  A result that saturates now signals Invalid Operation, not Overflow. Fixed point to float scales
+  by multiplying by 2^-n, because dividing by `BigFloat`'s 2^n lost digits.
 - GDB: `GdbServer`, `ZmuTarget` and `Simulation` can be built from a processor
   that has already been set up and reset (`from_processor`).
 - IT state: the IF-THEN state is now saved in the stacked xPSR on exception

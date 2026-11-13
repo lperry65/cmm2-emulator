@@ -155,6 +155,117 @@ fn test_decode_uxtab_() {
 }
 
 #[test]
+fn test_decode_extend_and_add() {
+    let cases = [
+        // uxtah r0, r0, r3
+        (0xfa10_f083, "uxtah", Reg::R0, Reg::R0, Reg::R3, 0),
+        // uxtah r3, r2, r3, ror #8
+        (0xfa12_f393, "uxtah", Reg::R3, Reg::R2, Reg::R3, 8),
+        // sxtah r3, r2, r3
+        (0xfa02_f383, "sxtah", Reg::R3, Reg::R2, Reg::R3, 0),
+        // sxtah r3, r2, r3, ror #16
+        (0xfa02_f3a3, "sxtah", Reg::R3, Reg::R2, Reg::R3, 16),
+        // sxtab r3, r2, r3, ror #24
+        (0xfa42_f3b3, "sxtab", Reg::R3, Reg::R2, Reg::R3, 24),
+        // uxtab r3, r2, r3
+        (0xfa52_f383, "uxtab", Reg::R3, Reg::R2, Reg::R3, 0),
+    ];
+    for (opcode, name, rd, rn, rm, rotation) in cases {
+        let params = Reg3UsizeParams {
+            rd,
+            rn,
+            rm,
+            rotation,
+        };
+        let expected = match name {
+            "uxtah" => Instruction::UXTAH { params },
+            "sxtah" => Instruction::SXTAH { params },
+            "sxtab" => Instruction::SXTAB { params },
+            _ => Instruction::UXTAB { params },
+        };
+        assert_eq!(decode_32(opcode), expected, "{opcode:#010x}");
+    }
+}
+
+#[test]
+fn test_the_extend_and_add_and_pack_instructions_are_shown_as_assembly() {
+    let cases = [
+        (0xfa10_f083, "uxtah r0, r0, r3"),
+        (0xfa12_f393, "uxtah r3, r2, r3, ror #8"),
+        (0xfa02_f3a3, "sxtah r3, r2, r3, ror #16"),
+        (0xfa42_f3b3, "sxtab r3, r2, r3, ror #24"),
+        (0xfa52_f383, "uxtab r3, r2, r3"),
+        (0xeacc_0400, "pkhbt r4, r12, r0"),
+        (0xeacc_4460, "pkhtb r4, r12, r0"),
+    ];
+    for (opcode, expected) in cases {
+        let text = decode_32(opcode).to_string();
+        assert!(
+            text.eq_ignore_ascii_case(expected),
+            "{opcode:#010x}: {text} against {expected}"
+        );
+    }
+}
+
+#[test]
+fn test_decode_extend_without_add_is_not_the_extend_and_add() {
+    // With Rn = PC the encodings are the plain extends, which have their own decoders.
+    // uxth.w r0, r3 and sxtb.w r0, r3
+    assert!(matches!(
+        decode_32(0xfa1f_f083),
+        Instruction::UXTH { thumb32: true, .. }
+    ));
+    assert!(matches!(
+        decode_32(0xfa4f_f083),
+        Instruction::SXTB { thumb32: true, .. }
+    ));
+}
+
+#[test]
+fn test_decode_pkhbt_and_pkhtb() {
+    let params = |shift_t, shift_n| Reg3ShiftParams {
+        rd: Reg::R4,
+        rn: Reg::R12,
+        rm: Reg::R0,
+        shift_t,
+        shift_n,
+        setflags: SetFlags::False,
+    };
+    // pkhbt r4, r12, r0
+    assert_eq!(
+        decode_32(0xeacc_0400),
+        Instruction::PKH {
+            params: params(SRType::LSL, 0),
+            tb_form: false
+        }
+    );
+    // pkhbt r4, r12, r0, lsl #3
+    assert_eq!(
+        decode_32(0xeacc_04c0),
+        Instruction::PKH {
+            params: params(SRType::LSL, 3),
+            tb_form: false
+        }
+    );
+    // pkhtb r4, r12, r0, asr #17
+    assert_eq!(
+        decode_32(0xeacc_4460),
+        Instruction::PKH {
+            params: params(SRType::ASR, 17),
+            tb_form: true
+        }
+    );
+    // pkhtb r4, r12, r0, asr #32
+    assert_eq!(
+        decode_32(0xeacc_0420),
+        Instruction::PKH {
+            params: params(SRType::ASR, 32),
+            tb_form: true
+        }
+    );
+}
+
+#[test]
 fn test_decode_uxtb() {
     // UXTB R1,R1
     match decode_16(0xb2c9) {

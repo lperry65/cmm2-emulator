@@ -1,7 +1,11 @@
 use super::*;
 
+use crate::core::fpregister::FPRounding;
 use crate::core::instruction::AddressingMode;
-use crate::core::instruction::VSelParamsf64;
+use crate::core::instruction::{
+    VCVTFixedParams, VMinMaxNumParamsf32, VMinMaxNumParamsf64, VRintParamsf32, VRintParamsf64,
+    VSelParamsf64,
+};
 
 #[test]
 fn test_decode_vabs_32() {
@@ -208,8 +212,7 @@ fn test_decode_vct() {
                 dp_operation: false,
                 to_integer: true,
                 unsigned: false,
-                round_nearest: false,
-                round_zero: true,
+                rounding: Some(FPRounding::Zero),
             }
         }
     );
@@ -617,30 +620,341 @@ fn test_decode_vsub_f32() {
     );
 }
 
+// The sixteen VRINT encodings, each with the rounding it names and whether it signals Inexact.
 #[test]
-fn test_decode_vrintz_f32() {
-    // eeb6 7ae7       vrintz.f32      s14, s15
+fn test_decode_vrint_f32() {
+    let cases = [
+        // vrinta.f32 s14, s15
+        (0xfeb8_7a67, Some(FPRounding::TieAway), false),
+        // vrintn.f32 s14, s15
+        (0xfeb9_7a67, Some(FPRounding::TieEven), false),
+        // vrintp.f32 s14, s15
+        (0xfeba_7a67, Some(FPRounding::PosInf), false),
+        // vrintm.f32 s14, s15
+        (0xfebb_7a67, Some(FPRounding::NegInf), false),
+        // vrintr.f32 s14, s15
+        (0xeeb6_7a67, None, false),
+        // vrintx.f32 s14, s15
+        (0xeeb7_7a67, None, true),
+        // vrintz.f32 s14, s15
+        (0xeeb6_7ae7, Some(FPRounding::Zero), false),
+    ];
+    for (opcode, rounding, exact) in cases {
+        assert_eq!(
+            decode_32(opcode),
+            Instruction::VRINT_f32 {
+                params: VRintParamsf32 {
+                    sd: SingleReg::S14,
+                    sm: SingleReg::S15,
+                    rounding,
+                    exact,
+                }
+            },
+            "{opcode:#010x}"
+        );
+    }
+}
+
+#[test]
+fn test_decode_vrint_f64() {
+    let cases = [
+        // vrinta.f64 d7, d8
+        (0xfeb8_7b48, Some(FPRounding::TieAway), false),
+        // vrintn.f64 d7, d8
+        (0xfeb9_7b48, Some(FPRounding::TieEven), false),
+        // vrintp.f64 d7, d8
+        (0xfeba_7b48, Some(FPRounding::PosInf), false),
+        // vrintm.f64 d7, d8
+        (0xfebb_7b48, Some(FPRounding::NegInf), false),
+        // vrintr.f64 d7, d8
+        (0xeeb6_7b48, None, false),
+        // vrintx.f64 d7, d8
+        (0xeeb7_7b48, None, true),
+        // vrintz.f64 d7, d8
+        (0xeeb6_7bc8, Some(FPRounding::Zero), false),
+    ];
+    for (opcode, rounding, exact) in cases {
+        assert_eq!(
+            decode_32(opcode),
+            Instruction::VRINT_f64 {
+                params: VRintParamsf64 {
+                    dd: DoubleReg::D7,
+                    dm: DoubleReg::D8,
+                    rounding,
+                    exact,
+                }
+            },
+            "{opcode:#010x}"
+        );
+    }
+}
+
+#[test]
+fn test_decode_vrint_with_the_upper_registers() {
+    // vrintm.f64 d15, d14 and vrinta.f32 s31, s30
     assert_eq!(
-        decode_32(0xeeb6_7ae7),
-        Instruction::VRINTZ_f32 {
-            params: VMovRegParamsf32 {
-                sd: SingleReg::S14,
-                sm: SingleReg::S15,
+        decode_32(0xfebb_fb4e),
+        Instruction::VRINT_f64 {
+            params: VRintParamsf64 {
+                dd: DoubleReg::D15,
+                dm: DoubleReg::D14,
+                rounding: Some(FPRounding::NegInf),
+                exact: false,
+            }
+        }
+    );
+    assert_eq!(
+        decode_32(0xfef8_fa4f),
+        Instruction::VRINT_f32 {
+            params: VRintParamsf32 {
+                sd: SingleReg::S31,
+                sm: SingleReg::S30,
+                rounding: Some(FPRounding::TieAway),
+                exact: false,
             }
         }
     );
 }
 
 #[test]
-fn test_decode_vrintz_f64() {
-    // eeb6 7bc7       vrintz.f64      d7, d7
+fn test_decode_vmaxnm_vminnm() {
+    // vmaxnm.f32 s1, s2, s3
     assert_eq!(
-        decode_32(0xeeb6_7bc7),
-        Instruction::VRINTZ_f64 {
-            params: VMovRegParamsf64 {
-                dd: DoubleReg::D7,
-                dm: DoubleReg::D7,
+        decode_32(0xfec1_0a21),
+        Instruction::VMINMAXNM_f32 {
+            params: VMinMaxNumParamsf32 {
+                sd: SingleReg::S1,
+                sn: SingleReg::S2,
+                sm: SingleReg::S3,
+                max: true,
             }
         }
     );
+    // vminnm.f32 s1, s2, s3
+    assert_eq!(
+        decode_32(0xfec1_0a61),
+        Instruction::VMINMAXNM_f32 {
+            params: VMinMaxNumParamsf32 {
+                sd: SingleReg::S1,
+                sn: SingleReg::S2,
+                sm: SingleReg::S3,
+                max: false,
+            }
+        }
+    );
+    // vmaxnm.f64 d1, d2, d3
+    assert_eq!(
+        decode_32(0xfe82_1b03),
+        Instruction::VMINMAXNM_f64 {
+            params: VMinMaxNumParamsf64 {
+                dd: DoubleReg::D1,
+                dn: DoubleReg::D2,
+                dm: DoubleReg::D3,
+                max: true,
+            }
+        }
+    );
+    // vminnm.f64 d1, d2, d3
+    assert_eq!(
+        decode_32(0xfe82_1b43),
+        Instruction::VMINMAXNM_f64 {
+            params: VMinMaxNumParamsf64 {
+                dd: DoubleReg::D1,
+                dn: DoubleReg::D2,
+                dm: DoubleReg::D3,
+                max: false,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vfnma() {
+    // vfnma.f32 s15, s12, s10
+    assert_eq!(
+        decode_32(0xeed6_7a45),
+        Instruction::VFNMA_f32 {
+            params: VAddSubParamsf32 {
+                sd: SingleReg::S15,
+                sn: SingleReg::S12,
+                sm: SingleReg::S10,
+            }
+        }
+    );
+    // vfnma.f64 d1, d2, d3
+    assert_eq!(
+        decode_32(0xee92_1b43),
+        Instruction::VFNMA_f64 {
+            params: VAddSubParamsf64 {
+                dd: DoubleReg::D1,
+                dn: DoubleReg::D2,
+                dm: DoubleReg::D3,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vcvt_with_a_named_rounding() {
+    let single = |reg| ExtensionReg::Single { reg };
+    let cases = [
+        // vcvta.s32.f32 s1, s2
+        (0xfefc_0ac1, FPRounding::TieAway, false, false),
+        // vcvta.u32.f32 s1, s2
+        (0xfefc_0a41, FPRounding::TieAway, true, false),
+        // vcvtn.s32.f32 s1, s2
+        (0xfefd_0ac1, FPRounding::TieEven, false, false),
+        // vcvtp.s32.f32 s1, s2
+        (0xfefe_0ac1, FPRounding::PosInf, false, false),
+        // vcvtm.s32.f32 s1, s2
+        (0xfeff_0ac1, FPRounding::NegInf, false, false),
+    ];
+    for (opcode, rounding, unsigned, dp_operation) in cases {
+        assert_eq!(
+            decode_32(opcode),
+            Instruction::VCVT {
+                params: VCVTParams {
+                    d: single(SingleReg::S1),
+                    m: single(SingleReg::S2),
+                    dp_operation,
+                    to_integer: true,
+                    unsigned,
+                    rounding: Some(rounding),
+                }
+            },
+            "{opcode:#010x}"
+        );
+    }
+    // vcvtm.u32.f64 s1, d2
+    assert_eq!(
+        decode_32(0xfeff_0b42),
+        Instruction::VCVT {
+            params: VCVTParams {
+                d: single(SingleReg::S1),
+                m: ExtensionReg::Double { reg: DoubleReg::D2 },
+                dp_operation: true,
+                to_integer: true,
+                unsigned: true,
+                rounding: Some(FPRounding::NegInf),
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vcvtr_takes_the_fpscr_rounding() {
+    // vcvtr.s32.f32 s15, s0
+    assert_eq!(
+        decode_32(0xeefd_7a40),
+        Instruction::VCVT {
+            params: VCVTParams {
+                d: ExtensionReg::Single {
+                    reg: SingleReg::S15
+                },
+                m: ExtensionReg::Single { reg: SingleReg::S0 },
+                dp_operation: false,
+                to_integer: true,
+                unsigned: false,
+                rounding: None,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_the_vrint_and_vcvt_encodings_do_not_catch_their_neighbours() {
+    // vsel, vmov immediate, vcvt between float and double, vcmp, and the integer vcvt all sit
+    // next to the new patterns.
+    let neighbours = [
+        (0xfe00_0a00u32, "vseleq.f32"),
+        (0xeeb7_0a00, "vmov.f32"),
+        (0xeeb7_7bc7, "vcvt.f32.f64"),
+        (0xeeb4_7a67, "vcmp.f32"),
+        (0xeefd_7ac0, "vcvt.s32.f32"),
+    ];
+    for (opcode, mnemonic) in neighbours {
+        let text = decode_32(opcode).to_string();
+        assert!(text.starts_with(mnemonic), "{opcode:#010x} -> {text}");
+    }
+}
+
+#[test]
+fn test_decode_vcvt_with_fraction_bits() {
+    let single = |reg| ExtensionReg::Single { reg };
+    let double = |reg| ExtensionReg::Double { reg };
+    let cases = [
+        // vcvt.s32.f32 s15, s15, #16
+        (0xeefe_7ac8, single(SingleReg::S15), true, false, 32, 16),
+        // vcvt.f32.s32 s13, s13, #13
+        (0xeefa_6ae9, single(SingleReg::S13), false, false, 32, 13),
+        // vcvt.u16.f32 s0, s0, #3
+        (0xeebf_0a66, single(SingleReg::S0), true, true, 16, 3),
+        // vcvt.s16.f64 d1, d1, #5
+        (0xeebe_1b65, double(DoubleReg::D1), true, false, 16, 5),
+        // vcvt.f64.u32 d2, d2, #32
+        (0xeebb_2bc0, double(DoubleReg::D2), false, true, 32, 32),
+        // vcvt.f32.u16 s1, s1, #1
+        (0xeefb_0a67, single(SingleReg::S1), false, true, 16, 1),
+        // vcvt.s16.f32 s0, s0, #0 and vcvt.u16.f64 d1, d1, #0: no fraction bits is the most
+        // the immediate can take away.
+        (0xeebe_0a48, single(SingleReg::S0), true, false, 16, 0),
+        (0xeebf_1b48, double(DoubleReg::D1), true, true, 16, 0),
+        // vcvt.f64.s16 d3, d3, #16
+        (0xeeba_3b40, double(DoubleReg::D3), false, false, 16, 16),
+    ];
+    for (opcode, reg, to_fixed, unsigned, size, fraction_bits) in cases {
+        assert_eq!(
+            decode_32(opcode),
+            Instruction::VCVT_fixed {
+                params: VCVTFixedParams {
+                    reg,
+                    to_fixed,
+                    unsigned,
+                    size,
+                    fraction_bits,
+                }
+            },
+            "{opcode:#010x}"
+        );
+    }
+}
+
+#[test]
+fn test_decode_vcvt_with_more_fraction_bits_than_the_size_is_undefined() {
+    // A 16-bit conversion with imm5 = 17 would have 16 - 17 fraction bits.
+    assert!(matches!(decode_32(0xeebe_0a68), Instruction::UDF { .. }));
+}
+
+// The text a trace shows for each of the new instructions, in the assembler's own spelling.
+#[test]
+fn test_the_new_floating_point_instructions_are_shown_as_assembly() {
+    let cases = [
+        (0xfeb8_7a67, "vrinta.f32 S14, S15"),
+        (0xfeb9_7b48, "vrintn.f64 D7, D8"),
+        (0xfeba_7a67, "vrintp.f32 S14, S15"),
+        (0xfebb_7b48, "vrintm.f64 D7, D8"),
+        (0xeeb6_7a67, "vrintr.f32 S14, S15"),
+        (0xeeb7_7b48, "vrintx.f64 D7, D8"),
+        (0xeeb6_7ae7, "vrintz.f32 S14, S15"),
+        (0xfec1_0a21, "vmaxnm.f32 S1, S2, S3"),
+        (0xfe82_1b43, "vminnm.f64 D1, D2, D3"),
+        (0xeed6_7a45, "vfnma.f32 S15, S12, S10"),
+        (0xee92_1b43, "vfnma.f64 D1, D2, D3"),
+        (0xfefc_0ac1, "vcvta.s32.f32 S1, S2"),
+        (0xfefd_0b42, "vcvtn.u32.f64 S1, D2"),
+        (0xfefe_0ac1, "vcvtp.s32.f32 S1, S2"),
+        (0xfeff_0b42, "vcvtm.u32.f64 S1, D2"),
+        (0xeefd_7a40, "vcvtr.s32.f32 S15, S0"),
+        (0xeefd_7ac0, "vcvt.s32.f32 S15, S0"),
+        (0xeefe_7ac8, "vcvt.s32.f32 S15, S15, #16"),
+        (0xeefa_6ae9, "vcvt.f32.s32 S13, S13, #13"),
+        (0xeebb_2bc0, "vcvt.f64.u32 D2, D2, #32"),
+    ];
+    for (opcode, expected) in cases {
+        let text = decode_32(opcode).to_string();
+        assert!(
+            text.eq_ignore_ascii_case(expected),
+            "{opcode:#010x}: {text} against {expected}"
+        );
+    }
 }

@@ -1042,6 +1042,210 @@ mod tests {
         assert_eq!(cpu.reg(4), 0xFF00_FF45);
     }
 
+    // Runs `instruction`, a Thumb-2 halfword pair, from flash on a core with the FPU on.
+    // d0 starts as the pair (r0, r1) = `operands[0..2]`, d1 as `operands[2..4]` and d2 as
+    // `operands[4..6]`, so s0 is operands[0], s1 operands[1], s2 operands[2] and s3 operands[3].
+    // The result is d0 in r2 (low word) and r3, s0 in r6 and the FPSCR in r7.
+    fn run_vfp(instruction: [u16; 2], operands: [u32; 6]) -> Cpu {
+        const CPACR: u32 = 0xE000_ED88;
+        const FPU_ON: u32 = 0x00F0_0000;
+        let ops = [
+            Load(0, 0),
+            Load(1, 1),
+            Raw(STR_R1_R0), // str r1,[r0]
+            Load(0, 2),
+            Load(1, 3),
+            Load(2, 4),
+            Load(3, 5),
+            Load(4, 6),
+            Load(5, 7),
+            Raw(0xEC41), // vmov d0, r0, r1
+            Raw(0x0B10),
+            Raw(0xEC43), // vmov d1, r2, r3
+            Raw(0x2B11),
+            Raw(0xEC45), // vmov d2, r4, r5
+            Raw(0x4B12),
+            Raw(instruction[0]),
+            Raw(instruction[1]),
+            Raw(0xEC53), // vmov r2, r3, d0
+            Raw(0x2B10),
+            Raw(0xEE10), // vmov r6, s0
+            Raw(0x6A10),
+            Raw(0xEEF1), // vmrs r7, fpscr
+            Raw(0x7A10),
+            Raw(SPIN_HERE),
+        ];
+        let mut pool = vec![CPACR, FPU_ON];
+        pool.extend(operands);
+        let mut cpu = cpu(&assemble(&ops, &pool));
+        // The instruction is the thirteenth, and is one step of four bytes.
+        cpu.run(12);
+        let pc = cpu.pc();
+        assert!(cpu.step().is_none());
+        assert_eq!(cpu.pc(), pc + 4);
+        assert_eq!(cpu.run(30), Stop::InstructionLimit);
+        cpu
+    }
+
+    fn f64_pair(x: f64) -> [u32; 2] {
+        [x.to_bits() as u32, (x.to_bits() >> 32) as u32]
+    }
+
+    fn d0(cpu: &Cpu) -> f64 {
+        f64::from_bits(u64::from(cpu.reg(3)) << 32 | u64::from(cpu.reg(2)))
+    }
+
+    fn operands64(d0: f64, d1: f64, d2: f64) -> [u32; 6] {
+        let [a, b, c, d, e, f] = [d0, d1, d2].map(f64_pair).concat().try_into().unwrap();
+        [a, b, c, d, e, f]
+    }
+
+    const IXC: u32 = 1 << 4;
+
+    #[test]
+    fn vrint_in_every_rounding_runs_from_flash() {
+        // vrinta.f64, vrintn.f64, vrintp.f64 and vrintm.f64 of d1 into d0, on 2.5 and -2.5.
+        let cases = [
+            ([0xFEB8, 0x0B41], [3.0, -3.0]),
+            ([0xFEB9, 0x0B41], [2.0, -2.0]),
+            ([0xFEBA, 0x0B41], [3.0, -2.0]),
+            ([0xFEBB, 0x0B41], [2.0, -3.0]),
+        ];
+        for (instruction, results) in cases {
+            for (x, expected) in [2.5, -2.5].into_iter().zip(results) {
+                let cpu = run_vfp(instruction, operands64(9.0, x, 0.0));
+                assert_eq!(d0(&cpu), expected, "{instruction:04x?} {x}");
+                assert_eq!(cpu.reg(7) & IXC, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn vrint_in_single_precision_runs_from_flash() {
+        // vrintp.f32 s0, s1 on 2.5, which is s1: the high word of d0.
+        let operands = [0, 2.5f32.to_bits(), 0, 0, 0, 0];
+        let cpu = run_vfp([0xFEBA, 0x0A60], operands);
+        assert_eq!(f32::from_bits(cpu.reg(6)), 3.0);
+    }
+
+    #[test]
+    fn vrintx_signals_inexact_and_vrintr_does_not() {
+        // vrintx.f64 d0, d1 and vrintr.f32 s0, s1; the FPSCR rounding is to nearest.
+        let cpu = run_vfp([0xEEB7, 0x0B41], operands64(9.0, 2.5, 0.0));
+        assert_eq!(d0(&cpu), 2.0);
+        assert_eq!(cpu.reg(7) & IXC, IXC);
+        let cpu = run_vfp([0xEEB6, 0x0A60], [0, 3.5f32.to_bits(), 0, 0, 0, 0]);
+        assert_eq!(f32::from_bits(cpu.reg(6)), 4.0);
+        assert_eq!(cpu.reg(7) & IXC, 0);
+    }
+
+    #[test]
+    fn vmaxnm_and_vminnm_run_from_flash() {
+        // vmaxnm.f64 d0, d1, d2 and vminnm.f32 s0, s1, s2.
+        let cpu = run_vfp([0xFE81, 0x0B02], operands64(9.0, -1.5, 4.5));
+        assert_eq!(d0(&cpu), 4.5);
+        let cpu = run_vfp([0xFE81, 0x0B02], operands64(9.0, f64::NAN, -7.0));
+        assert_eq!(d0(&cpu), -7.0);
+        let operands = [0, 1.5f32.to_bits(), (-2.5f32).to_bits(), 0, 0, 0];
+        let cpu = run_vfp([0xFE80, 0x0AC1], operands);
+        assert_eq!(f32::from_bits(cpu.reg(6)), -2.5);
+    }
+
+    #[test]
+    fn vfnma_runs_from_flash() {
+        // vfnma.f64 d0, d1, d2: d0 = -d0 + (-d1) * d2 = -10 + (-2) * 3. And the single
+        // precision one, vfnma.f32 s0, s1, s2, the one the firmware has.
+        let cpu = run_vfp([0xEE91, 0x0B42], operands64(10.0, 2.0, 3.0));
+        assert_eq!(d0(&cpu), -16.0);
+        let operands = [
+            10.0f32.to_bits(),
+            2.0f32.to_bits(),
+            3.0f32.to_bits(),
+            0,
+            0,
+            0,
+        ];
+        let cpu = run_vfp([0xEE90, 0x0AC1], operands);
+        assert_eq!(f32::from_bits(cpu.reg(6)), -16.0);
+    }
+
+    #[test]
+    fn vcvta_and_vcvtn_run_from_flash() {
+        // vcvta.s32.f64 s0, d1 and vcvtn.u32.f32 s0, s1.
+        let cpu = run_vfp([0xFEBC, 0x0BC1], operands64(0.0, 2.5, 0.0));
+        assert_eq!(cpu.reg(6), 3);
+        let cpu = run_vfp([0xFEBC, 0x0BC1], operands64(0.0, -2.5, 0.0));
+        assert_eq!(cpu.reg(6) as i32, -3);
+        let cpu = run_vfp([0xFEBD, 0x0A60], [0, 2.5f32.to_bits(), 0, 0, 0, 0]);
+        assert_eq!(cpu.reg(6), 2);
+    }
+
+    #[test]
+    fn vcvt_with_fraction_bits_runs_from_flash() {
+        // vcvt.s32.f32 s0, s0, #16: 1.5 is 0x18000 with 16 fraction bits.
+        let cpu = run_vfp([0xEEBE, 0x0AC8], [1.5f32.to_bits(), 0, 0, 0, 0, 0]);
+        assert_eq!(cpu.reg(6), 0x1_8000);
+        // vcvt.f32.s32 s0, s0, #13: the integer -0x6000 is -3 with 13 fraction bits.
+        let cpu = run_vfp([0xEEBA, 0x0AE9], [(-0x6000i32) as u32, 0, 0, 0, 0, 0]);
+        assert_eq!(f32::from_bits(cpu.reg(6)), -3.0);
+        // vcvt.s16.f64 d0, d0, #5: 100.3 * 32 is 3209.6, truncated to 3209.
+        let cpu = run_vfp([0xEEBE, 0x0B65], operands64(100.3, 0.0, 0.0));
+        assert_eq!(cpu.reg(2), 3209);
+        // vcvt.f64.u32 d0, d0, #32: the low word, as a number of 32 fraction bits.
+        let cpu = run_vfp([0xEEBB, 0x0BC0], [0x8000_0000, 0xDEAD, 0, 0, 0, 0]);
+        assert_eq!(d0(&cpu), 0.5);
+    }
+
+    // Runs `instruction` with r2 = 0x1234_8765 and r3 = 0xCAFE_F00D, and returns r4 and r2.
+    fn run_packing(instruction: [u16; 2]) -> (u32, u32) {
+        let code = assemble(
+            &[
+                Load(2, 0),
+                Load(3, 1),
+                Raw(instruction[0]),
+                Raw(instruction[1]),
+                Raw(SPIN_HERE),
+            ],
+            &[0x1234_8765, 0xCAFE_F00D],
+        );
+        let mut cpu = cpu(&code);
+        cpu.run(2);
+        let pc = cpu.pc();
+        assert!(cpu.step().is_none());
+        assert_eq!(cpu.pc(), pc + 4);
+        (cpu.reg(4), cpu.reg(2))
+    }
+
+    #[test]
+    fn the_extend_and_add_instructions_run_from_flash() {
+        // uxtah r2, r2, r3; sxtah r2, r2, r3, ror #8; the sums are of r2 = 0x1234_8765 and the
+        // halfword of r3 (0xF00D, or 0xFEF0 after the rotate, which is negative).
+        assert_eq!(run_packing([0xFA12, 0xF283]).1, 0x1234_8765 + 0xF00D);
+        assert_eq!(
+            run_packing([0xFA02, 0xF293]).1,
+            0x1234_8765u32.wrapping_add(0xFFFF_FEF0)
+        );
+        // sxtab r4, r2, r3: r2 plus the sign-extended byte 0x0D of r3. With ror #8 the byte is
+        // 0xF0, which is negative, and uxtab r4, r2, r3 gives r2 plus the byte 0x0D.
+        assert_eq!(run_packing([0xFA42, 0xF483]).0, 0x1234_8765 + 0x0D);
+        assert_eq!(
+            run_packing([0xFA42, 0xF493]).0,
+            0x1234_8765u32.wrapping_add(0xFFFF_FFF0)
+        );
+        assert_eq!(run_packing([0xFA52, 0xF483]).0, 0x1234_8765 + 0x0D);
+        // uxtab r4, r2, r3, ror #8: the byte 0xF0 is not extended by its sign.
+        assert_eq!(run_packing([0xFA52, 0xF493]).0, 0x1234_8765 + 0xF0);
+    }
+
+    #[test]
+    fn the_pack_halfword_instructions_run_from_flash() {
+        // pkhbt r2, r2, r3, lsl #16: the bottom of r2 and the top of r3 << 16, which is
+        // the bottom of r3.
+        assert_eq!(run_packing([0xEAC2, 0x4203]).1, 0xF00D_8765);
+        // pkhtb r4, r2, r3, asr #16: the top of r2 and the bottom of r3 >> 16.
+        assert_eq!(run_packing([0xEAC2, 0x4423]).0, 0x1234_CAFE);
+    }
+
     #[test]
     fn the_clock_is_the_core_cycle_count_at_the_start_of_the_instruction() {
         let mut cpu = cpu(&SPIN);

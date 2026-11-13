@@ -1,16 +1,35 @@
 use crate::Processor;
-use crate::core::fpregister::Fpscr;
+use crate::core::fpregister::{FPRounding, Fpscr};
 use crate::core::instruction::{
-    VAddSubParamsf32, VAddSubParamsf64, VCVTParams, VCVTParamsF32F64, VCVTParamsF64F32,
-    VCmpParamsf32, VCmpParamsf64, VMovRegParamsf32, VMovRegParamsf64, VSelParamsf32, VSelParamsf64,
+    VAddSubParamsf32, VAddSubParamsf64, VCVTFixedParams, VCVTParams, VCVTParamsF32F64,
+    VCVTParamsF64F32, VCmpParamsf32, VCmpParamsf64, VMinMaxNumParamsf32, VMinMaxNumParamsf64,
+    VMovRegParamsf32, VMovRegParamsf64, VRintParamsf32, VRintParamsf64, VSelParamsf32,
+    VSelParamsf64,
 };
 
 use crate::executor::ExecuteSuccess;
 
 use super::ExecuteResult;
 use super::fp_generic::{FloatingPointChecks, FloatingPointPublicOperations};
-use crate::core::register::ExtensionRegOperations;
+use crate::core::register::{ExtensionReg, ExtensionRegOperations};
 use crate::executor::ExecutorHelper;
+
+// The low `size` bits of a value, extended to 64 bits by zeros when they are unsigned and by
+// their sign when they are signed.
+fn extend_fixed(value: u64, size: usize, unsigned: bool) -> u64 {
+    let shift = 64 - size;
+    if unsigned {
+        (value << shift) >> shift
+    } else {
+        (((value << shift) as i64) >> shift) as u64
+    }
+}
+
+// The fixed-point number in the low `size` bits of a register, as the 32-bit value that
+// FixedToFP reads.
+fn fixed_operand(register: u32, size: usize, unsigned: bool) -> u32 {
+    extend_fixed(u64::from(register), size, unsigned) as u32
+}
 
 pub trait IsaFloatingPointDataProcessing {
     fn exec_vabs_f32(&mut self, params: VMovRegParamsf32) -> ExecuteResult;
@@ -18,8 +37,11 @@ pub trait IsaFloatingPointDataProcessing {
     fn exec_vneg_f32(&mut self, params: VMovRegParamsf32) -> ExecuteResult;
     fn exec_vneg_f64(&mut self, params: VMovRegParamsf64) -> ExecuteResult;
 
-    fn exec_vrintz_f32(&mut self, params: VMovRegParamsf32) -> ExecuteResult;
-    fn exec_vrintz_f64(&mut self, params: VMovRegParamsf64) -> ExecuteResult;
+    fn exec_vrint_f32(&mut self, params: VRintParamsf32) -> ExecuteResult;
+    fn exec_vrint_f64(&mut self, params: VRintParamsf64) -> ExecuteResult;
+
+    fn exec_vminmaxnm_f32(&mut self, params: &VMinMaxNumParamsf32) -> ExecuteResult;
+    fn exec_vminmaxnm_f64(&mut self, params: &VMinMaxNumParamsf64) -> ExecuteResult;
 
     fn exec_vsqrt_f32(&mut self, params: VMovRegParamsf32) -> ExecuteResult;
     fn exec_vsqrt_f64(&mut self, params: VMovRegParamsf64) -> ExecuteResult;
@@ -37,6 +59,8 @@ pub trait IsaFloatingPointDataProcessing {
     fn exec_vfms_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult;
     fn exec_vfnms_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult;
     fn exec_vfnms_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult;
+    fn exec_vfnma_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult;
+    fn exec_vfnma_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult;
     fn exec_vmul_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult;
     fn exec_vmul_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult;
     fn exec_vnmul_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult;
@@ -46,6 +70,7 @@ pub trait IsaFloatingPointDataProcessing {
     fn exec_vsub_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult;
 
     fn exec_vcvt(&mut self, params: &VCVTParams) -> ExecuteResult;
+    fn exec_vcvt_fixed(&mut self, params: &VCVTFixedParams) -> ExecuteResult;
     fn exec_vcvt_f64_f32(&mut self, params: VCVTParamsF64F32) -> ExecuteResult;
     fn exec_vcvt_f32_f64(&mut self, params: VCVTParamsF32F64) -> ExecuteResult;
     fn exec_vsel_f32(&mut self, params: VSelParamsf32) -> ExecuteResult;
@@ -101,24 +126,47 @@ impl IsaFloatingPointDataProcessing for Processor {
         Ok(ExecuteSuccess::NotTaken)
     }
 
-    fn exec_vrintz_f32(&mut self, params: VMovRegParamsf32) -> ExecuteResult {
+    fn exec_vrint_f32(&mut self, params: VRintParamsf32) -> ExecuteResult {
         if self.condition_passed() {
             self.execute_fp_check()?;
             let op = self.get_sr(params.sm);
-            let result = self.fp_round_int::<u32>(op, true, false, true);
+            let result = self.fp_round_int::<u32>(op, params.rounding, params.exact, true);
             self.set_sr(params.sd, result);
             return Ok(ExecuteSuccess::Taken { cycles: 1 });
         }
         Ok(ExecuteSuccess::NotTaken)
     }
 
-    fn exec_vrintz_f64(&mut self, params: VMovRegParamsf64) -> ExecuteResult {
+    fn exec_vrint_f64(&mut self, params: VRintParamsf64) -> ExecuteResult {
         if self.condition_passed() {
             self.execute_fp_check()?;
-            let (lower, upper) = self.get_dr(params.dm);
-            let op = (u64::from(upper) << 32) | u64::from(lower);
-            let result = self.fp_round_int::<u64>(op, true, false, true);
-            self.set_dr(params.dd, result as u32, (result >> 32) as u32);
+            let op = self.get_dr_bits(params.dm);
+            let result = self.fp_round_int::<u64>(op, params.rounding, params.exact, true);
+            self.set_dr_bits(params.dd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vminmaxnm_f32(&mut self, params: &VMinMaxNumParamsf32) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let op1 = self.get_sr(params.sn);
+            let op2 = self.get_sr(params.sm);
+            let result = self.fp_min_max_num::<u32>(op1, op2, params.max);
+            self.set_sr(params.sd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vminmaxnm_f64(&mut self, params: &VMinMaxNumParamsf64) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let op1 = self.get_dr_bits(params.dn);
+            let op2 = self.get_dr_bits(params.dm);
+            let result = self.fp_min_max_num::<u64>(op1, op2, params.max);
+            self.set_dr_bits(params.dd, result);
             return Ok(ExecuteSuccess::Taken { cycles: 1 });
         }
         Ok(ExecuteSuccess::NotTaken)
@@ -327,6 +375,32 @@ impl IsaFloatingPointDataProcessing for Processor {
         Ok(ExecuteSuccess::NotTaken)
     }
 
+    fn exec_vfnma_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let addend = self.get_sr(params.sd) ^ 0x8000_0000;
+            let op1 = self.get_sr(params.sn) ^ 0x8000_0000;
+            let op2 = self.get_sr(params.sm);
+            let result = self.fp_mul_add::<u32>(addend, op1, op2, true);
+            self.set_sr(params.sd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vfnma_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let addend = self.get_dr_bits(params.dd) ^ 0x8000_0000_0000_0000;
+            let op1 = self.get_dr_bits(params.dn) ^ 0x8000_0000_0000_0000;
+            let op2 = self.get_dr_bits(params.dm);
+            let result = self.fp_mul_add::<u64>(addend, op1, op2, true);
+            self.set_dr_bits(params.dd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
     fn exec_vmul_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult {
         if self.condition_passed() {
             self.execute_fp_check()?;
@@ -426,14 +500,15 @@ impl IsaFloatingPointDataProcessing for Processor {
                         .expect("Invalid register for single precision operation");
                     let dm = self.get_dr(*m_reg);
                     let dm_val = u64::from(dm.1) << 32 | u64::from(dm.0);
-                    let result = self.fp_to_fixed::<u64, u32>(
+                    let result = self.fp_to_fixed::<u64>(
                         dm_val,
+                        32,
                         0,
                         params.unsigned,
-                        params.round_zero,
+                        params.rounding,
                         true,
                     );
-                    self.set_sr(*d_reg, result);
+                    self.set_sr(*d_reg, result as u32);
                 } else {
                     let m_reg = params
                         .m
@@ -444,14 +519,9 @@ impl IsaFloatingPointDataProcessing for Processor {
                         .as_single()
                         .expect("Invalid register for single precision operation");
                     let dm = self.get_sr(*m_reg);
-                    let result = self.fp_to_fixed::<u32, u32>(
-                        dm,
-                        0,
-                        params.unsigned,
-                        params.round_zero,
-                        true,
-                    );
-                    self.set_sr(*d_reg, result);
+                    let result =
+                        self.fp_to_fixed::<u32>(dm, 32, 0, params.unsigned, params.rounding, true);
+                    self.set_sr(*d_reg, result as u32);
                 }
             } else if params.dp_operation {
                 let m_reg = params
@@ -463,8 +533,7 @@ impl IsaFloatingPointDataProcessing for Processor {
                     .as_double()
                     .expect("Invalid register for double precision operation");
                 let dm = self.get_sr(*m_reg);
-                let result =
-                    self.fixed_to_fp::<u64, u32>(dm, 0, params.unsigned, params.round_zero, true);
+                let result = self.fixed_to_fp::<u64, u32>(dm, 0, params.unsigned, false, true);
                 let result_upper = (result >> 32) as u32;
                 let result_lower = result as u32;
                 self.set_dr(*d_reg, result_lower, result_upper);
@@ -478,11 +547,62 @@ impl IsaFloatingPointDataProcessing for Processor {
                     .as_single()
                     .expect("Invalid register for single precision operation");
                 let dm = self.get_sr(*m_reg);
-                let result =
-                    self.fixed_to_fp::<u32, u32>(dm, 0, params.unsigned, params.round_zero, true);
+                let result = self.fixed_to_fp::<u32, u32>(dm, 0, params.unsigned, false, true);
                 self.set_sr(*d_reg, result);
             }
 
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vcvt_fixed(&mut self, params: &VCVTFixedParams) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let size = usize::from(params.size);
+            let fraction_bits = usize::from(params.fraction_bits);
+            let unsigned = params.unsigned;
+            match params.reg {
+                ExtensionReg::Single { reg } => {
+                    let op = self.get_sr(reg);
+                    let result = if params.to_fixed {
+                        let fixed = self.fp_to_fixed::<u32>(
+                            op,
+                            size,
+                            fraction_bits,
+                            unsigned,
+                            Some(FPRounding::Zero),
+                            true,
+                        );
+                        extend_fixed(fixed, size, unsigned) as u32
+                    } else {
+                        let fixed = fixed_operand(op, size, unsigned);
+                        self.fixed_to_fp::<u32, u32>(fixed, fraction_bits, unsigned, true, true)
+                    };
+                    self.set_sr(reg, result);
+                }
+                ExtensionReg::Double { reg } => {
+                    let result = if params.to_fixed {
+                        let op = self.get_dr_bits(reg);
+                        let fixed = self.fp_to_fixed::<u64>(
+                            op,
+                            size,
+                            fraction_bits,
+                            unsigned,
+                            Some(FPRounding::Zero),
+                            true,
+                        );
+                        extend_fixed(fixed, size, unsigned)
+                    } else {
+                        // The operand is the low bits of the register, which are all in the
+                        // low word.
+                        let (low_word, _) = self.get_dr(reg);
+                        let fixed = fixed_operand(low_word, size, unsigned);
+                        self.fixed_to_fp::<u64, u32>(fixed, fraction_bits, unsigned, true, true)
+                    };
+                    self.set_dr_bits(reg, result);
+                }
+            }
             return Ok(ExecuteSuccess::Taken { cycles: 1 });
         }
         Ok(ExecuteSuccess::NotTaken)
@@ -538,7 +658,9 @@ impl IsaFloatingPointDataProcessing for Processor {
 mod tests {
     use super::*;
     use crate::core::bits::Bits;
+    use crate::core::fpregister::FPSCRRounding;
     use crate::core::register::{Apsr, DoubleReg, ExtensionReg, SingleReg};
+    use crate::executor::fp_test_support::*;
 
     fn fp_test_processor() -> Processor {
         let mut processor = Processor::new();
@@ -645,55 +767,411 @@ mod tests {
         assert_eq!(result, (0x0000_0000, 0x4000_0000));
     }
 
-    #[test]
-    fn test_vrintz_f32() {
+    // Runs one VRINT on a double and gives back the result and the FPSCR.
+    fn vrint_f64(rounding: Option<FPRounding>, exact: bool, fpscr: u32, x: f64) -> (f64, u32) {
         let mut processor = fp_test_processor();
-
-        processor.set_sr(SingleReg::S15, 1.75f32.to_bits());
+        processor.fpscr = fpscr;
+        processor.set_dr_bits(DoubleReg::D7, x.to_bits());
         processor
-            .exec_vrintz_f32(VMovRegParamsf32 {
-                sd: SingleReg::S14,
-                sm: SingleReg::S15,
-            })
-            .unwrap();
-
-        assert_eq!(processor.get_sr(SingleReg::S14), 1.0f32.to_bits());
-    }
-
-    #[test]
-    fn test_vrintz_f64() {
-        let mut processor = fp_test_processor();
-
-        let input = (-2.9f64).to_bits();
-        processor.set_dr(DoubleReg::D7, input as u32, (input >> 32) as u32);
-        processor
-            .exec_vrintz_f64(VMovRegParamsf64 {
+            .exec_vrint_f64(VRintParamsf64 {
                 dd: DoubleReg::D6,
                 dm: DoubleReg::D7,
+                rounding,
+                exact,
             })
             .unwrap();
+        (
+            f64::from_bits(processor.get_dr_bits(DoubleReg::D6)),
+            processor.fpscr,
+        )
+    }
 
-        let result = processor.get_dr(DoubleReg::D6);
-        let result_bits = (u64::from(result.1) << 32) | u64::from(result.0);
-        assert_eq!(result_bits, (-2.0f64).to_bits());
+    fn vrint_f32(rounding: Option<FPRounding>, exact: bool, fpscr: u32, x: f32) -> (f32, u32) {
+        let mut processor = fp_test_processor();
+        processor.fpscr = fpscr;
+        processor.set_sr(SingleReg::S15, x.to_bits());
+        processor
+            .exec_vrint_f32(VRintParamsf32 {
+                sd: SingleReg::S14,
+                sm: SingleReg::S15,
+                rounding,
+                exact,
+            })
+            .unwrap();
+        (
+            f32::from_bits(processor.get_sr(SingleReg::S14)),
+            processor.fpscr,
+        )
     }
 
     #[test]
-    fn test_vrintz_f32_ignores_fpscr_rounding_mode() {
+    fn test_vrint_f32_rounds_as_named() {
+        for rounding in ALL_ROUNDINGS {
+            for x in [2.5f32, -2.5, 3.5, 0.4, -0.4, -0.0, 1e30, f32::INFINITY] {
+                let (result, fpscr) = vrint_f32(Some(rounding), false, 0, x);
+                assert_eq!(
+                    result.to_bits(),
+                    host_rint32(x, rounding).to_bits(),
+                    "{rounding:?} {x}"
+                );
+                assert_eq!(fpscr, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_vrint_f64_rounds_as_named() {
+        for rounding in ALL_ROUNDINGS {
+            for x in [2.5f64, -2.5, 3.5, 0.4, -0.4, -0.0, 1e300, f64::INFINITY] {
+                let (result, fpscr) = vrint_f64(Some(rounding), false, 0, x);
+                assert_eq!(
+                    result.to_bits(),
+                    host_rint64(x, rounding).to_bits(),
+                    "{rounding:?} {x}"
+                );
+                assert_eq!(fpscr, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_vrint_ignores_the_fpscr_rounding_mode_when_it_names_one() {
+        let mut fpscr = 0;
+        fpscr.set_rounding_mode(FPSCRRounding::RoundTowardsPlusInfinity);
+        assert_eq!(
+            vrint_f32(Some(FPRounding::Zero), false, fpscr, -2.9).0,
+            -2.0
+        );
+        assert_eq!(
+            vrint_f64(Some(FPRounding::Zero), false, fpscr, -2.9).0,
+            -2.0
+        );
+    }
+
+    #[test]
+    fn test_vrintr_and_vrintx_follow_the_fpscr_rounding_mode() {
+        let modes = [
+            (FPSCRRounding::RoundToNearest, FPRounding::TieEven),
+            (FPSCRRounding::RoundTowardsPlusInfinity, FPRounding::PosInf),
+            (FPSCRRounding::RoundTowardsMinusInfinity, FPRounding::NegInf),
+            (FPSCRRounding::RoundTowardsZero, FPRounding::Zero),
+        ];
+        for (mode, rounding) in modes {
+            let mut fpscr = 0;
+            fpscr.set_rounding_mode(mode);
+            for exact in [false, true] {
+                let (result, _) = vrint_f32(None, exact, fpscr, 2.5);
+                assert_eq!(result, host_rint32(2.5, rounding), "{mode:?}");
+                let (result, _) = vrint_f64(None, exact, fpscr, -2.5);
+                assert_eq!(result, host_rint64(-2.5, rounding), "{mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_vrintx_signals_inexact_and_vrintr_does_not() {
+        assert_eq!(vrint_f32(None, true, 0, 2.5).1, IXC);
+        assert_eq!(vrint_f64(None, true, 0, 2.5).1, IXC);
+        assert_eq!(vrint_f32(None, false, 0, 2.5).1, 0);
+        assert_eq!(vrint_f64(None, false, 0, 2.5).1, 0);
+        // A result equal to the operand is exact.
+        assert_eq!(vrint_f32(None, true, 0, 2.0).1, 0);
+        assert_eq!(vrint_f64(None, true, 0, 2.0).1, 0);
+    }
+
+    #[test]
+    fn test_vrint_obeys_the_it_condition() {
+        let mut processor = fp_test_processor();
+        // In an IT NE block with the Z flag set, the instruction is skipped.
+        processor.set_dr_bits(DoubleReg::D7, 2.5f64.to_bits());
+        processor.set_dr_bits(DoubleReg::D6, 9.0f64.to_bits());
+        processor.psr.set_z_bit(true);
+        processor
+            .set_itstate(((crate::core::condition::Condition::NE.value() as u8) << 4) | 0b1000);
+        let outcome = processor
+            .exec_vrint_f64(VRintParamsf64 {
+                dd: DoubleReg::D6,
+                dm: DoubleReg::D7,
+                rounding: Some(FPRounding::Zero),
+                exact: false,
+            })
+            .unwrap();
+        assert!(matches!(outcome, ExecuteSuccess::NotTaken));
+        assert_eq!(processor.get_dr_bits(DoubleReg::D6), 9.0f64.to_bits());
+    }
+
+    #[test]
+    fn test_vrint_faults_when_the_fpu_is_off() {
+        let mut processor = Processor::new();
+        processor.cpacr = 0;
+        let result = processor.exec_vrint_f32(VRintParamsf32 {
+            sd: SingleReg::S0,
+            sm: SingleReg::S1,
+            rounding: Some(FPRounding::Zero),
+            exact: false,
+        });
+        assert!(result.is_err());
+    }
+
+    fn min_max_f64(max: bool, a: f64, b: f64) -> f64 {
+        let mut processor = fp_test_processor();
+        processor.set_dr_bits(DoubleReg::D1, a.to_bits());
+        processor.set_dr_bits(DoubleReg::D2, b.to_bits());
+        processor
+            .exec_vminmaxnm_f64(&VMinMaxNumParamsf64 {
+                dd: DoubleReg::D0,
+                dn: DoubleReg::D1,
+                dm: DoubleReg::D2,
+                max,
+            })
+            .unwrap();
+        f64::from_bits(processor.get_dr_bits(DoubleReg::D0))
+    }
+
+    fn min_max_f32(max: bool, a: f32, b: f32) -> f32 {
+        let mut processor = fp_test_processor();
+        processor.set_sr(SingleReg::S1, a.to_bits());
+        processor.set_sr(SingleReg::S2, b.to_bits());
+        processor
+            .exec_vminmaxnm_f32(&VMinMaxNumParamsf32 {
+                sd: SingleReg::S0,
+                sn: SingleReg::S1,
+                sm: SingleReg::S2,
+                max,
+            })
+            .unwrap();
+        f32::from_bits(processor.get_sr(SingleReg::S0))
+    }
+
+    #[test]
+    fn test_vmaxnm_and_vminnm_pick_from_the_right_registers() {
+        assert_eq!(min_max_f64(true, 1.5, -2.0), 1.5);
+        assert_eq!(min_max_f64(true, -2.0, 1.5), 1.5);
+        assert_eq!(min_max_f64(false, 1.5, -2.0), -2.0);
+        assert_eq!(min_max_f64(false, -2.0, 1.5), -2.0);
+        assert_eq!(min_max_f32(true, 1.5, -2.0), 1.5);
+        assert_eq!(min_max_f32(true, -2.0, 1.5), 1.5);
+        assert_eq!(min_max_f32(false, 1.5, -2.0), -2.0);
+        assert_eq!(min_max_f32(false, -2.0, 1.5), -2.0);
+    }
+
+    #[test]
+    fn test_vmaxnm_and_vminnm_return_the_number_for_a_quiet_nan() {
+        assert_eq!(min_max_f64(true, f64::NAN, 4.0), 4.0);
+        assert_eq!(min_max_f64(false, 4.0, f64::NAN), 4.0);
+        assert_eq!(min_max_f32(true, f32::NAN, -4.0), -4.0);
+        assert_eq!(min_max_f32(false, -4.0, f32::NAN), -4.0);
+    }
+
+    #[test]
+    fn test_vmaxnm_and_vminnm_order_the_zeros() {
+        assert_eq!(min_max_f64(true, -0.0, 0.0).to_bits(), 0.0f64.to_bits());
+        assert_eq!(min_max_f64(false, 0.0, -0.0).to_bits(), (-0.0f64).to_bits());
+        assert_eq!(min_max_f32(true, 0.0, -0.0).to_bits(), 0.0f32.to_bits());
+        assert_eq!(min_max_f32(false, -0.0, 0.0).to_bits(), (-0.0f32).to_bits());
+    }
+
+    #[test]
+    fn test_vfnma_f32() {
+        // -(10) + (-(2)) * 3
+        let mut processor = fp_test_processor();
+        processor.set_sr(SingleReg::S0, 10.0f32.to_bits());
+        processor.set_sr(SingleReg::S5, 2.0f32.to_bits());
+        processor.set_sr(SingleReg::S14, 3.0f32.to_bits());
+        processor
+            .exec_vfnma_f32(&VAddSubParamsf32 {
+                sd: SingleReg::S0,
+                sn: SingleReg::S5,
+                sm: SingleReg::S14,
+            })
+            .unwrap();
+        assert_eq!(processor.get_sr(SingleReg::S0), (-16.0f32).to_bits());
+    }
+
+    #[test]
+    fn test_vfnma_f64() {
+        let mut processor = fp_test_processor();
+        processor.set_dr_bits(DoubleReg::D0, 10.0f64.to_bits());
+        processor.set_dr_bits(DoubleReg::D5, 2.0f64.to_bits());
+        processor.set_dr_bits(DoubleReg::D14, 3.0f64.to_bits());
+        processor
+            .exec_vfnma_f64(&VAddSubParamsf64 {
+                dd: DoubleReg::D0,
+                dn: DoubleReg::D5,
+                dm: DoubleReg::D14,
+            })
+            .unwrap();
+        assert_eq!(processor.get_dr_bits(DoubleReg::D0), (-16.0f64).to_bits());
+    }
+
+    #[test]
+    fn test_vfnma_is_fused() {
+        // (1 + 2^-30)^2 is 1 + 2^-29 + 2^-60, and a double cannot hold the last term. With the
+        // product rounded before the add, taking 1 + 2^-29 off it leaves nothing. Fused, it
+        // leaves 2^-60.
+        let a = 1.0 + 2f64.powi(-30);
+        let mut processor = fp_test_processor();
+        processor.set_dr_bits(DoubleReg::D0, (1.0 + 2f64.powi(-29)).to_bits());
+        processor.set_dr_bits(DoubleReg::D1, (-a).to_bits());
+        processor.set_dr_bits(DoubleReg::D2, a.to_bits());
+        processor
+            .exec_vfnma_f64(&VAddSubParamsf64 {
+                dd: DoubleReg::D0,
+                dn: DoubleReg::D1,
+                dm: DoubleReg::D2,
+            })
+            .unwrap();
+        assert_eq!(
+            processor.get_dr_bits(DoubleReg::D0),
+            2f64.powi(-60).to_bits()
+        );
+    }
+
+    #[test]
+    fn test_vfnma_f32_matches_the_host_fused_multiply_add() {
+        let values = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.5,
+            3.25,
+            1e20,
+            -1e-20,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        for d in values {
+            for n in values {
+                for m in values {
+                    let mut processor = fp_test_processor();
+                    processor.set_sr(SingleReg::S0, d.to_bits());
+                    processor.set_sr(SingleReg::S1, n.to_bits());
+                    processor.set_sr(SingleReg::S2, m.to_bits());
+                    processor
+                        .exec_vfnma_f32(&VAddSubParamsf32 {
+                            sd: SingleReg::S0,
+                            sn: SingleReg::S1,
+                            sm: SingleReg::S2,
+                        })
+                        .unwrap();
+                    let expected = (-n).mul_add(m, -d);
+                    let result = f32::from_bits(processor.get_sr(SingleReg::S0));
+                    if expected.is_nan() {
+                        assert!(result.is_nan(), "{d} {n} {m}");
+                    } else {
+                        assert_eq!(result.to_bits(), expected.to_bits(), "{d} {n} {m}");
+                    }
+                }
+            }
+        }
+    }
+
+    // Converts a double to an integer with the named rounding, the way VCVTA and its kin do.
+    fn vcvt_f64_to_integer(rounding: FPRounding, unsigned: bool, x: f64) -> u32 {
+        let mut processor = fp_test_processor();
+        processor.set_dr_bits(DoubleReg::D3, x.to_bits());
+        processor
+            .exec_vcvt(&VCVTParams {
+                d: ExtensionReg::Single { reg: SingleReg::S8 },
+                m: ExtensionReg::Double { reg: DoubleReg::D3 },
+                to_integer: true,
+                unsigned,
+                dp_operation: true,
+                rounding: Some(rounding),
+            })
+            .unwrap();
+        processor.get_sr(SingleReg::S8)
+    }
+
+    fn vcvt_f32_to_integer(rounding: FPRounding, unsigned: bool, x: f32) -> u32 {
+        let mut processor = fp_test_processor();
+        processor.set_sr(SingleReg::S3, x.to_bits());
+        processor
+            .exec_vcvt(&VCVTParams {
+                d: ExtensionReg::Single { reg: SingleReg::S8 },
+                m: ExtensionReg::Single { reg: SingleReg::S3 },
+                to_integer: true,
+                unsigned,
+                dp_operation: false,
+                rounding: Some(rounding),
+            })
+            .unwrap();
+        processor.get_sr(SingleReg::S8)
+    }
+
+    #[test]
+    fn test_vcvt_to_integer_rounds_as_named() {
+        for rounding in ALL_ROUNDINGS {
+            for x in [
+                2.5f64,
+                -2.5,
+                3.5,
+                0.4,
+                -0.4,
+                2.7,
+                -2.7,
+                1e10,
+                -1e10,
+                f64::NAN,
+            ] {
+                let rounded = host_rint64(x, rounding);
+                assert_eq!(
+                    vcvt_f64_to_integer(rounding, false, x),
+                    rounded as i32 as u32,
+                    "{rounding:?} {x} signed"
+                );
+                assert_eq!(
+                    vcvt_f64_to_integer(rounding, true, x),
+                    rounded as u32,
+                    "{rounding:?} {x} unsigned"
+                );
+                let single = x as f32;
+                let rounded = host_rint32(single, rounding);
+                assert_eq!(
+                    vcvt_f32_to_integer(rounding, false, single),
+                    rounded as i32 as u32,
+                    "{rounding:?} {single} signed"
+                );
+                assert_eq!(
+                    vcvt_f32_to_integer(rounding, true, single),
+                    rounded as u32,
+                    "{rounding:?} {single} unsigned"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_vcvtr_uses_the_fpscr_rounding_mode() {
         let mut processor = fp_test_processor();
         processor
             .fpscr
-            .set_rounding_mode(crate::core::fpregister::FPSCRRounding::RoundTowardsPlusInfinity);
-
-        processor.set_sr(SingleReg::S15, (-2.9f32).to_bits());
+            .set_rounding_mode(FPSCRRounding::RoundTowardsMinusInfinity);
+        processor.set_sr(SingleReg::S3, 2.9f32.to_bits());
         processor
-            .exec_vrintz_f32(VMovRegParamsf32 {
-                sd: SingleReg::S14,
-                sm: SingleReg::S15,
+            .exec_vcvt(&VCVTParams {
+                d: ExtensionReg::Single { reg: SingleReg::S8 },
+                m: ExtensionReg::Single { reg: SingleReg::S3 },
+                to_integer: true,
+                unsigned: false,
+                dp_operation: false,
+                rounding: None,
             })
             .unwrap();
+        assert_eq!(processor.get_sr(SingleReg::S8), 2);
 
-        assert_eq!(processor.get_sr(SingleReg::S14), (-2.0f32).to_bits());
+        processor.set_sr(SingleReg::S3, (-2.1f32).to_bits());
+        processor
+            .exec_vcvt(&VCVTParams {
+                d: ExtensionReg::Single { reg: SingleReg::S8 },
+                m: ExtensionReg::Single { reg: SingleReg::S3 },
+                to_integer: true,
+                unsigned: false,
+                dp_operation: false,
+                rounding: None,
+            })
+            .unwrap();
+        assert_eq!(processor.get_sr(SingleReg::S8) as i32, -3);
     }
 
     #[test]
@@ -1374,12 +1852,223 @@ mod tests {
                 to_integer: true,
                 unsigned: false,
                 dp_operation: true,
-                round_zero: true,
-                round_nearest: false,
+                rounding: Some(FPRounding::Zero),
             })
             .unwrap();
 
         assert_eq!(processor.get_sr(SingleReg::S8), 5);
+    }
+
+    // vcvt of a single or a double register in place, to or from fixed point.
+    fn vcvt_fixed(
+        reg: ExtensionReg,
+        to_fixed: bool,
+        unsigned: bool,
+        size: u8,
+        fraction_bits: u8,
+    ) -> VCVTFixedParams {
+        VCVTFixedParams {
+            reg,
+            to_fixed,
+            unsigned,
+            size,
+            fraction_bits,
+        }
+    }
+
+    const FIXED_FLOATS: [f64; 14] = [
+        0.0,
+        -0.0,
+        0.5,
+        1.5,
+        -1.5,
+        2.7,
+        100.3,
+        -100.3,
+        40000.5,
+        -40000.5,
+        1e10,
+        -1e10,
+        f64::INFINITY,
+        f64::NAN,
+    ];
+
+    // The result the host gives for a float turned into a fixed-point number of `size` bits,
+    // truncating: its `as` casts saturate, and send a NaN to zero.
+    fn host_to_fixed(x: f64, size: u8, fraction_bits: u8, unsigned: bool) -> u64 {
+        let scaled = (x * 2f64.powi(i32::from(fraction_bits))).trunc();
+        match (size, unsigned) {
+            (16, false) => scaled as i16 as i64 as u64,
+            (16, true) => u64::from(scaled as u16),
+            (_, false) => scaled as i32 as i64 as u64,
+            (_, true) => u64::from(scaled as u32),
+        }
+    }
+
+    #[test]
+    fn test_vcvt_f32_to_fixed_truncates_and_saturates() {
+        for size in [16, 32] {
+            for unsigned in [false, true] {
+                for fraction_bits in [1, 5, size / 2, size] {
+                    for x in FIXED_FLOATS {
+                        let reg = ExtensionReg::Single { reg: SingleReg::S6 };
+                        let mut processor = fp_test_processor();
+                        processor.set_sr(SingleReg::S6, (x as f32).to_bits());
+                        processor
+                            .exec_vcvt_fixed(&vcvt_fixed(reg, true, unsigned, size, fraction_bits))
+                            .unwrap();
+                        // The 32-bit register holds the result extended to its width.
+                        let expected =
+                            host_to_fixed(f64::from(x as f32), size, fraction_bits, unsigned);
+                        assert_eq!(
+                            processor.get_sr(SingleReg::S6),
+                            expected as u32,
+                            "{x} size {size} fbits {fraction_bits} unsigned {unsigned}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_vcvt_f64_to_fixed_truncates_and_saturates() {
+        for size in [16, 32] {
+            for unsigned in [false, true] {
+                for fraction_bits in [1, 5, size / 2, size] {
+                    for x in FIXED_FLOATS {
+                        let reg = ExtensionReg::Double { reg: DoubleReg::D6 };
+                        let mut processor = fp_test_processor();
+                        processor.set_dr_bits(DoubleReg::D6, x.to_bits());
+                        processor
+                            .exec_vcvt_fixed(&vcvt_fixed(reg, true, unsigned, size, fraction_bits))
+                            .unwrap();
+                        // The 64-bit register holds the result extended to its width.
+                        assert_eq!(
+                            processor.get_dr_bits(DoubleReg::D6),
+                            host_to_fixed(x, size, fraction_bits, unsigned),
+                            "{x} size {size} fbits {fraction_bits} unsigned {unsigned}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    const FIXED_INTEGERS: [u32; 10] = [
+        0,
+        1,
+        0xFFFF_FFFF,
+        0x7FFF,
+        0x8000,
+        0xFFFF,
+        0x1_2345,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0x8765_4321,
+    ];
+
+    // The number the register holds when it is read as fixed point: the low `size` bits, as a
+    // signed or an unsigned integer.
+    fn host_fixed_value(raw: u32, size: u8, unsigned: bool) -> f64 {
+        match (size, unsigned) {
+            (16, false) => f64::from(raw as u16 as i16),
+            (16, true) => f64::from(raw as u16),
+            (_, false) => f64::from(raw as i32),
+            (_, true) => f64::from(raw),
+        }
+    }
+
+    #[test]
+    fn test_vcvt_f32_from_fixed_rounds_to_nearest() {
+        for size in [16, 32] {
+            for unsigned in [false, true] {
+                for fraction_bits in [1, 5, size / 2, size] {
+                    for raw in FIXED_INTEGERS {
+                        let reg = ExtensionReg::Single { reg: SingleReg::S6 };
+                        let mut processor = fp_test_processor();
+                        processor.set_sr(SingleReg::S6, raw);
+                        processor
+                            .exec_vcvt_fixed(&vcvt_fixed(reg, false, unsigned, size, fraction_bits))
+                            .unwrap();
+                        // Exact in a double, and rounded once, to a single.
+                        let expected = (host_fixed_value(raw, size, unsigned)
+                            / 2f64.powi(i32::from(fraction_bits)))
+                            as f32;
+                        assert_eq!(
+                            processor.get_sr(SingleReg::S6),
+                            expected.to_bits(),
+                            "{raw:#x} size {size} fbits {fraction_bits} unsigned {unsigned}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_vcvt_f64_from_fixed_reads_the_low_word() {
+        for size in [16, 32] {
+            for unsigned in [false, true] {
+                for fraction_bits in [1, 5, size / 2, size] {
+                    for raw in FIXED_INTEGERS {
+                        let reg = ExtensionReg::Double { reg: DoubleReg::D6 };
+                        let mut processor = fp_test_processor();
+                        // The high word is not part of the operand.
+                        processor.set_dr(DoubleReg::D6, raw, 0xDEAD_BEEF);
+                        processor
+                            .exec_vcvt_fixed(&vcvt_fixed(reg, false, unsigned, size, fraction_bits))
+                            .unwrap();
+                        let expected = host_fixed_value(raw, size, unsigned)
+                            / 2f64.powi(i32::from(fraction_bits));
+                        assert_eq!(
+                            processor.get_dr_bits(DoubleReg::D6),
+                            expected.to_bits(),
+                            "{raw:#x} size {size} fbits {fraction_bits} unsigned {unsigned}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_vcvt_to_fixed_ignores_the_fpscr_rounding_mode() {
+        let mut processor = fp_test_processor();
+        processor
+            .fpscr
+            .set_rounding_mode(FPSCRRounding::RoundTowardsPlusInfinity);
+        processor.set_sr(SingleReg::S6, 2.1f32.to_bits());
+        processor
+            .exec_vcvt_fixed(&vcvt_fixed(
+                ExtensionReg::Single { reg: SingleReg::S6 },
+                true,
+                false,
+                32,
+                0,
+            ))
+            .unwrap();
+        assert_eq!(processor.get_sr(SingleReg::S6), 2);
+    }
+
+    #[test]
+    fn test_vcvt_from_fixed_ignores_the_fpscr_rounding_mode() {
+        // 2^24 + 1 is half way between two singles; to nearest, ties to even, it is 2^24.
+        let mut processor = fp_test_processor();
+        processor
+            .fpscr
+            .set_rounding_mode(FPSCRRounding::RoundTowardsPlusInfinity);
+        processor.set_sr(SingleReg::S6, (1 << 24) + 1);
+        processor
+            .exec_vcvt_fixed(&vcvt_fixed(
+                ExtensionReg::Single { reg: SingleReg::S6 },
+                false,
+                false,
+                32,
+                0,
+            ))
+            .unwrap();
+        assert_eq!(processor.get_sr(SingleReg::S6), 16_777_216.0f32.to_bits());
     }
 
     #[test]
