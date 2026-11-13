@@ -1,6 +1,7 @@
 mod args;
 mod script;
 mod terminal;
+mod window;
 
 use std::cell::RefCell;
 use std::fmt;
@@ -18,6 +19,7 @@ use cmm2_core::{
 };
 use script::Script;
 use terminal::RawMode;
+use window::{Window, WindowError};
 
 /// How many unmapped accesses the summary lists; the count covers all of them.
 const UNMAPPED_SHOWN: usize = 5;
@@ -46,8 +48,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Vectors(path) => finish(show_vectors(&path)),
-        Command::Run { firmware, options } if options.console => {
-            finish(run_console(&firmware, options))
+        Command::Run { firmware, options } if options.console || options.window => {
+            finish(run_live(&firmware, options))
         }
         Command::Run { firmware, options } => finish(run_firmware(&firmware, &options)),
     }
@@ -76,6 +78,7 @@ enum RunError {
     },
     Write(io::Error),
     Console(io::Error),
+    Window(WindowError),
     /// There is no screen to take a picture of.
     Frame(FrameError),
     Screenshot {
@@ -95,6 +98,7 @@ impl fmt::Display for RunError {
             RunError::Trace { path, source } => write!(f, "{path}: {source}"),
             RunError::Write(err) => write!(f, "writing the trace: {err}"),
             RunError::Console(err) => write!(f, "writing the console output: {err}"),
+            RunError::Window(err) => err.fmt(f),
             RunError::Frame(err) => write!(f, "no screenshot: {err}"),
             RunError::Screenshot { path, source } => write!(f, "{path}: {source}"),
             RunError::Fault(description) => f.write_str(description),
@@ -229,16 +233,23 @@ fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
     Ok(ok)
 }
 
-/// Runs with the console on the host terminal until the quit key, the limit, `--stop-at` or a
-/// fault. The summary is left out, as the screen belongs to the guest.
-fn run_console(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
+/// Runs with the console on the host terminal and the screen in a window, as asked, until the
+/// quit key, the window is closed, the limit, `--stop-at` or a fault. The summary is left out,
+/// as the screen belongs to the guest. Without `--console` the guest's output is printed at the
+/// end.
+fn run_live(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
     let Machine {
         mut cpu,
         console,
         trace,
     } = build_machine(path, &options)?;
-    let _raw = RawMode::enable();
-    let keys = read_stdin();
+    let mut window = options
+        .window
+        .then(Window::open)
+        .transpose()
+        .map_err(RunError::Window)?;
+    let _raw = options.console.then(RawMode::enable);
+    let keys = options.console.then(read_stdin);
     let mut script = Script::new(std::mem::take(&mut options.on));
     let limit = options.run.unwrap_or(u64::MAX);
     let mut stdout = io::stdout();
@@ -247,22 +258,36 @@ fn run_console(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
     let result = loop {
         let budget = limit.saturating_sub(cpu.instruction_count()).min(SLICE);
         let stop = run_slice(&mut cpu, &options, trace.as_ref(), budget);
-        if let Err(err) = show_output(&console, &mut script, &mut stdout) {
+        if keys.is_some()
+            && let Err(err) = show_output(&console, &mut script, &mut stdout)
+        {
             break Err(RunError::Console(err));
         }
         resets = report_resets(&cpu, resets);
+        if let Some(window) = &mut window {
+            match window.update(|| cpu.memory().frame()) {
+                Ok(true) => {}
+                Ok(false) => break Ok(true),
+                Err(err) => break Err(RunError::Window(err)),
+            }
+        }
         match stop {
             Stop::Fault(fault) => break Err(RunError::Fault(fault.description)),
             Stop::Address(_) => break Ok(true),
             Stop::InstructionLimit if cpu.instruction_count() >= limit => break Ok(true),
             Stop::InstructionLimit => {}
         }
-        if !send_keys(&console, &keys) {
+        if let Some(keys) = &keys
+            && !send_keys(&console, keys)
+        {
             break Ok(true);
         }
     };
     finish_trace(trace)?;
     let ok = result?;
+    if keys.is_none() {
+        print_console(&console);
+    }
     write_screenshot(&mut cpu, &options)?;
     Ok(ok)
 }

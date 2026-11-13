@@ -47,11 +47,13 @@ fn no_arguments_prints_usage() {
     );
 }
 
-const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>]";
+const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window]";
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
         .args(args)
+        // The window tests have no display to open on.
+        .env("SDL_VIDEODRIVER", "dummy")
         .output()
         .expect("failed to run cmm2-emulator")
 }
@@ -301,6 +303,37 @@ fn screenshot_writes_the_screen_as_a_ppm_file() {
         b"P6\n1 1\n255\n\xFF\x00\x00"
     );
     std::fs::remove_file(&image).unwrap();
+}
+
+#[test]
+fn window_shows_the_screen_and_ends_with_the_run() {
+    let output = run_program("window", &SCREEN, &["--window", "--run", "40"]);
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn window_says_once_that_there_is_no_picture() {
+    let output = run_program("window-blank", &THREE, &["--window", "--run", "400000"]);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "cmm2-emulator: no picture: the LTDC is not enabled\n"
+    );
+}
+
+#[test]
+fn window_goes_with_the_console() {
+    let output = run_program(
+        "window-console",
+        &SCREEN,
+        &["--window", "--console", "--run", "40"],
+    );
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
 }
 
 #[test]

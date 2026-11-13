@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>]";
+pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -29,6 +29,8 @@ pub struct RunOptions {
     pub on: Vec<OnRule>,
     /// Where to write the screen as a PPM file when the run ends.
     pub screenshot: Option<String>,
+    /// Show the screen in a window while the guest runs.
+    pub window: bool,
 }
 
 /// Keys to send once the guest has printed some text.
@@ -102,14 +104,18 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, ArgError
             }
             check_console(&options)?;
             check_trace_from(&options)?;
-            if !options.console && options.run.is_none() && options.stop_at.is_none() {
+            if !options.console
+                && !options.window
+                && options.run.is_none()
+                && options.stop_at.is_none()
+            {
                 return Err(ArgError::NothingToRun);
             }
             Ok(Command::Run { firmware, options })
         }
         Some(
             option @ ("--run" | "--stop-at" | "--trace" | "--trace-mmio" | "--trace-from"
-            | "--console" | "--on" | "--screenshot"),
+            | "--console" | "--on" | "--screenshot" | "--window"),
         ) => Err(ArgError::NeedsFirmware(option.to_string())),
         Some(arg) => Err(ArgError::Unknown(arg.to_string())),
     }
@@ -129,6 +135,7 @@ fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOption
                 options.trace_from = Some(parse_count(&args.next().ok_or(ArgError::Usage)?)?)
             }
             "--console" => options.console = true,
+            "--window" => options.window = true,
             "--screenshot" => options.screenshot = Some(args.next().ok_or(ArgError::Usage)?),
             "--on" => {
                 let text = args.next().ok_or(ArgError::Usage)?;
@@ -324,6 +331,36 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn window_runs_without_a_limit() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--window"]),
+            Ok(Command::Run {
+                firmware: "f".into(),
+                options: RunOptions {
+                    window: true,
+                    ..RunOptions::default()
+                }
+            })
+        );
+        assert!(!run_options(&["--run", "9"]).window);
+    }
+
+    #[test]
+    fn window_needs_the_firmware() {
+        assert_eq!(
+            parse_args(&["--window"]),
+            Err(ArgError::NeedsFirmware("--window".into()))
+        );
+    }
+
+    #[test]
+    fn window_goes_with_the_console_and_a_limit() {
+        let options = run_options(&["--window", "--console", "--run", "9"]);
+        assert!(options.window && options.console);
+        assert_eq!(options.run, Some(9));
     }
 
     #[test]

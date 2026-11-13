@@ -76,6 +76,11 @@ cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --run 260000000 \
     --on "Keyboard type" "1"
 ```
 
+To see the screen, add `--window`. It opens an SDL window that shows what the firmware has drawn
+and scales it to fit, and closing the window ends the run. It works with or without `--console`
+(without it the run goes on until the window is closed, or `--run` or `--stop-at` ends it).
+Building needs the SDL2 development files (`libsdl2-dev` on Debian and Ubuntu).
+
 ## Firmware and documentation are not included
 
 You supply your own copy of the official firmware. This repository does not contain the firmware
