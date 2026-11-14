@@ -201,11 +201,7 @@ impl IsaStatusRegister for Processor {
 
     #[cfg(feature = "armv6m")]
     fn exec_cps(&mut self, im: bool) -> ExecuteResult {
-        if im {
-            self.primask = true;
-        } else {
-            self.primask = false;
-        }
+        self.primask = im;
         self.execution_priority = self.get_execution_priority();
         Ok(ExecuteSuccess::Taken { cycles: 1 })
     }

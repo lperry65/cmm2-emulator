@@ -13,6 +13,7 @@ use crate::{FP_MVFR0_RESET, FP_MVFR1_RESET, FP_MVFR2_RESET};
 use crate::core::register::Ipsr;
 
 // Configuration Control Register bit positions
+#[cfg(not(feature = "armv6m"))]
 pub(crate) const CCR_NONBASETHRDENA: usize = 0;
 #[allow(dead_code)]
 const CCR_USERSETMPEND: usize = 1;
@@ -55,6 +56,8 @@ const SHCSR_USGFAULTENA: u32 = 1 << 18;
 // Debug Exception and Monitor Control Register bit positions
 #[cfg(feature = "has-fp")]
 pub(crate) const DEMCR_MON_EN: usize = 16;
+#[cfg(not(feature = "armv6m"))]
+const DEMCR_MON_PEND: u32 = 1 << 17;
 
 // Floating-Point Context Control Register bit positions
 #[cfg(feature = "has-fp")]
@@ -673,6 +676,18 @@ impl SystemControlBlock for Processor {
     }
 
     fn write_demcr(&mut self, value: u32) {
+        // A write of MON_PEND = 1 pends the DebugMonitor, whatever MON_EN is; a write of 0 removes
+        // the pending exception (C1-689). ARMv6-M has no DebugMonitor.
+        #[cfg(not(feature = "armv6m"))]
+        {
+            use crate::core::exception::{Exception, ExceptionHandling};
+            let was_pended = self.demcr & DEMCR_MON_PEND != 0;
+            if value & DEMCR_MON_PEND != 0 && !was_pended {
+                self.set_exception_pending(Exception::DebugMonitor);
+            } else if value & DEMCR_MON_PEND == 0 && was_pended {
+                self.clear_pending_exception(Exception::DebugMonitor);
+            }
+        }
         self.demcr = value;
     }
 

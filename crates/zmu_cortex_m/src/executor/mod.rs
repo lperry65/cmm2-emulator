@@ -190,6 +190,7 @@ impl Processor {
     }
 
     #[cfg(feature = "armv6m")]
+    #[allow(clippy::unused_self)] // the armv7 build needs the processor
     fn fault_delivery_exception(&mut self, fault: Fault) -> Exception {
         fault.exception()
     }
@@ -853,7 +854,8 @@ impl Executor for Processor {
         if (self.syst_csr & 1) != 0 {
             self.syst_step(count);
         }
-        if self.pending_exception_count != 0 || self.sleeping {
+        // a halt into a debugger takes no exception in the same step
+        if (self.pending_exception_count != 0 || self.sleeping) && !self.debug_halt {
             self.check_exceptions();
         }
         //TODO exception entry also burns cycles that should be accounted for

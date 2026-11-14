@@ -30,7 +30,10 @@ impl IsaException for Processor {
         if self.condition_passed() {
             // SVCall has to be able to preempt what runs (PRIMASK, BASEPRI and FAULTMASK count);
             // if it cannot, the SVC is a forced HardFault, which is a lockup below priority 0.
-            // the IT state stacked is the one after the SVC, like the return address
+            // The IT state stacked is the one after the SVC, like the return address
+            // (ReturnAddress(), B1.5.6, p. B1-534). If the entry fails while stacking, the
+            // derived fault stacks the SVC's own address, so the IT state goes back.
+            let it_before = self.itstate;
             self.it_advance();
             if self.get_exception_priority(Exception::SVCall) >= self.get_execution_priority() {
                 // an escalated fault keeps the return address of the original: for SVCall it is
@@ -42,7 +45,10 @@ impl IsaException for Processor {
                 return Err(Fault::Forced);
             }
             let return_address = self.get_pc().wrapping_add(2);
-            self.exception_entry(Exception::SVCall, return_address)?;
+            if let Err(fault) = self.exception_entry(Exception::SVCall, return_address) {
+                self.itstate = it_before;
+                return Err(fault);
+            }
             return Ok(ExecuteSuccess::Branched { cycles: 12 });
         }
         Ok(ExecuteSuccess::NotTaken)
@@ -83,7 +89,7 @@ impl IsaException for Processor {
                 && self.get_exception_priority(Exception::DebugMonitor)
                     < self.get_execution_priority()
             {
-                // MON_PEND is set by the event and cleared when the exception is taken (C1-693),
+                // MON_PEND is set by the event and cleared when the exception is taken (C1-694 for the event, C1-689 for the bit),
                 // which is at once here
                 let return_address = self.get_pc();
                 self.exception_entry(Exception::DebugMonitor, return_address)?;

@@ -182,11 +182,12 @@ impl Simulation {
         } else if self.processor.sleeping {
             self.processor.step_sleep();
         }
+        // a BKPT in the guest halts into the debugger; the halt is consumed here
+        let halted = std::mem::take(&mut self.processor.debug_halt);
         if let Some(context) = self.processor.take_pending_fault_trap() {
             return SimulationEvent::FaultTrap(context);
         }
-        // a BKPT in the guest halts into the debugger
-        if std::mem::take(&mut self.processor.debug_halt) {
+        if halted {
             return SimulationEvent::Break;
         }
         if self.breakpoints.contains(&self.processor.get_pc()) {
@@ -216,6 +217,7 @@ pub enum SimulationRunEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::exception::ExceptionHandling;
     use crate::core::register::Ipsr;
 
     // vector table (SP, reset), then `bkpt #0`, `nop`, `bkpt #0xab`
@@ -251,5 +253,43 @@ mod tests {
         simulation.processor.set_pc(0x0a);
         assert!(matches!(simulation.step(), SimulationEvent::DoneStep));
         assert_eq!(simulation.processor.get_pc(), 0x0c);
+    }
+
+    // A halt does not take a pending exception in the same step: the debugger sees the PC on the
+    // BKPT, and the exception is still pending.
+    #[test]
+    fn test_a_halt_does_not_take_a_pending_exception_in_the_same_step() {
+        let mut simulation = simulation_with_a_bkpt();
+        simulation
+            .processor
+            .set_exception_pending(crate::core::exception::Exception::PendSV);
+        assert!(matches!(simulation.step(), SimulationEvent::Break));
+        assert_eq!(simulation.processor.get_pc(), 0x08);
+        assert_eq!(simulation.processor.psr.get_isr_number(), 0);
+        assert!(
+            simulation
+                .processor
+                .exception_pending(crate::core::exception::Exception::PendSV)
+        );
+    }
+
+    // The halt is consumed when it is reported, also when a fault trap is reported with it.
+    #[test]
+    fn test_a_reported_halt_is_not_reported_again() {
+        use crate::core::exception::Exception;
+        use crate::core::fault::{Fault, FaultContext, FaultTrapReason};
+        let mut simulation = simulation_with_a_bkpt();
+        simulation.processor.debug_halt = true;
+        simulation
+            .processor
+            .set_pending_fault_trap_for_test(FaultContext {
+                trap_reason: FaultTrapReason::Fault,
+                fault: Fault::UndefInstr,
+                exception: Exception::UsageFault,
+                pc: 0,
+                active_exception: None,
+            });
+        assert!(matches!(simulation.step(), SimulationEvent::FaultTrap(_)));
+        assert!(!simulation.processor.debug_halt);
     }
 }

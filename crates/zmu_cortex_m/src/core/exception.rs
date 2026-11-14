@@ -17,7 +17,9 @@ use crate::core::reset::Reset;
 #[cfg(feature = "has-fp")]
 use crate::executor::FloatingPointChecks;
 use crate::peripheral::nvic::NVIC;
-use crate::peripheral::scb::{CCR_NONBASETHRDENA, CCR_STKALIGN};
+#[cfg(not(feature = "armv6m"))]
+use crate::peripheral::scb::CCR_NONBASETHRDENA;
+use crate::peripheral::scb::CCR_STKALIGN;
 #[cfg(feature = "has-fp")]
 use crate::peripheral::scb::{
     DEMCR_MON_EN, FPCCR_BFRDY, FPCCR_HFRDY, FPCCR_LSPACT, FPCCR_LSPEN, FPCCR_MMRDY, FPCCR_MONRDY,
@@ -291,6 +293,7 @@ pub enum Exception {
 
 impl Processor {
     /// CCR.NONBASETHRDENA. ARMv6-M has no such bit.
+    #[cfg_attr(feature = "armv6m", allow(clippy::unused_self))]
     fn nonbasethrdena(&self) -> bool {
         #[cfg(not(feature = "armv6m"))]
         {
@@ -377,7 +380,7 @@ impl ExceptionHandlingHelpers for Processor {
         self.control.sp_sel = false;
         // EPSR.IT<7:0> = Zeros(8) (ExceptionTaken(), B1.5.6, p. B1-533)
         self.itstate = 0;
-        // DEMCR.MON_PEND stays set until the DebugMonitor exception is taken (C1-693)
+        // DEMCR.MON_PEND stays set until the DebugMonitor exception is taken or a write clears it (C1-689)
         #[cfg(not(feature = "armv6m"))]
         if exception == Exception::DebugMonitor {
             self.demcr &= !(1 << 17);
@@ -839,7 +842,7 @@ impl ExceptionHandling for Processor {
                 }
                 0b1101 => {
                     // returning to thread using process stack
-                    if nested_activation != 1 && !self.ccr.get_bit(CCR_NONBASETHRDENA) {
+                    if nested_activation != 1 && !self.nonbasethrdena() {
                         return self
                             .invalid_exception_return(returning_exception_number, exc_return);
                     } else {
@@ -2572,8 +2575,8 @@ mod tests {
         assert_eq!(processor.read32(frame + 0x18), Ok(0x100));
     }
 
-    // C1.5, C1-693: a BKPT sets MON_PEND for the DebugMonitor it generates, and taking the
-    // exception clears it again; one that is escalated to HardFault never sets it.
+    // C1.5, C1-694: a BKPT sets MON_PEND for the DebugMonitor it generates, and taking the
+    // exception clears it again (C1-689); one that is escalated to HardFault never sets it.
     #[test]
     #[cfg(not(feature = "armv6m"))]
     fn test_bkpt_that_takes_the_debug_monitor_leaves_mon_pend_clear() {
@@ -2626,27 +2629,34 @@ mod tests {
         assert_eq!(processor.itstate, 0);
     }
 
-    // DEMCR.MON_PEND stays set until the DebugMonitor exception is taken or a write clears it
-    // (C1-693), so it is clear once the BKPT has taken the DebugMonitor.
+    // A software write of DEMCR.MON_PEND = 1 pends the DebugMonitor whatever MON_EN is, and it is
+    // taken by the usual priority rules; MON_PEND stays set until then, or until a write clears it
+    // (C1-689, and C1-694 for the event).
     #[test]
     #[cfg(not(feature = "armv6m"))]
-    fn test_mon_pend_stays_set_until_the_debug_monitor_is_taken() {
+    fn test_mon_pend_pends_the_debug_monitor_until_it_is_taken_or_cleared() {
+        // taken when its priority allows, and cleared by the entry
         let mut processor = Processor::new();
         processor.set_msp(0x2000_0200);
-        processor
-            .write32(0xE000_EDFC, (1 << 16) | (1 << 17))
-            .unwrap();
+        processor.execution_priority = processor.get_execution_priority();
+        processor.write32(0xE000_EDFC, 1 << 17).unwrap(); // MON_EN is 0
         assert_eq!(processor.demcr & (1 << 17), 1 << 17, "pended, not taken");
-        processor
-            .exception_entry(Exception::DebugMonitor, 0x100)
-            .unwrap();
+        processor.check_exceptions();
         assert_eq!(processor.psr.get_isr_number(), 12);
         assert_eq!(processor.demcr & (1 << 17), 0, "taken");
-        assert_eq!(
-            processor.demcr & (1 << 16),
-            1 << 16,
-            "MON_EN is not touched"
-        );
+
+        // not taken while a handler of the same priority runs: it stays pended, set
+        let mut processor = Processor::new();
+        processor.set_msp(0x2000_0200);
+        set_active_exception(&mut processor, Exception::SysTick);
+        processor.execution_priority = processor.get_execution_priority();
+        processor.write32(0xE000_EDFC, 1 << 17).unwrap();
+        processor.check_exceptions();
+        assert_eq!(processor.psr.get_isr_number(), 15);
+        assert_eq!(processor.demcr & (1 << 17), 1 << 17, "still pended");
+        // a write that clears it removes the pending exception
+        processor.write32(0xE000_EDFC, 0).unwrap();
+        assert!(!processor.exception_pending(Exception::DebugMonitor));
     }
 
     // A return to Handler mode with only that exception active is not refused for the nesting
@@ -2684,7 +2694,7 @@ mod tests {
     }
 
     // The IT state an SVC stacks is the one after the SVC, as ReturnAddress() is the next
-    // instruction (the note to PushStack, B1.5.6, p. B1-533).
+    // instruction (the note in ReturnAddress(), B1.5.6, p. B1-534).
     #[test]
     #[cfg(not(feature = "armv6m"))]
     fn test_an_svc_in_an_it_block_stacks_the_it_state_after_it() {
@@ -2722,5 +2732,27 @@ mod tests {
         let mut processor = Processor::new();
         processor.write32(0xE000_ED14, 1).unwrap();
         assert_eq!(processor.ccr & 1, 0);
+    }
+
+    // ITSTATE stacked is consistent with the stacked PC (ReturnAddress(), B1.5.6, p. B1-534): an
+    // SVC whose entry fails while stacking leaves the IT state before the SVC, as its own address
+    // is what the derived fault stacks.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_an_svc_whose_stacking_fails_stacks_the_it_state_of_the_svc() {
+        let mut processor = Processor::new();
+        processor.set_msp(0x2002_0010); // the frame straddles the end of SRAM
+        processor.set_pc(0x100);
+        processor.itstate = 0x0c; // ITE EQ
+        crate::core::register::Apsr::set_z_bit(&mut processor.psr, true);
+
+        processor.execute(&decode_16(0xdf00), 2);
+
+        assert_eq!(processor.psr.get_isr_number(), 3);
+        let frame = processor.get_msp();
+        assert_eq!(processor.read32(frame + 0x18), Ok(0x100));
+        let xpsr = processor.read32(frame + 0x1c).unwrap();
+        assert_eq!((xpsr >> 10) & 0x3f, 0x0c >> 2);
+        assert_eq!((xpsr >> 25) & 0x3, 0x0c & 0x3);
     }
 }

@@ -478,6 +478,11 @@ impl Processor {
         self.fault_trap_mode
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_pending_fault_trap_for_test(&mut self, context: FaultContext) {
+        self.pending_fault_trap = Some(context);
+    }
+
     /// Take the currently pending fault trap, if any.
     pub fn take_pending_fault_trap(&mut self) -> Option<FaultContext> {
         self.pending_fault_trap.take()

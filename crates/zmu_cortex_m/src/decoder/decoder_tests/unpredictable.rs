@@ -600,6 +600,11 @@ fn test_register_lists_follow_the_manual() {
     for opcode in [0xb402, 0xbc02, 0xc002, 0xc802, 0xb500, 0xbd00] {
         assert!(!is_udf_16(&decode_16(opcode)), "{opcode:#06x}");
     }
+    // LDM.W (A7.7.41 T2): one register, and write back with the base in the list
+    assert!(is_udf(&decode_32(0xe890_0002))); // ldm.w r0, {r1}
+    assert!(is_udf(&decode_32(0xe8b0_0003))); // ldm.w r0!, {r0, r1}
+    assert!(!is_udf(&decode_32(0xe890_0003))); // ldm.w r0, {r0, r1}
+    assert!(!is_udf(&decode_32(0xe8b0_0006))); // ldm.w r0!, {r1, r2}
     // r7 is in the 8-bit register_list of the 16-bit forms (A7.7.159 T1, A7.7.41 T1, A7.7.99 T1,
     // A7.7.101 T1)
     for (opcode, rn) in [(0xc080_u16, Reg::R0), (0xc1f0, Reg::R1)] {

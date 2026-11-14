@@ -236,24 +236,32 @@ The firmware needs a few things zmu does not do, so I changed the following.
   next instruction (ReturnAddress(), p. B1-534: "a fault that is escalated ... retains the
   ReturnAddress() value of the original fault"; the note is repeated at p. B1-529); I stacked the
   SVC itself. The IT state an SVC stacks (escalated or not) is the one after the SVC, to match
-  that return address (the note to PushStack, p. B1-533); it was the state before. BKPT with no
+  that return address (the note in ReturnAddress(), p. B1-534); it was the state before. If the
+  SVCall entry fails while stacking, the derived fault stacks the SVC's own address, so the IT
+  state is put back to what it was before the SVC. BKPT with no
   semihosting host is a debug event (C1.5, p. C1-694; B1.5.14, HardFault on breakpoint
   escalation): DFSR.BKPT is set, the DebugMonitor is taken if DEMCR.MON_EN is set and its group
-  priority is higher than the execution priority, and the event sets DEMCR.MON_PEND, which stays set until
-  the exception is taken or a write clears it (C1-693), so it reads 0 after the BKPT has entered
-  the DebugMonitor, and taking the DebugMonitor clears it (I did not touch it); otherwise it is a HardFault with HFSR.DEBUGEVT, a lockup below priority 0. The return
+  priority is higher than the execution priority, and otherwise it is a HardFault with HFSR.DEBUGEVT, a lockup
+  below priority 0. A debug event that generates the DebugMonitor sets DEMCR.MON_PEND (C1-694),
+  and MON_PEND stays set until the exception is taken or a write clears it (C1-689); the BKPT takes
+  the DebugMonitor at once, so the code does not set the bit for it and it reads 0 afterwards.
+  A software write of MON_PEND = 1 to DEMCR pends the DebugMonitor whatever MON_EN is (C1-689):
+  it is taken by the usual priority rules, taking it clears MON_PEND, and a write of 0 removes the
+  pending exception. The return
   address is the BKPT itself for both (ReturnAddress(), synchronous). DFSR bits are set when the event halts or
   generates an exception (C1-694), so DFSR.BKPT is set on the HardFault path too; only whether
   they are set for an event that is ignored or causes lockup is IMPLEMENTATION DEFINED. BKPT #0xab with no host is the same.
   ARMv6-M has no DebugMonitor (exception 12) and no DEMCR, but the core stores every bit of DEMCR,
-  so on an armv6m build BKPT never enters exception 12 now. With a GDB server attached, a BKPT
+  so on an armv6m build BKPT never enters exception 12 now, and a MON_PEND write pends nothing. With a GDB server attached, a BKPT
   (not #0xab when a semihosting function is installed, which it is for the servers built by
   `GdbServer::new`; with none, #0xab halts too) halts into the debugger: the simulation reports a breakpoint
   stop and DFSR.BKPT is set, and the PC stays on the BKPT, as it does when silicon halts in Debug
   state. A plain continue or step from there hits the same BKPT again, as it does on hardware;
   the debugger has to move the PC past it (GDB's `set $pc += 2`, which the server supports as a
   register write), and then continue and step go on. A BKPT that halts does not advance the IT
-  state, as it does not move the PC. It used to be a HardFault under the server. A stacking failure on the
+  state, as it does not move the PC, and takes no pending exception in that step (the debugger
+  sees the PC on the BKPT; the exception stays pending). The halt is consumed when the simulation
+  reports it. It used to be a HardFault under the server. A stacking failure on the
   entry of an exception is a lockup by the same rule as a fault (execution priority below 0), not
   by the IPSR. The xPSR that a refused return stacks holds only the fields the xPSR has (reserved
   bits 23:20, and GE without the DSP extension, are zero).
@@ -265,7 +273,8 @@ The firmware needs a few things zmu does not do, so I changed the following.
 - The 16-bit STM decoded only seven bits of its register list (`0b111_1111`), dropping r7 from
   every `stmia Rn!, {..., r7}` (`{r4-r7}` stored three words and wrote back 12). A7.7.159 T1 (p.
   A7-383) has an 8-bit list; fixed. The other list decoders (LDM T1, PUSH T1 with LR, POP T1 with
-  PC, the 32-bit forms) were checked and are right. STM.W and STMDB cannot have SP or PC in the
+  PC, the 32-bit forms) were checked and are right. LDM.W with fewer than two registers, or with
+  write back and the base in the list (A7.7.41 T2), is UDF in `decode_LDM_t2`, and has a test. STM.W and STMDB cannot have SP or PC in the
   list (the decode patterns have 0 in bits 15 and 13).
 - VCVT between floating-point and fixed-point: checked against A7.7.229 (p. A7-463, A7-464) and
   FixedToFP() (A2.5, FP conversions, pp. A2-58, A2-59): fixed to float rounds to nearest whatever
