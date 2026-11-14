@@ -46,7 +46,8 @@ RGB332 mode is index-to-colour through the CLUT), framebuffer 0x2400_0000, pitch
 Output is three 8-bit resistor ladders.
 
 The frame the model builds from this is in `boot-trace.md` (issue 36): what the firmware writes,
-and what is drawn and what is reported as unsupported.
+and what is drawn and what is reported as unsupported. Every other mode and depth, with PLL3
+and the frame rates, is in `video.md`.
 
 Interrupts: the firmware turns on the line interrupt (IRQ 88) at line 624, the one after the
 active area, and the main thread waits for it once a frame. It also enables the FIFO underrun and

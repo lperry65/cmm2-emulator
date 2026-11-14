@@ -93,7 +93,7 @@ impl Window {
             return Ok(true);
         }
         self.drawn = Some(Instant::now());
-        match frame() {
+        match frame().and_then(usable) {
             Ok(frame) => {
                 self.complaint.clear();
                 self.last = Some(frame);
@@ -158,38 +158,55 @@ impl Window {
         self.canvas.clear();
         if let Some(frame) = &self.last {
             let (width, height) = (frame.width as u32, frame.height as u32);
-            // The texture is made for each draw, as it borrows the texture creator and the
-            // picture can change size.
-            let mut texture =
-                sdl(self
-                    .textures
-                    .create_texture_streaming(PixelFormatEnum::RGB24, width, height))?;
-            sdl(texture.update(None, &frame.rgb, 3 * frame.width))?;
-            let (window_width, window_height) = sdl(self.canvas.output_size())?;
-            let target = fit((window_width, window_height), (width, height));
-            sdl(self.canvas.copy(&texture, None, target))?;
+            // A window with no room for the picture (minimised) has nothing to draw it in.
+            if let Some(target) = fit(sdl(self.canvas.output_size())?, (width, height)) {
+                // The texture is made for each draw, as it borrows the texture creator and the
+                // picture can change size.
+                let mut texture = sdl(self.textures.create_texture_streaming(
+                    PixelFormatEnum::RGB24,
+                    width,
+                    height,
+                ))?;
+                sdl(texture.update(None, &frame.rgb, 3 * frame.width))?;
+                sdl(self.canvas.copy(&texture, None, target))?;
+            }
         }
         self.canvas.present();
         Ok(())
     }
 }
 
-/// The largest rectangle with the picture's proportions that fits in the window, centred.
-fn fit(window: (u32, u32), picture: (u32, u32)) -> Rect {
+/// A frame is only a picture if it has a width and a height; a texture cannot have none.
+fn usable(frame: Frame) -> Result<Frame, FrameError> {
+    if frame.width == 0 || frame.height == 0 {
+        Err(FrameError::Empty)
+    } else {
+        Ok(frame)
+    }
+}
+
+/// The largest rectangle with the picture's proportions that fits in the window, centred, or
+/// `None` if the window or the picture has no size or the picture shrinks to nothing.
+fn fit(window: (u32, u32), picture: (u32, u32)) -> Option<Rect> {
     let (window_width, window_height) = (u64::from(window.0), u64::from(window.1));
     let (width, height) = (u64::from(picture.0), u64::from(picture.1));
+    if window_width == 0 || window_height == 0 || width == 0 || height == 0 {
+        return None;
+    }
     // Compare window_width / width with window_height / height, without dividing.
     let (fit_width, fit_height) = if window_width * height <= window_height * width {
         (window_width, window_width * height / width)
     } else {
         (window_height * width / height, window_height)
     };
-    Rect::new(
-        ((window_width - fit_width) / 2) as i32,
-        ((window_height - fit_height) / 2) as i32,
-        fit_width as u32,
-        fit_height as u32,
-    )
+    (fit_width > 0 && fit_height > 0).then(|| {
+        Rect::new(
+            ((window_width - fit_width) / 2) as i32,
+            ((window_height - fit_height) / 2) as i32,
+            fit_width as u32,
+            fit_height as u32,
+        )
+    })
 }
 
 /// Remembers which kind of error was last reported, so that the same one is said only once.
@@ -222,7 +239,8 @@ mod tests {
         SDL_RELEASED, SDL_Scancode, SDL_TextInputEvent, SDL_WindowEvent, SDL_WindowEventID,
     };
 
-    fn bounds(rect: Rect) -> (i32, i32, u32, u32) {
+    fn bounds(rect: Option<Rect>) -> (i32, i32, u32, u32) {
+        let rect = rect.unwrap();
         (rect.x(), rect.y(), rect.width(), rect.height())
     }
 
@@ -245,6 +263,38 @@ mod tests {
     #[test]
     fn a_window_smaller_than_the_picture_shrinks_it() {
         assert_eq!(bounds(fit((400, 400), (800, 600))), (0, 50, 400, 300));
+    }
+
+    #[test]
+    fn a_picture_or_a_window_with_no_size_is_not_fitted() {
+        for (window, picture) in [
+            ((800, 600), (0, 0)),
+            ((800, 600), (0, 480)),
+            ((800, 600), (640, 0)),
+            ((0, 0), (640, 480)),
+            ((0, 600), (640, 480)),
+            // A window so narrow that the picture shrinks to nothing.
+            ((1, 600), (640, 1)),
+        ] {
+            assert_eq!(fit(window, picture), None, "{window:?} {picture:?}");
+        }
+    }
+
+    #[test]
+    fn a_frame_with_no_width_or_no_height_is_not_a_picture() {
+        let empty = |width, height| Frame {
+            width,
+            height,
+            rgb: Vec::new(),
+        };
+        assert_eq!(usable(empty(0, 480)), Err(FrameError::Empty));
+        assert_eq!(usable(empty(640, 0)), Err(FrameError::Empty));
+        let frame = Frame {
+            width: 1,
+            height: 1,
+            rgb: vec![1, 2, 3],
+        };
+        assert_eq!(usable(frame.clone()), Ok(frame));
     }
 
     #[test]

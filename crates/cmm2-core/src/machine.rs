@@ -19,14 +19,21 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
     memory
         .map_peripheral(PWR_BASE, PWR_SIZE, Box::new(Pwr::new()))
         .expect("PWR window is clear of RAM");
+    let rcc = Rcc::new(memory.clock());
+    let pixel_clock = rcc.pixel_clock();
     memory
-        .map_peripheral(RCC_BASE, RCC_SIZE, Box::new(Rcc::new()))
+        .map_peripheral(RCC_BASE, RCC_SIZE, Box::new(rcc))
         .expect("RCC window is clear of RAM");
     memory
         .map_peripheral(
             LTDC_BASE,
             LTDC_SIZE,
-            Box::new(Ltdc::new(memory.clock(), memory.display(), irqs.clone())),
+            Box::new(Ltdc::new(
+                memory.clock(),
+                memory.display(),
+                irqs.clone(),
+                pixel_clock,
+            )),
         )
         .expect("LTDC window is clear of RAM");
     memory
@@ -130,7 +137,8 @@ mod tests {
         m.write32(0x5000_1094, 2); // LTDC_L1PFCR: RGB565
         m.write32(0x5000_1098, 0xFF); // LTDC_L1CACR
         m.write32(0x5000_10AC, 0xD000_0000); // LTDC_L1CFBAR
-        m.write32(0x5000_10B0, 1600 << 16); // LTDC_L1CFBLR
+        m.write32(0x5000_10B0, 1600 << 16 | 1607); // LTDC_L1CFBLR
+        m.write32(0x5000_10B4, 600); // LTDC_L1CFBLNR
         m.write32(0x5000_1024, 1); // LTDC_SRCR: IMR
         m.write16(0xD000_0000, 0xF800);
         let frame = m.frame().unwrap();
@@ -142,6 +150,11 @@ mod tests {
     fn the_ltdc_is_served_by_the_model() {
         let irqs = Irqs::new();
         let mut m = cmm2_memory(&irqs);
+        // The pixel clock the firmware programs for 800 x 600: 8 MHz x 99 / 16.
+        m.write32(0x5802_4428, 0x0010_1012); // RCC_PLLCKSELR
+        m.write32(0x5802_4440, 0x0F0F_1E62); // RCC_PLL3DIVR
+        m.write32(0x5802_442C, 0x013F_0CDD); // RCC_PLLCFGR
+        m.write32(0x5802_4400, 0x1501_1001); // RCC_CR
         m.write32(0x5000_1040, 0x270); // LTDC_LIPCR
         m.write32(0x5000_1014, 0x041F_0270); // LTDC_TWCR
         m.write32(0x5000_1018, 1); // LTDC_GCR: LTDCEN

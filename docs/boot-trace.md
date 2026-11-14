@@ -326,12 +326,11 @@ shows the MaxiMite logo, the banner (`480MHz Colour Maximite 2 G2`, `MMBasic Ver
 them. Some time later (640 million instructions) the status line along the bottom row appears in
 dark orange: `A:/`, `Check Disk` and the clock.
 
-Not drawn, and reported as `FrameError::Unsupported` rather than drawn wrong: layer 2, colour
-keying, constant alpha below 255, L8 without the colour table, and every pixel format with an
-alpha channel (ARGB8888, ARGB1555, ARGB4444, AL44, AL88). L8, RGB565 and RGB888 are drawn. The
-default colour (`L1DCCR`), the blending factors and the CLUT alpha are not used, as the firmware
-sets the layer opaque. `--screenshot <file>` on the emulator writes the frame as a PPM at the
-end of a run.
+The other depths, layer 2, blending and the frame timing from PLL3 (issue 58) are in
+[video.md](video.md). Still reported as `FrameError::Unsupported` rather than drawn wrong:
+colour keying, L8 without the colour table, AL44 and AL88, blending factors the firmware
+does not set, and a window wider than the line the layer fetches (`CFBLL`). `--screenshot <file>` on the emulator writes the frame as a PPM at the end of a
+run.
 
 ## Where it blocks now
 

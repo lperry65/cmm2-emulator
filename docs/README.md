@@ -8,6 +8,7 @@ Project documentation lives here as markdown.
 - `decisions/`: short records of design decisions and the evidence for them.
 - `boot-trace.md`: what the real firmware does at boot (written in iteration 1).
 - [sd-card.md](sd-card.md): how the firmware drives the SD card (SPI mode) and the card model.
+- [video.md](video.md): the video modes, PLL3 and the frame rates, layers, blending and page flips.
 - [usb-host.md](usb-host.md): how the firmware's USB host stack sees a keyboard, and the plan to emulate it.
 
 Local copies of manuals, schematics and firmware are kept in `reference/`, which is not tracked.

@@ -1487,7 +1487,7 @@ mod tests {
             )
             .unwrap();
         memory
-            .map_peripheral(RCC_BASE, RCC_SIZE, Box::new(Rcc::new()))
+            .map_peripheral(RCC_BASE, RCC_SIZE, Box::new(Rcc::new(memory.clock())))
             .unwrap();
         memory
             .map_peripheral(RTC_BASE, RTC_SIZE, Box::new(Rtc::new(memory.clock())))
