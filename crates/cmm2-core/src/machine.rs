@@ -11,7 +11,7 @@ use crate::pwr::{PWR_BASE, PWR_SIZE, Pwr};
 use crate::rcc::{RCC_BASE, RCC_SIZE, Rcc};
 use crate::rng::{RNG_BASE, RNG_SIZE, Rng};
 use crate::rtc::{RTC_BASE, RTC_SIZE};
-use crate::timer::{TIM5_BASE, TIM16_BASE, TIMER_SIZE, Timer};
+use crate::timer::{TIM5_BASE, TIM5_SPEC, TIM16_BASE, TIM16_SPEC, TIMER_SIZE, Timer};
 use crate::usart::{USART_SIZE, USART1_BASE, Usart};
 
 /// The machine's memory map, with the RNG's values seeded from the host, so that they differ from
@@ -63,14 +63,22 @@ fn build_memory(irqs: &Irqs, rng_seed: Option<u64>) -> MemoryMap {
         .map_peripheral(
             TIM5_BASE,
             TIMER_SIZE,
-            Box::new(Timer::new(TIM5_BASE, 32, memory.clock())),
+            Box::new(Timer::with_interrupt(
+                TIM5_SPEC,
+                memory.clock(),
+                irqs.clone(),
+            )),
         )
         .expect("TIM5 window is clear of RAM");
     memory
         .map_peripheral(
             TIM16_BASE,
             TIMER_SIZE,
-            Box::new(Timer::new(TIM16_BASE, 16, memory.clock())),
+            Box::new(Timer::with_interrupt(
+                TIM16_SPEC,
+                memory.clock(),
+                irqs.clone(),
+            )),
         )
         .expect("TIM16 window is clear of RAM");
     for port in 0..GPIO_PORTS {
@@ -265,6 +273,7 @@ mod tests {
         let mut m = cmm2_memory(&Irqs::new());
         let clock = m.clock();
         m.write32(TIM16_BASE + 0x28, 239); // PSC
+        m.write32(TIM16_BASE + 0x14, 1); // UG loads it
         m.write32(TIM16_BASE, 1); // CEN
         m.write32(TIM5_BASE, 1);
         clock.set(480 * 1234);

@@ -37,6 +37,13 @@ impl Clock {
         self.wake.set(Some(earliest));
     }
 
+    /// The cycle of the earliest wake asked for, for the tests that run a device the way the
+    /// CPU does.
+    #[cfg(test)]
+    pub(crate) fn next_wake(&self) -> Option<u64> {
+        self.wake.get()
+    }
+
     /// Whether a wake has come due, which it then no longer is. Every device that wants to be
     /// woken again asks again when it is ticked.
     pub(crate) fn take_due(&self) -> bool {
