@@ -664,12 +664,20 @@ the one before in slot order. Nothing a user types is lost this way. What can be
 pressed and let go while the firmware is not polling is kept and typed late, six at a time, when it
 does (there is no bound on how many are kept; the firmware does not stop polling short of a reset,
 which drops them); and a modifier that is tapped on its own and held back stays until the key before it
-has gone. A key that goes down while six others are down is lost, as on a real keyboard, which sends
-the rollover error (`0x01` in every slot) for as long as a seventh key is down and never the key.
-The emulator is polled more slowly than real time, so a tap made and over between two polls is
-counted as down until the firmware has been sent the error once, and then it is gone: the firmware
-sees the error, then the six keys again, as it would from the keyboard. Nothing is left waiting, so
-the window's lock following (below) is not held up by it. A key that was already waiting when the
+has gone. A key that goes down while six others are down is a seventh key, and a real keyboard sends
+the rollover error (`0x01` in every slot) for as long as it is down, with no key in the report. A
+seventh key that is let go while the error is the report is lost, as on a keyboard. One that is
+still held when a slot frees is reported then, and typed, as a keyboard does.
+The emulator is polled more slowly than real time, so the error is sent whenever a seventh key went
+down with six others, until the firmware has had it once, whatever has come up since: a keyboard
+polled while the seven overlapped would have sent it, so the seventh key is lost when it is let go
+before then, even if the other six, or one of them, come up first. The firmware sees the error, then
+the keys that remain, as it would from the keyboard. Keys that were down when the error went out, and
+had not been in a report before, are not counted as seen by it: they are reported afterwards, and
+typed, even if they come up before the next poll. Nothing is left waiting for the lost key, so
+the window's lock following (below) is not held up by it. A Caps Lock or Num Lock is waited for
+(the LED update the firmware answers it with) when it is first reported as a key, and not when it
+goes down, so one lost to the error is not waited for and one held through it is. A key that was already waiting when the
 seven were down, because it was tapped before the seventh key went down, was seen by the keyboard
 alone and is not lost: it is typed once there is room.
 

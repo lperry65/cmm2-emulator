@@ -59,12 +59,29 @@ impl HostTime {
 
     /// Seconds since 1970-01-01 00:00:00 of this wall-clock time, as if it were UTC.
     fn seconds(self) -> i64 {
-        days_from_civil(self.year.into(), self.month, self.day) * 86_400
-            + i64::from(self.hour * 3600 + self.minute * 60 + self.second)
+        self.seconds_by(days_from_civil)
     }
 
     fn from_seconds(seconds: i64) -> HostTime {
-        let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
+        HostTime::from_seconds_by(seconds, civil_from_days)
+    }
+
+    /// As `seconds`, in the calendar of the chip (see `chip_days_from_civil`).
+    fn chip_seconds(self) -> i64 {
+        self.seconds_by(chip_days_from_civil)
+    }
+
+    fn from_chip_seconds(seconds: i64) -> HostTime {
+        HostTime::from_seconds_by(seconds, chip_civil_from_days)
+    }
+
+    fn seconds_by(self, days: fn(i64, u32, u32) -> i64) -> i64 {
+        days(self.year.into(), self.month, self.day) * 86_400
+            + i64::from(self.hour * 3600 + self.minute * 60 + self.second)
+    }
+
+    fn from_seconds_by(seconds: i64, civil: fn(i64) -> (i64, u32, u32)) -> HostTime {
+        let (year, month, day) = civil(seconds.div_euclid(86_400));
         let of_day = seconds.rem_euclid(86_400) as u32;
         HostTime::new(
             year as i32,
@@ -170,13 +187,56 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-fn days_in_month(year: i32, month: u32) -> u32 {
-    let next = if month == 12 {
-        days_from_civil(year.into(), 12, 1) + 31
-    } else {
-        days_from_civil(year.into(), month + 1, 1)
-    };
-    (next - days_from_civil(year.into(), month, 1)) as u32
+// The chip's calendar. It counts a year as a leap year when it is divisible by 4, as the
+// datasheet says, 2100 included, where the Gregorian calendar the host has is not: the chip has a
+// 29 February 2100. A chip that has not been set shows the host's own date; one that has counts
+// in this calendar, which is the Gregorian one up to 28 February 2100, and has the days of 29
+// February 2100, 2200 and so on put in after it. Day numbers are the same as the other calendar's
+// (days from 1970-01-01) up to there.
+fn is_chip_extra_leap_year(year: i64) -> bool {
+    year >= 2100 && year % 100 == 0 && year % 400 != 0
+}
+
+/// How many of those extra days have come by the end of `year`, or the year before it.
+fn extra_leap_days_by(year: i64) -> i64 {
+    if year < 2100 {
+        return 0;
+    }
+    (year / 100 - 20) - (year / 400 - 5)
+}
+
+fn chip_days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    if month == 2 && day == 29 && is_chip_extra_leap_year(year) {
+        return days_from_civil(year, 2, 28) + 1 + extra_leap_days_by(year - 1);
+    }
+    // The extra day of this year comes in February, so it is before March.
+    let before = if month >= 3 { year } else { year - 1 };
+    days_from_civil(year, month, day) + extra_leap_days_by(before)
+}
+
+fn chip_civil_from_days(days: i64) -> (i64, u32, u32) {
+    let mut extra = 0;
+    for year in (2100..).step_by(100).filter(|year| year % 400 != 0) {
+        let leap_day = days_from_civil(year, 2, 28) + 1 + extra;
+        if leap_day > days {
+            break;
+        }
+        if leap_day == days {
+            return (year, 2, 29);
+        }
+        extra += 1;
+    }
+    civil_from_days(days - extra)
+}
+
+/// The days of a month in the chip's calendar.
+fn chip_days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        2 if year % 4 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 fn bcd(n: u32) -> u8 {
@@ -218,9 +278,8 @@ fn hour_register(hour: u32, hour12: bool) -> u8 {
 
 /// The seven calendar registers for `seconds` of wall-clock time. The weekday is 1 to 7, as the
 /// chip counts it from the one it was given: `weekday_skew` days on from Monday as 1.
-fn calendar_registers(seconds: i64, weekday_skew: u8, hour12: bool) -> [u8; CALENDAR] {
-    let time = HostTime::from_seconds(seconds);
-    let weekday = (civil_weekday(seconds.div_euclid(86_400)) + i64::from(weekday_skew)) % 7 + 1;
+fn calendar_registers(time: HostTime, days: i64, weekday_skew: u8, hour12: bool) -> [u8; CALENDAR] {
+    let weekday = (civil_weekday(days) + i64::from(weekday_skew)) % 7 + 1;
     [
         bcd(time.second),
         bcd(time.minute),
@@ -373,6 +432,16 @@ impl Chip {
         self.hour12 = false;
     }
 
+    /// The date and time of `seconds` of the chip's wall clock: the host's own calendar until the
+    /// chip is set, and the chip's after.
+    fn civil(&self, seconds: i64) -> HostTime {
+        if self.offset.is_some() {
+            HostTime::from_chip_seconds(seconds)
+        } else {
+            HostTime::from_seconds(seconds)
+        }
+    }
+
     /// The chip's wall-clock time in milliseconds, as if it were UTC.
     fn wall_millis(&self, now: &HostNow) -> i64 {
         match self.offset {
@@ -431,7 +500,14 @@ impl Chip {
 
     fn refresh_calendar(&mut self) {
         let wall = self.wall_millis(&self.clock.now());
-        let calendar = calendar_registers(wall.div_euclid(1000), self.weekday_skew, self.hour12);
+        let seconds = wall.div_euclid(1000);
+        let time = self.civil(seconds);
+        let calendar = calendar_registers(
+            time,
+            seconds.div_euclid(86_400),
+            self.weekday_skew,
+            self.hour12,
+        );
         self.registers[..CALENDAR].copy_from_slice(&calendar);
     }
 
@@ -550,7 +626,7 @@ impl Chip {
         // The weekday as it is before this write: only a write of its own changes it, and one
         // that moves the date leaves it as it was.
         let weekday = self.weekday_on(today);
-        let mut time = HostTime::from_seconds(wall.div_euclid(1000));
+        let mut time = self.civil(wall.div_euclid(1000));
         let mut millis = wall.rem_euclid(1000);
         match register {
             0 => {
@@ -571,9 +647,9 @@ impl Chip {
             _ => self.date_written[register - 4] = Some(byte),
         }
         let [day, month, year] = self.date_written;
-        // The century bit goes with the month, and says which hundred years the year is in: the
-        // 2000s with 0 and the 2100s with 1, as the chip's own is 1 after its first rollover.
-        // Without a month written the chip stays in the hundred years it is in.
+        // The century bit goes with the month, and says which hundred years the year is in: 0 is
+        // 2000 to 2099 and 1 is 2100 to 2199, the years the chip has. Without a month written the
+        // chip stays in the hundred years it is in.
         let century = month.map_or(century(time.year), |m| i32::from(m >> 7));
         let month = month.map_or(time.month, |m| unbcd(m & 0x1F).clamp(1, 12));
         let digits = year.map_or((time.year - 2000).rem_euclid(100), |y| {
@@ -585,13 +661,15 @@ impl Chip {
         time.year = year;
         // A month that does not have the day is not a date. The datasheet leaves what the chip
         // does then undefined, and this one takes the last day of the month.
-        time.day = day.min(days_in_month(year, month));
-        let target = time.seconds() * 1000 + millis;
-        self.set_weekday(target.div_euclid(86_400_000), weekday);
+        time.day = day.min(chip_days_in_month(year, month));
+        let target = time.chip_seconds() * 1000 + millis;
         // The chip must stay as far from the host as a saved offset may be, or it could not be
         // loaded again.
         let offset = target.saturating_sub(now.utc_millis);
         self.offset = Some(offset.clamp(-MAX_OFFSET_MILLIS, MAX_OFFSET_MILLIS));
+        // The weekday goes on from the day the chip is on, which is not the one written if that
+        // was clamped.
+        self.set_weekday(self.wall_millis(&now).div_euclid(86_400_000), weekday);
     }
 }
 
@@ -631,7 +709,7 @@ impl Ds3231Slot {
     /// The time the chip shows.
     pub fn time(&self) -> HostTime {
         let chip = self.0.borrow();
-        HostTime::from_seconds(chip.wall_millis(&chip.clock.now()).div_euclid(1000))
+        chip.civil(chip.wall_millis(&chip.clock.now()).div_euclid(1000))
     }
 
     /// What the chip keeps with the power off, for the front end to save: the offset, the status
@@ -804,10 +882,15 @@ mod tests {
             assert_eq!(days_from_civil(year, month, day), days, "{days}");
         }
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
-        assert_eq!(days_in_month(2000, 2), 29);
-        assert_eq!(days_in_month(2100, 2), 28);
-        assert_eq!(days_in_month(2026, 12), 31);
-        assert_eq!(days_in_month(2026, 11), 30);
+        assert_eq!(chip_days_in_month(2000, 2), 29);
+        assert_eq!(
+            chip_days_in_month(2100, 2),
+            29,
+            "the chip's rule is every 4th year"
+        );
+        assert_eq!(chip_days_in_month(2026, 2), 28);
+        assert_eq!(chip_days_in_month(2026, 12), 31);
+        assert_eq!(chip_days_in_month(2026, 11), 30);
     }
 
     #[test]
@@ -1169,15 +1252,100 @@ mod tests {
 
     #[test]
     fn the_century_bit_is_written_with_the_month() {
-        // Set, it is the 2100s (the bit is 1 for them as the year rolls over from 99 to 00).
+        // 0 is 2000 to 2099 and 1 is 2100 to 2199, as the chip's bit is set after its first
+        // rollover from 99 to 00.
         let bus = Bus::at(december());
         bus.write(0, &[0x30, 0x20, 0x10, 5, 0x05, 0x91, 0x27]);
         assert_eq!(bus.read(0, 7), [0x30, 0x20, 0x10, 5, 0x05, 0x91, 0x27]);
         assert_eq!(bus.chip.time(), HostTime::new(2127, 11, 5, 10, 20, 30));
-        // And clear, the 2000s again, whatever hundred years the chip was in.
+        // And clear, whatever hundred years the chip was in.
+        bus.write(4, &[0x05, 0x11, 0x27]);
+        assert_eq!(bus.chip.time().year, 2027);
+        let bus = Bus::at(HostTime::new(2100, 6, 15, 12, 0, 0));
         bus.write(4, &[0x05, 0x11, 0x27]);
         assert_eq!(bus.read(5, 2), [0x11, 0x27]);
         assert_eq!(bus.chip.time().year, 2027);
+    }
+
+    #[test]
+    fn the_month_written_back_as_it_was_read_changes_nothing_in_the_years_the_chip_has() {
+        for year in [2000, 2026, 2099, 2100, 2150, 2199] {
+            let time = HostTime::new(year, 6, 9, 12, 0, 0);
+            let bus = Bus::at(time);
+            let registers = bus.read(4, 3);
+            bus.write(5, &registers[1..2]);
+            assert_eq!(bus.chip.time(), time, "{year}");
+            bus.write(4, &registers);
+            assert_eq!(bus.chip.time(), time, "{year}");
+        }
+    }
+
+    #[test]
+    fn a_date_written_in_the_2000s_after_the_chip_rolled_over_to_the_2100s_is_in_the_2000s() {
+        // The firmware's DATE$ writes bit 0.
+        let bus = Bus::at(december());
+        bus.write(0, &[0x58, 0x59, 0x23]);
+        bus.write(3, &[2, 0x31, 0x12, 0x99]);
+        bus.clock.advance(5);
+        assert_eq!(bus.read(4, 3), [0x01, 0x81, 0x00]);
+        bus.write(3, &[2, 0x01, 0x01, 0x30]);
+        assert_eq!(bus.read(4, 3), [0x01, 0x01, 0x30]);
+        assert_eq!(bus.chip.time().year, 2030);
+    }
+
+    #[test]
+    fn a_chip_that_was_set_counts_29_february_2100_as_the_chip_does() {
+        let bus = Bus::at(december());
+        // 28 February 2100, in the 2100s.
+        bus.write(0, &[0x00, 0x00, 0x12]);
+        bus.write(4, &[0x28, 0x82, 0x00]);
+        bus.clock.advance(86_400);
+        assert_eq!(bus.read(4, 3), [0x29, 0x82, 0x00]);
+        bus.clock.advance(86_400);
+        assert_eq!(bus.read(4, 3), [0x01, 0x83, 0x00]);
+        // A day later it is the day after that, and 2104 is a leap year too.
+        bus.clock.advance(86_400);
+        assert_eq!(bus.read(4, 3), [0x02, 0x83, 0x00]);
+        // Written, 29/02/00 is a date.
+        bus.write(4, &[0x29, 0x82, 0x00]);
+        assert_eq!(bus.read(4, 3), [0x29, 0x82, 0x00]);
+        assert_eq!(bus.chip.time(), HostTime::new(2100, 2, 29, 12, 0, 0));
+        // The weekday counted through it.
+        bus.write(3, &[1]);
+        bus.clock.advance(86_400);
+        assert_eq!(bus.read(3, 1), [2]);
+        assert_eq!(bus.read(4, 3), [0x01, 0x83, 0x00]);
+    }
+
+    #[test]
+    fn the_chips_calendar_is_the_hosts_until_2100_and_counts_one_day_more_after() {
+        for days in [-800, 0, 11_016, 20_811, 47_540] {
+            assert_eq!(chip_civil_from_days(days), civil_from_days(days), "{days}");
+        }
+        for (year, month, day) in [
+            (2100, 2, 28),
+            (2100, 2, 29),
+            (2100, 3, 1),
+            (2200, 2, 29),
+            (2200, 3, 1),
+            (2201, 12, 31),
+            (2400, 2, 29),
+            (2400, 3, 1),
+            (2401, 1, 1),
+            (2500, 3, 1),
+        ] {
+            let days = chip_days_from_civil(year, month, day);
+            assert_eq!(chip_civil_from_days(days), (year, month, day));
+        }
+        assert_eq!(
+            chip_days_from_civil(2100, 3, 1),
+            chip_days_from_civil(2100, 2, 28) + 2
+        );
+        // 2400 is a leap year for both, so it adds nothing.
+        assert_eq!(
+            chip_days_from_civil(2400, 3, 1) - chip_days_from_civil(2400, 2, 29),
+            1
+        );
     }
 
     #[test]
@@ -1509,8 +1677,7 @@ mod tests {
                 assert_eq!(bus.read(4, 1), [bcd(d)]);
             }
         }
-        assert_eq!(days_in_month(2100, 2), 28);
-        assert_eq!(days_in_month(2104, 2), 29);
+        assert_eq!(chip_days_in_month(2104, 2), 29);
     }
 
     #[test]
@@ -1617,6 +1784,20 @@ mod tests {
         assert_eq!((bus.chip.saved(), bus.chip.offset_millis()), before);
         // And the status flags it would have reset are as they were.
         assert_eq!(bus.read(0x0F, 1), [0]);
+    }
+
+    #[test]
+    fn a_write_that_is_clamped_leaves_the_weekday_as_it_was() {
+        let bus = Bus::at(december());
+        bus.chip
+            .set_offset_millis(Some(MAX_OFFSET_MILLIS - 1000))
+            .unwrap();
+        bus.write(3, &[3]);
+        // The day it is clamped to is not the day written, and the weekday is not set from that.
+        for year in [0x99, 0x98, 0x97, 0x96, 0x95, 0x94, 0x93] {
+            bus.write(6, &[year]);
+            assert_eq!(bus.read(3, 1), [3], "{year:#x}");
+        }
     }
 
     #[test]
