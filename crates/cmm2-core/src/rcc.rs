@@ -3,12 +3,11 @@
 //!
 //! One clock is worked out from the registers: PLL3's R output, which is the LTDC's pixel
 //! clock. The firmware sets it for each video mode, so the frame timing follows from it. The
-//! other PLL outputs are only stored. The RNG's clock gate, reset and kernel clock choice are
-//! handed to the RNG (see docs/rng.md). PLL3 only locks (PLL3RDY) when the reference and the VCO
+//! other PLL outputs are only stored. PLL3 only locks (PLL3RDY) when the reference and the VCO
 //! are in the chip's ranges; otherwise it has no clock and never becomes ready.
-
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+//!
+//! The RNG's clock gate, reset and kernel clock are also worked out here and handed to the RNG
+//! (see docs/rng.md).
 
 use crate::clock::Clock;
 use crate::peripheral::{ResetCause, StubRegisters};
@@ -16,7 +15,9 @@ use crate::registers::{Registers, WordAccess, follow};
 use crate::svd::Svd;
 
 mod rng_clock;
+mod signal;
 pub(crate) use rng_clock::{RngClock, RngClockState};
+use signal::Signal;
 
 pub const RCC_BASE: u32 = 0x5802_4400;
 pub const RCC_SIZE: u32 = 0x400;
@@ -24,18 +25,18 @@ pub const RCC_SIZE: u32 = 0x400;
 // Register offsets and bit positions, as the SVD gives them.
 const CR: u32 = 0x00;
 const CFGR: u32 = 0x10;
-const D2CCIP2R: u32 = 0x54;
 const PLLCKSELR: u32 = 0x28;
 const PLLCFGR: u32 = 0x2C;
 const PLL3DIVR: u32 = 0x40;
 const PLL3FRACR: u32 = 0x44;
+const D2CCIP2R: u32 = 0x54;
+const BDCR: u32 = 0x70;
+const CSR: u32 = 0x74;
 const AHB2RSTR: u32 = 0x84;
+const RSR: u32 = 0xD0;
 const AHB2ENR: u32 = 0xDC;
 // The same register as AHB2ENR, at a second offset (RM0433 8.7.42, Table 68).
 const C1_AHB2ENR: u32 = 0x13C;
-const BDCR: u32 = 0x70;
-const CSR: u32 = 0x74;
-const RSR: u32 = 0xD0;
 
 // RCC_CR: each ready bit follows the on bit next to it in this table.
 const READY_FOLLOWS_ON: [(u32, u32); 7] = [
@@ -66,17 +67,28 @@ const SFTRSTF: u32 = 1 << 24;
 const POWER_ON_FLAGS: u32 = 1 << 21 | 1 << 22 | 1 << 23; // BORRSTF, PINRSTF, PORRSTF
 const FLAGS: u32 = 0x55FA_0000;
 
-// The RNG's bits: RCC_AHB2ENR.RNGEN and RCC_AHB2RSTR.RNGRST (bit 6 of both), and the two bits
-// of RCC_D2CCIP2R that pick its kernel clock (RM0433 8.7.5, p. 416, and Figure 58, p. 364).
+// The RNG's bits: RCC_AHB2ENR.RNGEN and RCC_AHB2RSTR.RNGRST (bit 6 of both), the two bits of
+// RCC_D2CCIP2R that pick its kernel clock (RM0433 8.7.5, p. 416, and Figure 58, p. 364), and
+// the on bits of the oscillators that can be that clock.
 const RNGEN: u32 = 1 << 6;
 const RNGRST: u32 = 1 << 6;
 const RNGSEL_SHIFT: u32 = 8;
-const RNGSEL_HZ: [u64; 4] = [
-    48_000_000, // hsi48_ck
-    // pll1_q_ck. PLL1 is not worked out, so I take it as 48 MHz. The firmware picks hsi48.
-    48_000_000, 32_768, // lse_ck
-    32_000, // lsi_ck, nominally 32 kHz
-];
+const RC48ON: u32 = 1 << 12; // RCC_CR, HSI48ON in the manual
+const PLL1ON: u32 = 1 << 24; // RCC_CR
+
+/// The kernel clock of the RNG in Hz, from RNGSEL and the oscillators: 0 when the one it picks
+/// is off, as then there is no clock (Figure 58).
+fn rng_kernel_hz(sel: u32, cr: u32, bdcr: u32, csr: u32) -> u64 {
+    match sel {
+        0 if cr & RC48ON != 0 => 48_000_000, // hsi48_ck
+        // pll1_q_ck. PLL1's outputs are not worked out, so I take it as 48 MHz whenever PLL1
+        // is on (the firmware picks hsi48).
+        1 if cr & PLL1ON != 0 => 48_000_000,
+        2 if bdcr & LSEON != 0 => 32_768, // lse_ck
+        3 if csr & LSION != 0 => 32_000,  // lsi_ck, nominally 32 kHz
+        _ => 0,
+    }
+}
 
 /// The board's crystal. PLL3 is fed from it, and the PLL sources the board does not use (the
 /// internal oscillators) are not modelled.
@@ -87,13 +99,13 @@ const PLL3VCOSEL: u32 = 1 << 9; // RCC_PLLCFGR
 const DIVR3EN: u32 = 1 << 24; // RCC_PLLCFGR
 const DIVM3_BITS: u32 = 0x3F << 20; // RCC_PLLCKSELR
 const PLLSRC_BITS: u32 = 3; // RCC_PLLCKSELR
-const ANY_PLL_ON: u32 = 1 << 24 | 1 << 26 | PLL3ON; // RCC_CR
+const ANY_PLL_ON: u32 = PLL1ON | 1 << 26 | PLL3ON; // RCC_CR
 // RCC_PLLCFGR: DIVR3EN, DIVQ3EN, DIVP3EN, PLL3RGE and PLL3VCOSEL, not PLL3FRACEN.
 const PLL3_CONFIG_BITS: u32 = 7 << 22 | 3 << 10 | PLL3VCOSEL;
 // The registers that PLL3's R output depends on.
 const PLL3_INPUTS: [u32; 5] = [CR, PLLCKSELR, PLLCFGR, PLL3DIVR, PLL3FRACR];
 // The registers that the RNG's clocks and reset depend on.
-const RNG_INPUTS: [u32; 3] = [D2CCIP2R, AHB2ENR, AHB2RSTR];
+const RNG_INPUTS: [u32; 6] = [CR, D2CCIP2R, BDCR, CSR, AHB2RSTR, AHB2ENR];
 
 /// The pixel clock in Hz, as the RCC works it out from PLL3's registers, or 0 while PLL3 has no
 /// R output. A cheap handle: clones share the value, so the LTDC can see what the firmware
@@ -102,50 +114,32 @@ const RNG_INPUTS: [u32; 3] = [D2CCIP2R, AHB2ENR, AHB2RSTR];
 /// when. A change also asks the clock for a tick at once, so the LTDC hears of it without the
 /// firmware touching it.
 #[derive(Clone, Debug)]
-pub(crate) struct PixelClock(Rc<PixelClockState>);
-
-#[derive(Debug)]
-struct PixelClockState {
-    clock: Clock,
-    hz: Cell<u64>,
-    changes: RefCell<Vec<(u64, u64)>>,
-}
+pub(crate) struct PixelClock(Signal<u64>);
 
 impl PixelClock {
     /// A clock that is stopped, as PLL3 is until the firmware sets it up.
     pub(crate) fn new(clock: Clock) -> PixelClock {
-        PixelClock(Rc::new(PixelClockState {
-            clock,
-            hz: Cell::new(0),
-            changes: RefCell::new(Vec::new()),
-        }))
+        PixelClock(Signal::new(clock, 0))
     }
 
     /// A clock that has been running at `hz` since the start, for a controller that has no RCC
     /// beside it.
     #[cfg(test)]
     pub(crate) fn running_at(clock: Clock, hz: u64) -> PixelClock {
-        let pixel_clock = PixelClock::new(clock);
-        pixel_clock.0.hz.set(hz);
-        pixel_clock
+        PixelClock(Signal::new(clock, hz))
     }
 
     pub(crate) fn hz(&self) -> u64 {
-        self.0.hz.get()
+        self.0.get()
     }
 
     /// The changes since the last call, oldest first, each as the core cycle and the new rate.
     pub(crate) fn take_changes(&self) -> Vec<(u64, u64)> {
-        self.0.changes.take()
+        self.0.take_changes()
     }
 
     pub(crate) fn set(&self, hz: u64) {
-        if hz != self.0.hz.get() {
-            let now = self.0.clock.now();
-            self.0.hz.set(hz);
-            self.0.changes.borrow_mut().push((now, hz));
-            self.0.clock.wake_at(now);
-        }
+        self.0.set(hz);
     }
 }
 
@@ -183,8 +177,9 @@ enum Vco {
 // 16 MHz. The wide VCO (VCOH, PLL3VCOSEL clear) takes a reference of 2 to 16 MHz and makes 192 to
 // 960 MHz; the medium one (VCOL, set) takes 1 to 2 MHz and makes 150 to 420 MHz (the
 // manual has VCOL chosen for a reference of 2 MHz or less, and VCOH otherwise). PLL3RGE is only
-// to be set to the reference's range for optimal performance, so it is not a condition here. DIVN3 is 4 to 512 (the field, 3 to
-// 0x1FF); no VCO range can be reached with less, so the range of the VCO covers the lower limit. The manual does not say what a PLL does outside
+// to be set to the reference's range for optimal performance, so it is not a condition here.
+// DIVN3 is 4 to 512 (the field, 3 to 0x1FF); no VCO range can be reached with less, so the
+// range of the VCO covers the lower limit. The manual does not say what a PLL does outside
 // these ranges (it does not guarantee the output frequency): the model does not lock it.
 const REFERENCE_HZ: std::ops::RangeInclusive<u128> = 1_000_000..=16_000_000;
 const WIDE_REFERENCE_HZ: std::ops::RangeInclusive<u128> = 2_000_000..=16_000_000;
@@ -264,22 +259,32 @@ impl RccRegisters {
 
     /// Tells the RNG what its clocks and reset are now.
     fn update_rng_clock(&mut self) {
-        let sel = self.stored.read(D2CCIP2R) >> RNGSEL_SHIFT & 3;
-        self.rng_clock.set(RngClockState {
-            enabled: self.stored.read(AHB2ENR) & RNGEN != 0,
-            in_reset: self.stored.read(AHB2RSTR) & RNGRST != 0,
-            kernel_hz: RNGSEL_HZ[sel as usize],
-        });
+        self.rng_clock.set(rng_state(&mut self.stored));
+    }
+}
+
+/// What the RNG's clocks and reset are, from the registers.
+fn rng_state(stored: &mut StubRegisters) -> RngClockState {
+    let sel = stored.read(D2CCIP2R) >> RNGSEL_SHIFT & 3;
+    RngClockState {
+        enabled: stored.read(AHB2ENR) & RNGEN != 0,
+        in_reset: stored.read(AHB2RSTR) & RNGRST != 0,
+        kernel_hz: rng_kernel_hz(sel, stored.read(CR), stored.read(BDCR), stored.read(CSR)),
+    }
+}
+
+/// The offset a register is stored at: RCC_C1_AHB2ENR is the same register as RCC_AHB2ENR.
+fn canonical(offset: u32) -> u32 {
+    if offset == C1_AHB2ENR {
+        AHB2ENR
+    } else {
+        offset
     }
 }
 
 impl Registers for RccRegisters {
     fn read(&mut self, offset: u32) -> u32 {
-        let offset = if offset == C1_AHB2ENR {
-            AHB2ENR
-        } else {
-            offset
-        };
+        let offset = canonical(offset);
         let value = self.stored.read(offset);
         match offset {
             CR => {
@@ -304,11 +309,7 @@ impl Registers for RccRegisters {
     }
 
     fn write(&mut self, offset: u32, value: u32, mask: u32) {
-        let offset = if offset == C1_AHB2ENR {
-            AHB2ENR
-        } else {
-            offset
-        };
+        let offset = canonical(offset);
         if offset == RSR {
             if value & mask & RMVF != 0 {
                 self.rsr &= !FLAGS;
@@ -348,12 +349,14 @@ pub type Rcc = WordAccess<RccRegisters>;
 
 impl Rcc {
     pub fn new(clock: Clock) -> Rcc {
+        let mut stored = StubRegisters::with_reset_values(RCC_BASE, Svd::stm32h743());
+        let rng_clock = RngClock::new(clock.clone(), rng_state(&mut stored));
         WordAccess::wrap(RccRegisters {
-            stored: StubRegisters::with_reset_values(RCC_BASE, Svd::stm32h743()),
+            stored,
             sh_reg: 0,
             rsr: POWER_ON_FLAGS,
-            pixel_clock: PixelClock::new(clock.clone()),
-            rng_clock: RngClock::new(clock),
+            pixel_clock: PixelClock::new(clock),
+            rng_clock,
         })
     }
 

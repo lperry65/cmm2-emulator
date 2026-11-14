@@ -59,12 +59,18 @@ enum Work {
     /// The first set after the RNG is enabled: 192 RNG clocks and 213 AHB clocks, or, with an
     /// AHB clock under (213 x fRNG) / 64, 128 RNG clocks and 426 AHB clocks.
     Init,
-    /// The next set: 16 x fAHB / fRNG AHB clocks, but at least 213.
+    /// The next set: 16 x fAHB / fRNG AHB clocks, but at least 213. 34.5 is the section that
+    /// gives the times, so its 213 is used for both; the 216 of 34.3.8 (the restart after
+    /// RNGEN was cleared) and of 34.7.3 (DR after the buffer empties) are not.
     Refill,
 }
 
 impl Work {
     fn cycles(self, hz: u64) -> u64 {
+        // Protection against dividing by zero: the callers only work with a kernel clock.
+        if hz == 0 {
+            return u64::MAX; // no kernel clock: never
+        }
         let rng = |n: u64| (n * CORE_HZ).div_ceil(hz);
         let ahb = |n: u64| n * (CORE_HZ / AHB_HZ);
         match self {
@@ -99,8 +105,14 @@ pub struct RngRegisters {
 }
 
 impl RngRegisters {
-    fn running(&self) -> bool {
+    /// RNGEN is set and the registers answer: what the interrupt and the clock check need.
+    fn enabled(&self) -> bool {
         self.cr & RNGEN != 0 && self.bus_clock()
+    }
+
+    /// Enabled, and the noise source has its kernel clock.
+    fn running(&self) -> bool {
+        self.enabled() && self.state.kernel_hz > 0
     }
 
     /// The registers answer only with the clocks on and the block out of reset.
@@ -110,7 +122,7 @@ impl RngRegisters {
 
     /// The interrupt level: an enabled interrupt with a flag to report, with the RNG enabled.
     fn interrupt_active(&self) -> bool {
-        self.running() && self.cr & IE != 0 && (self.words > 0 || self.flags & CLEARABLE != 0)
+        self.enabled() && self.cr & IE != 0 && (self.words > 0 || self.flags & CLEARABLE != 0)
     }
 
     /// The clock error check: with CED clear, a kernel clock under a 32nd of the AHB clock
@@ -119,7 +131,7 @@ impl RngRegisters {
     /// the kernel clock choices that can (LSE and LSI).
     fn check_clock(&mut self) {
         let too_slow = self.cr & CED == 0 && self.state.kernel_hz * 32 < AHB_HZ;
-        if self.running() && too_slow {
+        if self.enabled() && too_slow {
             if self.flags & CECS == 0 {
                 self.flags |= CEIS;
             }
@@ -140,32 +152,26 @@ impl RngRegisters {
 
     /// Brings the work up to `to`, a cycle at or after the anchor.
     fn advance(&mut self, to: u64) {
-        if self.running() {
-            if self.words == 0 && self.work.is_none() {
-                self.work = Some((
-                    if self.started {
-                        Work::Refill
-                    } else {
-                        Work::Init
-                    },
-                    0,
-                ));
+        self.work = self.pending();
+        // The first set stops with RNGEN clear and resumes (34.3.8). A refill that has started
+        // goes on: the conditioning runs on the AHB clock, and DRDY can rise with RNGEN clear
+        // (34.7.2 note). A seed error stops it until SEIS is cleared (34.3.7).
+        let goes_on = match self.work {
+            Some((Work::Refill, _)) => self.bus_clock() && self.state.kernel_hz > 0,
+            _ => self.running(),
+        };
+        if goes_on
+            && self.flags & SEIS == 0
+            && let Some((work, done)) = &mut self.work
+        {
+            *done += to - self.anchor;
+            if *done >= work.cycles(self.state.kernel_hz) {
+                self.work = None;
+                self.words = WORDS;
+                self.started = true;
             }
-            // A seed error stops the generator until SEIS is cleared (34.3.7).
-            if self.flags & SEIS != 0 {
-                self.anchor = to;
-                return;
-            }
-            if let Some((work, done)) = &mut self.work {
-                *done += to - self.anchor;
-                if *done >= work.cycles(self.state.kernel_hz) {
-                    self.work = None;
-                    self.words = WORDS;
-                    self.started = true;
-                }
-            }
-            self.check_clock();
         }
+        self.check_clock();
         self.anchor = to;
     }
 
@@ -182,9 +188,23 @@ impl RngRegisters {
         self.advance(self.clock.now());
     }
 
+    /// The work under way, or the work that starts now: a refill is started by the next
+    /// `advance`, not by the read that emptied the buffer.
+    fn pending(&self) -> Option<(Work, u64)> {
+        if self.work.is_none() && self.running() && self.words == 0 {
+            let work = if self.started {
+                Work::Refill
+            } else {
+                Work::Init
+            };
+            return Some((work, 0));
+        }
+        self.work
+    }
+
     /// Asks for a tick when the work will be done, if an interrupt is waiting for it.
     fn schedule(&mut self) {
-        if let Some((work, done)) = self.work
+        if let Some((work, done)) = self.pending()
             && self.running()
             && self.cr & IE != 0
         {
@@ -217,9 +237,6 @@ impl RngRegisters {
             return 0;
         }
         self.words -= 1;
-        if self.words == 0 {
-            self.work = Some((Work::Refill, 0));
-        }
         // After a seed error is cleared, 12 words are read and thrown away, then SECS clears.
         if self.recovery > 0 {
             self.recovery -= 1;
@@ -286,6 +303,10 @@ impl Registers for RngRegisters {
 
     fn reset(&mut self, _cause: ResetCause) {
         self.reset_registers();
+        // The RCC's state after its own reset is the reset one (a test in rcc/tests.rs holds the
+        // two together), and the RCC's reset puts it there with `update_rng_clock`. That holds
+        // whichever of the two windows is reset first: if the RNG goes first, the RCC logs the
+        // change and the RNG takes it at its next sync.
         self.state = RngClockState::RESET;
         self.rcc.take_changes();
         self.anchor = self.clock.now();

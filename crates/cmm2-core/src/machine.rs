@@ -141,6 +141,7 @@ mod tests {
     fn the_rng_is_served_by_the_model() {
         let mut m = cmm2_memory_with_rng_seed(&Irqs::new(), 1);
         m.write32(0x5802_44DC, 1 << 6); // RCC_AHB2ENR: RNGEN
+        m.write32(0x5802_4400, 1 << 12); // RCC_CR: RC48ON, the kernel clock
         m.write32(0x4802_1800, 1 << 2); // RNG_CR: RNGEN
         m.clock().set(10_000);
         assert_eq!(m.read32(0x4802_1804), 1); // RNG_SR: DRDY

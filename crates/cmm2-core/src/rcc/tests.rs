@@ -472,3 +472,10 @@ fn a_reset_stops_the_pixel_clock() {
     m.reset_peripherals(ResetCause::Software);
     assert_eq!(pixel_clock.hz(), 0);
 }
+
+#[test]
+fn a_fresh_rcc_gives_the_rng_the_state_that_the_rng_takes_at_reset() {
+    // The RNG assumes this after a system reset, as the RCC is reset before it (rng.rs).
+    let rcc = Rcc::new(Clock::new());
+    assert_eq!(rcc.rng_clock().get(), RngClockState::RESET);
+}

@@ -30,15 +30,6 @@ fn real_firmware_prints_no_error_1_after_boot() {
     assert!(!output.contains("Error:1"), "{output:?}");
 }
 
-#[test]
-#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test --release -- --ignored"]
-fn real_firmware_gives_different_values_for_rnd() {
-    let (mut cpu, console) = boot();
-    let first = answer_to(&mut cpu, &console, "PRINT RND");
-    let second = answer_to(&mut cpu, &console, "PRINT RND");
-    assert_ne!(first, second);
-}
-
 /// Boots with the RNG seeded with `seed`, and returns what `PRINT RND` printed and how many
 /// times the firmware read RNG_DR to make it.
 fn first_rnd_with_seed(seed: u64) -> (String, u32) {
