@@ -251,7 +251,9 @@ order, oldest first, like a keyboard does, and the firmware's choice carries ove
 - With the idle rate set to 0 and boot protocol, a real keyboard answers NAK until something
   changes, so a held key is not re-sent. I rely on this, because the model sent exactly one report
   per change and nothing else, and the games' held-key behaviour came out right.
-- Lock keys: `KEYDOWN(8)` returned 0 throughout; I did not press Caps Lock or Num Lock.
+- Lock keys: `KEYDOWN(8)` returned 0 throughout; I did not press Caps Lock or Num Lock. The firmware
+  keeps the locks itself, toggling on the key down, and shows them to the keyboard with SET_REPORT
+  (the LED byte), which is how the window can tell what state it has them in (section 12).
 
 ## 5. The slave-mode mechanics the model needs
 
@@ -268,7 +270,7 @@ The smallest set I used, and the order the firmware expects. Offsets from 0x4008
 | `GRXSTSR`, `GRXSTSP` | 0x1C, 0x20 | peek and pop the RX status queue |
 | `GNPTXSTS` | 0x2C | 0x00080200: non-periodic queue space 8, FIFO space 0x200 |
 | `GSNPSID` | 0x40 | top 16 bits 0x4F54 (the low half is open) |
-| `GHWCFG2` | 0x48 | 0x0002C100: FS PHY, 12 host channels |
+| `GHWCFG2` | 0x48 | 0x028ED500 (a guess, see section 12): FS PHY, 12 host channels |
 | `HFNUM` | 0x408 | frame number from the clock, one per millisecond; the top half non-zero |
 | `HPTXSTS` | 0x410 | 0x00080100 |
 | `HAINT` | 0x414 | bit n set while channel n has `HCINT` and `HCINTMSK` bits in common |
@@ -279,7 +281,11 @@ The smallest set I used, and the order the firmware expects. Offsets from 0x4008
 A channel number above the hardware's (0 to 11) can be ignored; the firmware used channels 0 and 1.
 
 **GHWCFG2 and GSNPSID are guesses**: I never read them from the board. The firmware only needs
-the fields above (the FS PHY type, 12 or more host channels, a recognised `GSNPSID`).
+the fields above (the FS PHY type, 12 or more host channels, a recognised `GSNPSID`). The scratch
+model answered 0x0002C100 for `GHWCFG2`, which has those fields and not much else (and not the
+periodic support bit, which an interrupt endpoint needs); the core now answers 0x028ED500, the whole
+register laid out as I remember the Synopsys core's (section 12). I do not know that the reference
+manual documents it, and every field but the three the firmware needs is a guess.
 
 **An OUT or SETUP transfer** (the order the firmware does it):
 
@@ -530,6 +536,38 @@ slices of a million), at the same speed.
   toggle, so a device that did not toggle would go unnoticed.
 - `GUSBCFG` resets to 0x1440 and `HCFG` to 0x200 (the guesses of section 2, which make the registers
   read what the board does after the firmware has edited them), not the SVD's values.
+- `HFNUM.FRNUM` counts to 0x3FFF and starts again at 0, as the reference manual has it, not at
+  0xFFFF.
+- The FIFO windows take what they are given: a byte or halfword write adds only the bytes written
+  (the data of a packet written with narrow writes arrives in the order written). I do not know what
+  the chip does with a narrow write to the FIFO, and the firmware writes words; this is the one that
+  loses nothing.
+- `GRSTCTL.CSRST` resets the core: the channels (all their registers and what is staged for them),
+  the RX FIFO and the flags the core latched are cleared, any transaction waiting is dropped, the
+  registers (`GINTMSK`, `GAHBCFG`, `HAINTMSK`, `HFIR` and so on) go back to their reset values except
+  `HCFG.FSLSPCS`, and it is over at once. The port and its device stay as they are. This is from my
+  memory of RM0433 and I have not checked it against the manual: I remember it keeping a few more bits
+  (the power and clock gating of `PCGCCTL`), which this model does not have. I am also not sure that a reset leaves `HPRT` alone, power (`PPWR`) included: if the manual's "all CSR bits" includes it, a reset would drop the port, which the firmware would meet by powering it again. I kept it because the firmware does the reset before it powers the port. The firmware does the
+  reset early in its init and programs everything after it, so it cannot tell, and it boots as before
+  (612 million instructions to the second prompt).
+  `TXFFLSH` drops the data staged for packets that have not gone, and a packet that was ready to go
+  with it, in the FIFO `TXFNUM` names (0 the non-periodic one, which control and bulk channels send
+  through, 1 the periodic one, for interrupt and isochronous channels, 0x10 both); an OUT transfer
+  with no data has nothing in the FIFO and is left alone. `RXFFLSH` empties the RX FIFO.
+- A system reset or the port losing its power (`PPWR` cleared with a device connected) resets the
+  device too, as a chip reset or a power-down does to a device on the cable. It is what makes
+  `KeyReport::polled()` false again until the firmware has restarted its USB stack, so the window's
+  keys go back to the console in between (below).
+- A NAK is reported as `HCINT.NAK` for every endpoint type, and the core does not retry it. For
+  control and bulk transfers the core would, in DMA mode; in slave mode, which is what the firmware
+  runs, the driver starts the channel again, and the firmware does: its interrupt handler (the one
+  at 0x08010304, with the IN transfers' `NAK` branch) halts the channel on a NAK whatever the
+  endpoint type, and the halt interrupt starts the transfer again. So the model leaves the transfer
+  enabled, and a NAKed control IN is completed by the firmware's restart (tested). The keyboard
+  never NAKs endpoint 0 anyway. I have not seen a device that does, so this is from reading the
+  handler and not from a measurement.
+- The keyboard clears a SET_ADDRESS that was not followed by its status stage when the next SETUP
+  arrives, so the address it was asked for does not turn up later.
 - The device answers a request for string 0 with a STALL, which the firmware tolerates. The keyboard
   also stalls the interrupt endpoint until `SET_CONFIGURATION`, and answers every request that is not
   one of those in section 3 with a stall.
@@ -540,7 +578,7 @@ slices of a million), at the same speed.
 |---|---|---|
 | `GSNPSID` | 0x4F54310A | the id the firmware checks for, and low half 0x310A (not above 0x4209) |
 | `GHWCFG1` | 0 | every endpoint bidirectional |
-| `GHWCFG2` | 0x029AD500 | slave mode only, dedicated FS PHY, 6 device endpoints, 12 host channels, dynamic FIFO sizing, periodic support, queues of 8 |
+| `GHWCFG2` | 0x028ED500 | slave mode only (bits 4:3), dedicated FS PHY (9:8), 6 device endpoints (13:10 = 5), 12 host channels (17:14 = 11), periodic support (18), dynamic FIFO sizing (19), queues of 8 (23:22 and 25:24 = 2); the OTG mode, multiprocessor interrupt (20) and token queue depth 0 |
 | `GHWCFG3` | 0x040000E8 | 1024 words of FIFO, 19 bit transfer size and 10 bit packet count (the widths of `HCTSIZ`), OTG enabled |
 | `GHWCFG4` | 0 | |
 | `GNPTXSTS`, `HPTXSTS` | 0x00080200, 0x00080100 | room for 8 requests, 0x200 and 0x100 words |
@@ -566,22 +604,115 @@ the firmware within a few milliseconds of machine time: `KEYDOWN(0)` was 1 and `
 polls is never seen, which is also what a real keyboard does, so a front end should hold a key
 until it has been polled (issue 52).
 
-**The window's keys (issue 52).** `cmm2-emulator` plugs a `HidKeyboard` into the port with `--window`
+**The window's keys (issues 52 and after).** `cmm2-emulator` plugs a `HidKeyboard` into the port with `--window`
 (unless `--console-keys`) and `usb_keys.rs` drives its `KeyReport` from SDL: scancodes are the usages
 (0x04 to 0x65 and the modifiers 0xE0 to 0xE7), the report is the modifier byte and up to six keys in
 press order, more than six is `0x01` in all six slots, SDL's repeats are ignored and a lost focus lets
-go of everything. Two hooks in the core serve it: `KeyReport::polled()` is true from the first
-interrupt IN on the keyboard's endpoint after `SET_CONFIGURATION` (and false again after a bus reset),
+go of everything. Three hooks in the core serve it: `KeyReport::polled()` is true from the first
+interrupt IN on the keyboard's endpoint after `SET_CONFIGURATION` (and false again after a bus reset,
+a system reset or the port losing its power), `KeyReport::leds()` is the LED byte the firmware set,
 and `KeyReport::was_sent()` is true once the keyboard has handed over, or found the firmware already
-had, the report as it now is. A key that is let go stays in the report until `was_sent()`, so a tap
-between two polls is seen. Until `polled()` the window types console bytes, which the first-boot
-question needs; from then on it sends reports only. A key held across the switch was typed on the
-console, so it is typed once and is not in the report (its release is ignored and its next press is
-USB's); the modifiers are always in the report. Measured in the release build, with the keyboard
-attached from reset, the firmware polls about 299 million instructions after the second prompt: 1.4 s
-of machine time, and 5.5 to 6 s of host time unpaced. A modifier let go before a pending key has been
-sent goes out first, as in one run the firmware did not poll a running loop for two slices of about 10 ms,
-so a very quick Ctrl-C can arrive as `c`; a held Ctrl, as a finger does, is not affected.
+had, the report as it now is.
+
+**The report is the keys that are held.** Each poll the keyboard reports the keys that are down at that
+moment, as a real keyboard does: the modifiers and up to six keys in press order, `0x01` in all six
+slots with more than six down. A held key is in every report for as long as it is held, so the
+firmware repeats it itself and `KEYDOWN()` sees it, and keys that are held together appear together.
+(An earlier version queued a report for every change of the keys and sent one per poll. It could
+not keep up with typing: a keystroke cost two reports of 25 ms each, so it drained about five
+characters a second of host time unpaced, and it would have replayed a stall minutes late. That
+version, and the one before it, which dropped a Shift as soon as its own press was sent, typed
+`a` for a quick Shift and `a`, and `l` for `ll`, both of which the real firmware showed.)
+
+The one thing added to a real keyboard, because the emulator is polled more slowly than real time: a
+key that is let go before a poll has reported it stays in the report until one has, together with
+the modifiers that were down when it went down, so a tap is never lost, Shift with a letter types the
+capital however soon the Shift comes up, and Ctrl-C arrives. A tap is two polls, the key and then
+the report without it, as on hardware. What cannot share a report waits for the next:
+ - the same key again (it is reported, then let go for a poll, then reported again, so `ll` types two);
+ - a key that went down with different modifiers than one still waiting (`a` and then a quick
+   Shift with `B` are two reports, so `a` is not typed as `A`);
+ - a seventh key at once (taps over six in one go are six and then the rest, in order);
+ - everything after the first of these that waits, so the order is kept.
+A modifier pressed after a waiting key is held back from the report with it, and appears in the next.
+A key that is down when there are more than six is the rollover error, as before, and the keys
+are counted as told of.
+
+So typing faster than one key per poll can put two different keys in one report. They are both typed,
+in the order they were pressed, as the firmware types every key that is in a report and was not in
+the one before in slot order. Nothing a user types is lost this way. What can be lost: a key
+pressed and let go while the firmware is not polling is kept and typed late, six at a time, when it
+does (there is no bound on how many are kept; the firmware does not stop polling short of a reset,
+which drops them); a seventh key pressed while six are held (the rollover error, as on a keyboard);
+and a modifier that is tapped on its own and held back stays until the key before it has gone.
+
+Property tested (`usb_keys.rs`, 3000 random sequences of presses and releases of three keys and three
+modifiers, with the firmware polling at random in between, and no more than one key going down
+between two polls): a model of the firmware types exactly the keys that were pressed, in order, each
+with the modifiers that were down when it was pressed. On the real firmware: a held `a` is
+`KEYDOWN(1)` = 97 in every one of the readings 20 ms apart after the first (none lost in 40); a key
+held at the prompt for 2 s of machine time typed 21 characters (the firmware's own repeat: with a first
+delay of about half a second that is a repeat about every 75 ms, which I worked out from the count and
+did not measure directly); a quick Shift and a
+letter types the capital, Ctrl-C stops a program (also behind 40 taps), and `PRINT 1+2` is typed.
+
+The speed, measured on the real firmware (release build) with everything pressed at once:
+
+| Burst | Polls | Machine time | Host time, unpaced |
+|---|---|---|---|
+| 25 different lowercase letters | 6 | 0.14 s | 0.63 s |
+| 25 different letters with Shift | 6 | 0.15 s | 0.64 s |
+| the same key 20 times | 40 | 0.99 s | 4.1 s |
+
+The machine time is real time when the emulator is paced and keeps up; unpaced the host is 4 to 6
+times slower here. So different keys go at about 180 a second paced and 40 unpaced, and the
+same key twice in a row, which needs the key let go in between, 20 a second paced and 5 unpaced, which
+is the limit for typing `ll`, `ss` and `oo` fast. The window also looks at the keys every 16 ms of
+host time, and a report goes out at a look or an event: a quick sequence of keys one after another,
+a key at a time, is one key per look at worst, 60 a second. None of this is below what a typist does.
+Until `polled()` the window types console bytes, which the first-boot question needs; from then on it
+sends reports only. A key held across the switch was typed on the console, so it is typed once and is
+not in the report (its release is ignored and its next press is USB's); the modifiers are always in
+the report. After a system reset, or the port losing its power, `polled()` is false again (the core
+resets the device), the keys held and waiting are dropped, and the window is back to console keys until
+the firmware starts polling again, which is also when a question asked before the USB stack is up can be
+answered. Measured in the release build, with the keyboard attached from reset, the firmware polls
+about 299 million instructions after the second prompt: 1.4 s of machine time, and 5.5 to 6 s of host
+time unpaced.
+
+**AltGr.** On the console path AltGr makes a character, which arrives as text, so Ctrl does not
+make a control code when Right Alt is also down (Windows reports AltGr as Left Ctrl with Right Alt).
+On Linux AltGr is Right Alt alone, so Ctrl with Right Alt and a letter makes no control code there
+either; Ctrl with Left Alt does. On the USB path, on Windows only (`cfg(windows)`), a Right Alt that comes straight after a Left
+Control (the Control the last key down) takes the Control back if the firmware has not been sent it yet:
+the window handles the two events of AltGr in one batch with no machine time between, so the Control is
+still waiting, and it is dropped as if it had not been pressed. A Control the firmware has had, or that
+was not the last key down, is a real one. Off Windows a real Ctrl with Right Alt in one batch is what it
+says. I have not tried it on Windows: it relies on Windows sending the Control and the Alt of AltGr as two
+key downs in a row, which I remember and have not checked, and a window that gets the two in different
+batches (a look between them) lets the firmware see a Control on its own, which is harmless.
+
+**The lock keys.** The firmware keeps Caps Lock and Num Lock itself and sets the keyboard's LEDs
+(`KeyReport::leds()`, bit 0 num lock, bit 1 caps lock). The key presses reach it, so the window and
+the firmware stay in step once they agree, but not if the host's lock was already on when the window
+opened or was toggled while the window had no focus. So the window reads the host's locks
+(`SDL_GetModState`) and, the first time after the firmware starts polling and again whenever the
+window gets the focus, taps the Caps Lock or Num Lock key if the firmware's LED does not agree with
+the host's. It is one tap and not a loop, so a lock that the firmware never shows is tapped once and
+left. The comparison waits until the LEDs are the firmware's: measured after
+`OPTION KEYBOARD UK,1,1` and a restart (both locks on), the LEDs are 0 at the first poll and the
+firmware's own SET_REPORT (both on) comes about 430,000 instructions later, so a comparison at the
+first poll tapped both locks off. The keyboard counts the firmware's SET_REPORTs
+(`KeyReport::led_updates()`) and its polls (`polls()`, both from the last reset), and the window waits
+for the first SET_REPORT, or for 200 polls (1.2 s of machine time at 6 ms a poll) if the firmware never
+sends one; after a lock key it waits for the next one, or the same 200 polls, so a lock key pressed
+just before the focus came back is not tapped again; and it waits until no key is waiting to be sent and the report is sent, and while the user holds a lock key (the release would take the tap's key up). Measured: a
+tap of Caps Lock sets bit 1 within a few milliseconds and a second tap clears it, and the next
+letter is a capital; with both locks on at the host and the firmware, nothing is tapped. Num Lock
+is handled the same way: a tap of it was measured (`real_firmware_shows_num_lock_on_the_leds_over_usb`), LED bit 0 is set and the firmware sends exactly one SET_REPORT for it. SDL does not report the host's Num
+Lock on macOS (it reads as off), so there the window leaves Num Lock as the firmware has it; a
+Wayland compositor that did not report it would turn the firmware's Num Lock off at each focus
+change, and I do not know of one. Scroll Lock is not followed.
 
 The mouse and the gamepad (issues after) need a composite device or a second device behind a hub,
 which the port does not have.

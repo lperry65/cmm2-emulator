@@ -1143,3 +1143,51 @@ fn real_firmware_runs_each_mode_at_its_frame_rate() {
     println!("640 x 480: {hz_640:.3} Hz");
     assert!((hz_640 - 74.725).abs() < 0.01, "{hz_640}");
 }
+
+// A restart takes the USB stack down: the keyboard is not polled until the firmware has brought
+// it up again, so a front end knows to type into the console in between.
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test --release -- --ignored"]
+fn real_firmware_polls_a_usb_keyboard_again_after_a_restart() {
+    let mut boot = boot_with_usb_keyboard();
+    // The first poll has been started, and the keyboard has answered it a little later.
+    run_and_collect(&mut boot, 5_000_000);
+    assert!(boot.keys.polled() && boot.keys.was_sent());
+    let restarts = boot.cpu.resets();
+    boot.console.push_input(b"CPU RESTART\r");
+    let limit = boot.cpu.instruction_count() + 100_000_000;
+    while boot.cpu.resets() == restarts {
+        assert!(boot.cpu.instruction_count() < limit, "no restart");
+        run_and_collect(&mut boot, 100_000);
+    }
+    assert!(!boot.keys.polled() && !boot.keys.was_sent());
+    let limit = boot.cpu.instruction_count() + 1_500_000_000;
+    while !boot.keys.polled() {
+        assert!(
+            boot.cpu.instruction_count() < limit,
+            "no poll after the restart"
+        );
+        run_and_collect(&mut boot, 1_000_000);
+    }
+}
+
+// The firmware shows the lock keys on the keyboard's LEDs with SET_REPORT, which a front end reads
+// to keep the host's locks and the firmware's the same.
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test --release -- --ignored"]
+fn real_firmware_shows_the_lock_keys_of_a_usb_keyboard_on_its_leds() {
+    const CAPS_LOCK: u8 = 0x39;
+    let mut boot = boot_with_usb_keyboard();
+    assert_eq!(boot.keys.leds(), 0);
+    boot.keys.set([0, 0, CAPS_LOCK, 0, 0, 0, 0, 0]);
+    run_and_collect(&mut boot, 5_000_000);
+    boot.keys.set([0; 8]);
+    run_and_collect(&mut boot, 5_000_000);
+    assert_eq!(boot.keys.leds(), 0b010, "caps lock is bit 1");
+    // Tapped again, it is off.
+    boot.keys.set([0, 0, CAPS_LOCK, 0, 0, 0, 0, 0]);
+    run_and_collect(&mut boot, 5_000_000);
+    boot.keys.set([0; 8]);
+    run_and_collect(&mut boot, 5_000_000);
+    assert_eq!(boot.keys.leds(), 0);
+}

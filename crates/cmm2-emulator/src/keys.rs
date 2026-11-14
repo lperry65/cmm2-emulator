@@ -21,10 +21,14 @@ static CONTROL: [u8; 26] = {
 /// The cursor and function keys are the xterm sequences, except Home and End, which are the
 /// VT220 `ESC [ 1 ~` and `ESC [ 4 ~`: measured, the firmware reads those and not xterm's
 /// `ESC [ H` and `ESC [ F`. Backspace is 0x08; the firmware ignores 0x7F.
+///
+/// AltGr is not Ctrl: where SDL reports it as Left Ctrl with Right Alt (as it does on Windows),
+/// the key makes a character, which comes as text, and not a control code. Right Alt with Ctrl
+/// gives no control code anywhere, as on Linux AltGr is Right Alt alone, and nobody breaks a
+/// program with Ctrl and AltGr: Ctrl with Left Alt still does.
 pub fn key_bytes(keycode: Keycode, keymod: Mod) -> Option<&'static [u8]> {
-    if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD)
-        && let Some(code) = control_code(keycode)
-    {
+    let ctrl = keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD) && !keymod.contains(Mod::RALTMOD);
+    if ctrl && let Some(code) = control_code(keycode) {
         return Some(code);
     }
     Some(match keycode {
@@ -135,6 +139,23 @@ mod tests {
         assert_eq!(
             key_bytes(Keycode::C, Mod::LCTRLMOD | Mod::LSHIFTMOD),
             Some(&b"\x03"[..])
+        );
+    }
+
+    #[test]
+    fn altgr_is_not_ctrl_when_it_comes_as_ctrl_with_right_alt() {
+        // The characters AltGr makes are text, so the letters have no bytes here.
+        assert_eq!(key_bytes(Keycode::E, Mod::LCTRLMOD | Mod::RALTMOD), None);
+        assert_eq!(key_bytes(Keycode::Q, Mod::LCTRLMOD | Mod::RALTMOD), None);
+        // Left Alt is not AltGr.
+        assert_eq!(
+            key_bytes(Keycode::C, Mod::LCTRLMOD | Mod::LALTMOD),
+            Some(&b"\x03"[..])
+        );
+        // And the keys that are not letters are what they were.
+        assert_eq!(
+            key_bytes(Keycode::Left, Mod::LCTRLMOD | Mod::RALTMOD),
+            plain(Keycode::Left)
         );
     }
 

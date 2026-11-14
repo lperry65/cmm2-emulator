@@ -58,6 +58,14 @@ struct Shared {
     sent: Cell<bool>,
     /// The firmware has asked for a report at least once since the keyboard was reset.
     polled: Cell<bool>,
+    /// The LED byte the firmware last set: num, caps and scroll lock in bits 0 to 2.
+    leds: Cell<u8>,
+    /// How many times the firmware has set the LEDs since the keyboard was reset.
+    led_updates: Cell<u32>,
+    /// How many times the firmware has polled since the keyboard was reset: the keyboard's clock,
+    /// every 6 ms of machine time while there is nothing to send, and about every 25 ms while
+    /// there is (docs/usb-host.md section 12).
+    polls: Cell<u32>,
 }
 
 impl KeyReport {
@@ -89,6 +97,24 @@ impl KeyReport {
     pub fn polled(&self) -> bool {
         self.0.polled.get()
     }
+
+    /// The LED byte the firmware last set (num lock is bit 0, caps lock bit 1, scroll lock bit
+    /// 2), which is the state of the locks as the firmware has them. 0 again after a reset.
+    pub fn leds(&self) -> u8 {
+        self.0.leds.get()
+    }
+
+    /// How many times the firmware has set the LEDs since the keyboard was reset. It is 0 until
+    /// it has, which is a little after its first poll, and `leds()` is not the firmware's
+    /// state before then.
+    pub fn led_updates(&self) -> u32 {
+        self.0.led_updates.get()
+    }
+
+    /// How many times the firmware has polled since the keyboard was reset.
+    pub fn polls(&self) -> u32 {
+        self.0.polls.get()
+    }
 }
 
 /// The device. The firmware asks it for the report with an interrupt IN token every few
@@ -105,7 +131,6 @@ pub struct HidKeyboard {
     control: Control,
     /// The data stage of a SET_REPORT is next.
     expect_leds: bool,
-    leds: u8,
 }
 
 enum Control {
@@ -123,13 +148,12 @@ impl HidKeyboard {
             configured: false,
             control: Control::Data(Vec::new()),
             expect_leds: false,
-            leds: 0,
         }
     }
 
     /// The LED byte the firmware last set: num, caps and scroll lock in bits 0 to 2.
     pub fn leds(&self) -> u8 {
-        self.leds
+        self.keys.leds()
     }
 
     // What a GET_DESCRIPTOR of `kind` and `index` is answered with.
@@ -184,13 +208,19 @@ impl UsbDevice for HidKeyboard {
     }
 
     fn reset(&mut self) {
-        // The firmware starts again: it has no report and has not polled.
+        // The firmware starts again: it has no report, has not polled and has set no LEDs.
         self.keys.0.sent.set(false);
         self.keys.0.polled.set(false);
+        self.keys.0.leds.set(0);
+        self.keys.0.led_updates.set(0);
+        self.keys.0.polls.set(0);
         *self = HidKeyboard::new(self.keys.clone());
     }
 
     fn setup(&mut self, packet: [u8; 8]) {
+        // A new request ends the last one, and a SET_ADDRESS the host did not finish is no
+        // address.
+        self.new_address = None;
         self.expect_leds = false;
         self.control = match self.answer(packet) {
             Some(data) => Control::Data(data),
@@ -204,7 +234,9 @@ impl UsbDevice for HidKeyboard {
             return Out::Stall;
         }
         if let (true, Some(&leds)) = (self.expect_leds, data.first()) {
-            self.leds = leds;
+            self.keys.0.leds.set(leds);
+            let updates = &self.keys.0.led_updates;
+            updates.set(updates.get().saturating_add(1));
             self.expect_leds = false;
         }
         Out::Ack
@@ -222,15 +254,18 @@ impl UsbDevice for HidKeyboard {
                 In::Data(packet)
             }
             (1, _) if self.configured => {
-                self.keys.0.polled.set(true);
+                let shared = &self.keys.0;
+                shared.polled.set(true);
+                shared.polls.set(shared.polls.get().saturating_add(1));
                 // Either way the firmware has the report as it is after this.
-                self.keys.0.sent.set(true);
+                shared.sent.set(true);
                 let report = self.keys.get();
                 if report == self.sent {
-                    return In::Nak;
+                    In::Nak
+                } else {
+                    self.sent = report;
+                    In::Data(report.to_vec())
                 }
-                self.sent = report;
-                In::Data(report.to_vec())
             }
             _ => In::Stall,
         }
@@ -387,6 +422,17 @@ mod tests {
     }
 
     #[test]
+    fn a_set_address_that_was_given_up_on_does_not_take_effect_later() {
+        let (mut kb, _) = keyboard();
+        kb.setup([0x00, 0x05, 5, 0, 0, 0, 0, 0]);
+        // The host never ran the status stage, and asks something else.
+        control_in(&mut kb, get_descriptor(1, 0, 8)).unwrap();
+        assert_eq!(kb.address(), 0);
+        assert!(control_no_data(&mut kb, [0x00, 0x09, 1, 0, 0, 0, 0, 0]));
+        assert_eq!(kb.address(), 0);
+    }
+
+    #[test]
     fn the_address_is_seven_bits() {
         let (mut kb, _) = keyboard();
         assert!(control_no_data(&mut kb, [0x00, 0x05, 0x81, 0, 0, 0, 0, 0]));
@@ -448,6 +494,18 @@ mod tests {
         assert_eq!(kb.out(0, &[0b010]), Out::Ack);
         assert_eq!(kb.in_token(0, 8), In::Data(Vec::new()));
         assert_eq!(kb.leds(), 0b010);
+    }
+
+    #[test]
+    fn the_led_byte_is_on_the_shared_report_and_a_bus_reset_clears_it() {
+        let (mut kb, report) = keyboard();
+        assert_eq!(report.leds(), 0);
+        kb.setup([0x21, 0x09, 0, 0x02, 0, 0, 1, 0]);
+        kb.out(0, &[0b011]);
+        assert_eq!(report.leds(), 0b011);
+        kb.reset();
+        assert_eq!(report.leds(), 0);
+        assert_eq!(kb.leds(), 0);
     }
 
     #[test]
@@ -622,6 +680,31 @@ mod tests {
         kb.in_token(1, 8);
         kb.reset();
         assert!(!report.was_sent());
+    }
+
+    #[test]
+    fn a_bus_reset_drops_the_counts() {
+        let (mut kb, report) = configured();
+        kb.in_token(1, 8);
+        kb.setup([0x21, 0x09, 0, 0x02, 0, 0, 1, 0]);
+        kb.out(0, &[1]);
+        assert_eq!((report.polls(), report.led_updates()), (1, 1));
+        kb.reset();
+        assert_eq!((report.polls(), report.led_updates()), (0, 0));
+    }
+
+    #[test]
+    fn every_interrupt_in_is_a_poll_and_every_set_report_a_led_update() {
+        let (mut kb, report) = configured();
+        for _ in 0..3 {
+            kb.in_token(1, 8);
+        }
+        assert_eq!(report.polls(), 3);
+        for leds in [1, 1] {
+            kb.setup([0x21, 0x09, 0, 0x02, 0, 0, 1, 0]);
+            kb.out(0, &[leds]);
+        }
+        assert_eq!(report.led_updates(), 2);
     }
 
     #[test]

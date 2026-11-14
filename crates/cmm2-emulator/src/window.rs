@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use cmm2_core::{Frame, FrameError};
 use sdl2::EventPump;
 use sdl2::event::{Event, WindowEvent};
+use sdl2::keyboard::{KeyboardUtil, Mod};
 use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::Rect;
 use sdl2::render::{Canvas, TextureCreator};
@@ -16,6 +17,12 @@ use sdl2::video::{Window as SdlWindow, WindowContext};
 
 use crate::keys::{key_bytes, text_bytes};
 use crate::usb_keys::{UsbKeys, usage};
+
+/// Whether SDL reports the host's Num Lock. On macOS it does not (its keyboards have none), and
+/// where it is not reported it reads as off, so following it would turn the firmware's off at
+/// every focus change. Other hosts, Wayland included, are taken to report it; if one did not,
+/// the same would happen there.
+const NUM_LOCK_REPORTED: bool = !cfg!(target_os = "macos");
 
 /// The window opens at this size; it can be resized.
 const START_SIZE: (u32, u32) = (800, 600);
@@ -50,6 +57,8 @@ pub struct Window {
     drawn: Option<Instant>,
     /// The USB keyboard's keys, if the window drives it.
     usb: Option<UsbKeys>,
+    /// Where the host's lock keys are read from.
+    keyboard: KeyboardUtil,
 }
 
 impl Window {
@@ -68,6 +77,7 @@ impl Window {
         let canvas = sdl(window.into_canvas().build())?;
         let textures = canvas.texture_creator();
         let events = sdl(context.event_pump())?;
+        let keyboard = context.keyboard();
         Ok(Window {
             canvas,
             textures,
@@ -76,6 +86,7 @@ impl Window {
             complaint: Complaint::default(),
             drawn: None,
             usb,
+            keyboard,
         })
     }
 
@@ -100,13 +111,21 @@ impl Window {
             }
             Err(err) => {
                 if self.complaint.is_new(&err) {
-                    eprintln!("cmm2-emulator: no picture: {err}");
+                    // Through the writer that a signal can interrupt: a standard error that
+                    // nobody reads would block `eprintln!`.
+                    crate::say(format!("no picture: {err}"));
                 }
             }
         }
         self.draw()?;
         if let Some(usb) = &mut self.usb {
             usb.sync();
+            // The firmware keeps its own caps lock and num lock; this brings them to the host's.
+            let locks = self.keyboard.mod_state();
+            usb.follow_locks(
+                locks.contains(Mod::CAPSMOD),
+                NUM_LOCK_REPORTED.then(|| locks.contains(Mod::NUMMOD)),
+            );
         }
         // Whether the keys are USB's is settled for the whole batch: the firmware cannot start
         // polling while the events are handled.
@@ -145,6 +164,15 @@ impl Window {
                 } => {
                     if let Some(usb) = &mut self.usb {
                         usb.release_all();
+                    }
+                }
+                // A lock may have been toggled while the window was not looking.
+                Event::Window {
+                    win_event: WindowEvent::FocusGained,
+                    ..
+                } => {
+                    if let Some(usb) = &mut self.usb {
+                        usb.check_locks();
                     }
                 }
                 _ => {}
@@ -368,12 +396,16 @@ mod tests {
     }
 
     fn push_focus_lost() {
+        push_focus(SDL_WindowEventID::SDL_WINDOWEVENT_FOCUS_LOST);
+    }
+
+    fn push_focus(what: SDL_WindowEventID) {
         let mut event = SDL_Event {
             window: SDL_WindowEvent {
                 type_: SDL_EventType::SDL_WINDOWEVENT as u32,
                 timestamp: 0,
                 windowID: 0,
-                event: SDL_WindowEventID::SDL_WINDOWEVENT_FOCUS_LOST as u8,
+                event: what as u8,
                 padding1: 0,
                 padding2: 0,
                 padding3: 0,
@@ -412,6 +444,8 @@ mod tests {
         push_text("é");
         push_keycode(Keycode::Return, Mod::NOMOD);
         push_keycode(Keycode::LShift, Mod::NOMOD);
+        // AltGr is Ctrl and Alt on Windows, and the character it makes comes as text.
+        push_keycode(Keycode::E, Mod::LCTRLMOD | Mod::RALTMOD);
         assert!(update(&mut window, &mut typed));
         assert_eq!(typed, b"a\x1b[D\x03\r");
         assert_eq!(report.get(), [0; 8]);
@@ -456,6 +490,7 @@ mod tests {
         push_key(Keycode::B, Some(Scancode::B), Mod::LSHIFTMOD, true, true);
         assert!(update(&mut window, &mut typed));
         assert_eq!(typed, b"a\x1b[D\x03\rb");
+        // Two keys pressed with no poll between them are one report.
         assert_eq!(report.get(), [2, 0, 0x04, 0x50, 0, 0, 0, 0]);
 
         // A release changes the report, and a key held across the switch (B) has no effect.
@@ -465,8 +500,7 @@ mod tests {
         assert!(update(&mut window, &mut typed));
         assert_eq!(report.get(), [2, 0, 0x50, 0, 0, 0, 0, 0]);
 
-        // A key tapped between two polls is in the report until the firmware has it, and the
-        // next look, with no event, lets it go.
+        // A key tapped between two polls is sent, and the report after it, one at each poll.
         push_key(Keycode::C, Some(Scancode::C), Mod::LSHIFTMOD, true, false);
         push_key(Keycode::C, Some(Scancode::C), Mod::LSHIFTMOD, false, false);
         assert!(update(&mut window, &mut typed));
@@ -476,10 +510,59 @@ mod tests {
         assert_eq!(report.get(), [2, 0, 0x50, 0, 0, 0, 0, 0]);
 
         // Losing the focus lets go of everything.
+        keyboard.in_token(1, 8);
         push_focus_lost();
         assert!(update(&mut window, &mut typed));
         assert_eq!(report.get(), [0; 8]);
         assert_eq!(typed, b"a\x1b[D\x03\rb");
+
+        // The firmware has set the LEDs, which is what the locks wait for.
+        keyboard.setup([0x21, 0x09, 0, 0x02, 0, 0, 1, 0]);
+        keyboard.out(0, &[0]);
+        // The host's caps lock was on while the window was away, and is brought to the
+        // firmware's when the focus comes back.
+        window.keyboard.set_mod_state(Mod::CAPSMOD);
+        keyboard.in_token(1, 8);
+        push_focus(SDL_WindowEventID::SDL_WINDOWEVENT_FOCUS_GAINED);
+        assert!(update(&mut window, &mut typed));
+        assert!(update(&mut window, &mut typed));
+        assert_eq!(report.get(), [0, 0, 0x39, 0, 0, 0, 0, 0]);
+        keyboard.in_token(1, 8);
+        assert!(update(&mut window, &mut typed));
+        assert_eq!(report.get(), [0; 8]);
+        window.keyboard.set_mod_state(Mod::NOMOD);
+
+        // AltGr on Windows is Left Ctrl and Right Alt in a row, and the report is the Alt; on
+        // other hosts the two are what they say.
+        keyboard.in_token(1, 8);
+        let altgr = Mod::LCTRLMOD | Mod::RALTMOD;
+        push_key(
+            Keycode::LCtrl,
+            Some(Scancode::LCtrl),
+            Mod::LCTRLMOD,
+            true,
+            false,
+        );
+        push_key(Keycode::RAlt, Some(Scancode::RAlt), altgr, true, false);
+        assert!(update(&mut window, &mut typed));
+        for _ in 0..4 {
+            keyboard.in_token(1, 8);
+            assert!(update(&mut window, &mut typed));
+        }
+        let expected = if cfg!(windows) { 0x40 } else { 0x41 };
+        assert_eq!(report.get(), [expected, 0, 0, 0, 0, 0, 0, 0]);
+        push_key(Keycode::RAlt, Some(Scancode::RAlt), altgr, false, false);
+        push_key(
+            Keycode::LCtrl,
+            Some(Scancode::LCtrl),
+            Mod::LCTRLMOD,
+            false,
+            false,
+        );
+        assert!(update(&mut window, &mut typed));
+        keyboard.in_token(1, 8);
+        assert!(update(&mut window, &mut typed));
+        assert_eq!(report.get(), [0; 8]);
 
         // Without USB keys the keys are the console's whatever the firmware does.
         window.usb = None;

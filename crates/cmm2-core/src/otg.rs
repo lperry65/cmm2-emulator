@@ -29,6 +29,9 @@ pub const OTG_SIZE: u32 = 0x2_0000;
 const OTG_IRQ: u16 = 101;
 const CHANNELS: usize = 12;
 
+/// The frame number counts to 0x3FFF and starts again at 0, as RM0433 gives HFNUM.FRNUM.
+const FRNUM_MASK: u64 = 0x3FFF;
+
 const CYCLES_PER_US: u64 = CORE_HZ / 1_000_000;
 const CYCLES_PER_FRAME: u64 = CORE_HZ / 1_000;
 // The delays are my choices, from the spike: the firmware does not look at any of them. A
@@ -75,7 +78,12 @@ const CH_HCTSIZ: u32 = 0x10;
 const GAHBCFG_GINT: u32 = 1;
 
 // GRSTCTL.
+const CSRST: u32 = 1 << 0;
 const RXFFLSH: u32 = 1 << 4;
+const TXFFLSH: u32 = 1 << 5;
+const TXFNUM_SHIFT: u32 = 6;
+const TXFNUM_MASK: u32 = 0x1F;
+const TXFNUM_ALL: u32 = 0x10;
 const CSRST_DONE: u32 = 1 << 29;
 const AHBIDL: u32 = 1 << 31;
 
@@ -112,16 +120,20 @@ const NAK: u32 = 1 << 4;
 const ACK: u32 = 1 << 5;
 const TXERR: u32 = 1 << 7;
 
-// GHWCFG1 to 4 are guesses: I have not read them from the board, and the firmware reads only
-// GHWCFG2. I picked them to describe the H743's OTG with the embedded full-speed PHY as the
-// reference manual does, and they agree with how the firmware sets the core up.
+// GHWCFG1 to 4 are guesses: I have not read them from the board, and I do not know that the
+// reference manual describes them; the firmware reads only GHWCFG2. I picked them to describe
+// the H743's OTG with the embedded full-speed PHY by the Synopsys core's usual layout, and they
+// agree with how the firmware sets the core up.
 //  - GHWCFG1: 0, every endpoint bidirectional.
-//  - GHWCFG2: slave mode only (OTG_ARCH 0), dedicated FS PHY, 6 device endpoints, 12 host
-//    channels, dynamic FIFO sizing, periodic support, and queues of 8 entries.
+//  - GHWCFG2: slave mode only (OTG_ARCH 0), dedicated FS PHY (bits 9:8 = 1), 6 device
+//    endpoints (bits 13:10 = 5, the count after endpoint 0), 12 host channels (bits 17:14 = 11),
+//    periodic support (bit 18), dynamic FIFO sizing (bit 19), and queues of 8 entries (2 in
+//    bits 23:22 and 25:24); the rest, the OTG mode, the multiprocessor interrupt (bit 20) and
+//    the token queue depth, 0.
 //  - GHWCFG3: a data FIFO of 1024 words, the width of the transfer and packet counters
 //    (HCTSIZ: 19 and 10 bits), and OTG enabled.
 //  - GHWCFG4: 0.
-const GHWCFG2_VALUE: u32 = 0x029A_D500;
+const GHWCFG2_VALUE: u32 = 0x028E_D500;
 const GHWCFG3_VALUE: u32 = 0x0400_00E8;
 // GSNPSID is a guess too. The firmware wants the top half to be one of three Synopsys ids,
 // and for the low half not to be above 0x4209, or it waits for CSRST_DONE in GRSTCTL instead
@@ -136,6 +148,8 @@ const HPTXSTS_VALUE: u32 = 0x0008_0100;
 // has edited them; the SVD's values would give a different result.
 const GUSBCFG_RESET: u32 = 0x1440;
 const HCFG_RESET: u32 = 0x200;
+// HCFG.FSLSPCS, the clock for the speed of the PHY.
+const HCFG_FSLSPCS: u32 = 3;
 
 // HPRT: the bits the firmware can set and clear as it likes, and the bits that clear when a 1
 // is written to them.
@@ -157,6 +171,7 @@ const SETUP_DPID: u32 = 3;
 // HCCHAR.
 const MPSIZ_MASK: u32 = 0x7FF;
 const EPNUM_SHIFT: u32 = 11;
+const EPTYP_SHIFT: u32 = 18;
 const EPDIR_IN: u32 = 1 << 15;
 const DAD_SHIFT: u32 = 22;
 
@@ -182,6 +197,11 @@ struct Channel {
 impl Channel {
     fn input(&self) -> bool {
         self.hcchar & EPDIR_IN != 0
+    }
+
+    /// Isochronous and interrupt endpoints send through the periodic FIFO.
+    fn periodic(&self) -> bool {
+        self.hcchar >> EPTYP_SHIFT & 1 != 0
     }
 
     fn max_packet(&self) -> usize {
@@ -260,7 +280,7 @@ impl OtgRegisters {
         let left = CYCLES_PER_FRAME - now % CYCLES_PER_FRAME;
         let interval = u64::from(self.stored.read(HFIR) & 0xFFFF);
         let remaining = (interval * left / CYCLES_PER_FRAME) as u32;
-        remaining << 16 | (self.frame() & 0xFFFF) as u32
+        remaining << 16 | (self.frame() & FRNUM_MASK) as u32
     }
 
     // Channel n's interrupt flags that the firmware asked to hear of.
@@ -332,6 +352,42 @@ impl OtgRegisters {
             sof_seen: self.frame(),
             ..State::default()
         };
+        // The device is reset with the chip: whatever the firmware had set up with it is gone.
+        self.port.with_device(|device| device.reset());
+    }
+
+    // A core soft reset: the state machines go idle and the FIFOs empty, so the channels, the
+    // RX queue and the flags the core latched are cleared, and so are the registers, which go
+    // back to what a reset leaves except for the speed bits of HCFG. The port keeps its state,
+    // as the device stays connected. This is from my memory of RM0433, which I have not checked:
+    // I remember it keeping a few more bits (the power and clock gating of PCGCCTL, and
+    // DCFG.DSPD, which this core does not have). The firmware does it before it sets anything
+    // up, so it cannot tell.
+    fn soft_reset(&mut self) {
+        let speed = self.stored.read(HCFG) & HCFG_FSLSPCS;
+        self.stored.reset(ResetCause::Software);
+        self.stored.write(GUSBCFG, GUSBCFG_RESET, !0);
+        self.stored.write(HCFG, HCFG_RESET | speed, !0);
+        let state = &mut self.state;
+        state.rx.clear();
+        state.latched = 0;
+        state.channels = Default::default();
+    }
+
+    // The transmit FIFOs `fifo` names are emptied: 0 is the non-periodic one, which the control
+    // and bulk channels send through, 1 the periodic one, for the interrupt and isochronous
+    // ones, and 0x10 both. What the firmware wrote for a packet that has not gone is dropped, and
+    // a packet that was ready to go has nothing left to send. An OUT transfer that sends no data
+    // has nothing in the FIFO to lose, and goes on.
+    fn flush_tx(&mut self, fifo: u32) {
+        for channel in &mut self.state.channels {
+            let named = fifo == TXFNUM_ALL || fifo == u32::from(channel.periodic());
+            // Only a channel that sends has anything staged.
+            if named && !channel.staged.is_empty() {
+                channel.staged.clear();
+                channel.due = None;
+            }
+        }
     }
 
     // The port follows the device in the socket and the power: a device that is plugged in
@@ -343,6 +399,10 @@ impl OtgRegisters {
         let wanted = self.state.hprt & PPWR != 0 && self.port.attached();
         if self.state.hprt & PCSTS != 0 && (replaced || !wanted) {
             self.disconnect();
+            // A device that has lost its power starts again when it gets it back.
+            if !wanted {
+                self.port.with_device(|device| device.reset());
+            }
         }
         if !wanted {
             self.state.connect_at = None;
@@ -448,13 +508,21 @@ impl OtgRegisters {
         }
     }
 
-    // A word the firmware wrote to the FIFO window of channel n.
-    fn stage(&mut self, n: usize, word: u32) {
+    // What the firmware wrote to the FIFO window of channel n: the bytes of `word` that `mask`
+    // selects, as a byte or halfword write has them. The FIFO takes what it is given: a narrow
+    // write is not widened to a word.
+    fn stage(&mut self, n: usize, word: u32, mask: u32) {
         let Some(channel) = self.state.channels.get_mut(n) else {
             return;
         };
         if !channel.input() {
-            channel.staged.extend(word.to_le_bytes());
+            channel.staged.extend(
+                word.to_le_bytes()
+                    .into_iter()
+                    .zip(mask.to_le_bytes())
+                    .filter(|&(_, lane)| lane == 0xFF)
+                    .map(|(byte, _)| byte),
+            );
             self.arm(n);
         }
     }
@@ -575,15 +643,22 @@ impl Registers for OtgRegisters {
     fn write(&mut self, offset: u32, value: u32, mask: u32) {
         if offset >= FIFO {
             let window = ((offset - FIFO) / FIFO_STRIDE) as usize;
-            self.stage(window, value);
+            self.stage(window, value, mask);
         } else {
             match offset {
                 // Read only, or flags nothing here ever sets.
                 GOTGINT | GNPTXSTS | GSNPSID | GHWCFG1 | GHWCFG2 | GHWCFG3 | GHWCFG4 | HFNUM
                 | HPTXSTS | HAINT | GRXSTSR | GRXSTSP => {}
                 GRSTCTL => {
-                    // The reset and the TX flush are over as soon as they are asked for.
-                    if value & mask & RXFFLSH != 0 {
+                    // The reset and the flushes are over as soon as they are asked for.
+                    let bits = value & mask;
+                    if bits & CSRST != 0 {
+                        self.soft_reset();
+                    }
+                    if bits & TXFFLSH != 0 {
+                        self.flush_tx(bits >> TXFNUM_SHIFT & TXFNUM_MASK);
+                    }
+                    if bits & RXFFLSH != 0 {
                         self.state.rx.clear();
                     }
                 }
@@ -661,12 +736,9 @@ mod tests {
     use crate::usb::UsbDevice;
     use crate::usb_keyboard::{HidKeyboard, KeyReport};
 
-    // GRSTCTL bits the model has nothing to do for: the reset and the TX flush are over at once.
-    const CSRST: u32 = 1 << 0;
-    const TXFFLSH: u32 = 1 << 5;
-
     const GINTSTS_ADDR: u32 = OTG_BASE + GINTSTS;
     const GINTMSK_ADDR: u32 = OTG_BASE + GINTMSK;
+    const GRSTCTL_ADDR: u32 = OTG_BASE + GRSTCTL;
     const GAHBCFG_ADDR: u32 = OTG_BASE + GAHBCFG;
     const HPRT_ADDR: u32 = OTG_BASE + HPRT;
     const HAINT_ADDR: u32 = OTG_BASE + HAINT;
@@ -909,6 +981,10 @@ mod tests {
         assert_eq!(cfg2 >> 3 & 3, 0, "OTG_ARCH: slave only");
         assert_eq!(cfg2 >> 8 & 3, 1, "FSPHYTYPE: dedicated");
         assert_eq!(cfg2 >> 14 & 15, 11, "NUMHSTCHNL: 12 channels");
+        assert_eq!(cfg2 >> 10 & 15, 5, "NUMDEVEPS: 6 endpoints");
+        assert_eq!(cfg2 >> 18 & 1, 1, "PERIOSUPPORT");
+        assert_eq!(cfg2 >> 19 & 1, 1, "DYNFIFOSIZING");
+        assert_eq!((cfg2 >> 22 & 3, cfg2 >> 24 & 3), (2, 2), "queues of 8");
         assert_eq!(
             r.read(OTG_BASE + GHWCFG3) >> 16,
             0x400,
@@ -1297,11 +1373,15 @@ mod tests {
     }
 
     #[test]
-    fn the_frame_number_is_sixteen_bits() {
+    fn the_frame_number_counts_to_0x3fff_and_starts_again() {
         let mut r = rig();
         r.clock.set(300 * CYCLES_PER_FRAME);
         assert_eq!(r.read(OTG_BASE + HFNUM) & 0xFFFF, 300);
-        r.clock.set(0x1_0003 * CYCLES_PER_FRAME);
+        r.clock.set(0x3FFF * CYCLES_PER_FRAME);
+        assert_eq!(r.read(OTG_BASE + HFNUM) & 0xFFFF, 0x3FFF);
+        r.clock.set(0x4000 * CYCLES_PER_FRAME);
+        assert_eq!(r.read(OTG_BASE + HFNUM) & 0xFFFF, 0);
+        r.clock.set(0x4003 * CYCLES_PER_FRAME);
         assert_eq!(r.read(OTG_BASE + HFNUM) & 0xFFFF, 3);
     }
 
@@ -1790,6 +1870,27 @@ mod tests {
     }
 
     #[test]
+    fn a_narrow_write_to_the_fifo_adds_only_the_bytes_written() {
+        let (device, log) = script(0, vec![]);
+        let mut r = Rig::with(device);
+        r.write(hctsiz(0), tsiz(DATA0, 1, 7));
+        r.write(hcchar(0), chan(0, 1, false));
+        // Bytes and a halfword, wherever in the word they land, in the order they were written.
+        r.m.write8(FIFO0, 1);
+        r.m.write8(FIFO0 + 2, 2);
+        r.m.write16(FIFO0 + 2, 0x0403);
+        r.advance_us(1_000);
+        assert!(
+            log.borrow().outs.is_empty(),
+            "four bytes are not a packet of 7"
+        );
+        r.m.write16(FIFO0, 0x0605);
+        r.m.write8(FIFO0 + 1, 7);
+        r.advance_us(1_000);
+        assert_eq!(log.borrow().outs, [(1, vec![1, 2, 3, 4, 5, 6, 7])]);
+    }
+
+    #[test]
     fn data_written_to_a_channel_that_is_not_sending_is_dropped() {
         let (device, log) = script(0, vec![]);
         let mut r = Rig::with(device);
@@ -1958,6 +2059,229 @@ mod tests {
         r.write(FIFO0, 2);
         r.advance_us(1_000);
         assert!(log.borrow().outs.is_empty());
+    }
+
+    // The device and the core, when either starts again.
+
+    #[test]
+    fn a_system_reset_resets_the_device() {
+        let (device, log) = script(1, vec![]);
+        let mut r = Rig::with(device);
+        let before = log.borrow().resets;
+        r.m.reset_peripherals(ResetCause::Software);
+        assert_eq!(log.borrow().resets, before + 1);
+    }
+
+    #[test]
+    fn removing_the_power_resets_the_device() {
+        let (device, log) = script(1, vec![]);
+        let mut r = Rig::with(device);
+        let before = log.borrow().resets;
+        r.write(HPRT_ADDR, 0);
+        assert_eq!(log.borrow().resets, before + 1);
+    }
+
+    #[test]
+    fn a_device_that_never_connected_is_not_reset_by_the_power_going() {
+        let (device, log) = script(1, vec![]);
+        let mut r = rig();
+        r.port.attach(device);
+        r.write(HPRT_ADDR, PPWR);
+        r.write(HPRT_ADDR, 0);
+        assert_eq!(log.borrow().resets, 0);
+    }
+
+    #[test]
+    fn a_system_reset_makes_the_keyboard_unpolled_and_unsent() {
+        let keys = KeyReport::new();
+        let mut r = Rig::with(HidKeyboard::new(keys.clone()));
+        r.setup(0, 0, [0x00, 5, 1, 0, 0, 0, 0, 0]);
+        r.advance_us(1_000);
+        r.start_in(0, 0, 0, DATA1, 1, 0);
+        r.advance_us(1_000);
+        r.setup(0, 1, [0x00, 9, 1, 0, 0, 0, 0, 0]);
+        r.advance_us(1_000);
+        r.start_in(1, 1, 1, DATA0, 1, 8);
+        r.advance_us(1_000);
+        assert!(keys.polled() && keys.was_sent());
+        r.m.reset_peripherals(ResetCause::Software);
+        assert!(!keys.polled() && !keys.was_sent());
+    }
+
+    #[test]
+    fn removing_the_power_makes_the_keyboard_unpolled() {
+        let keys = KeyReport::new();
+        let mut r = Rig::with(HidKeyboard::new(keys.clone()));
+        r.setup(0, 0, [0x00, 5, 1, 0, 0, 0, 0, 0]);
+        r.advance_us(1_000);
+        r.start_in(0, 0, 0, DATA1, 1, 0);
+        r.advance_us(1_000);
+        r.setup(0, 1, [0x00, 9, 1, 0, 0, 0, 0, 0]);
+        r.advance_us(1_000);
+        r.start_in(1, 1, 1, DATA0, 1, 8);
+        r.advance_us(1_000);
+        assert!(keys.polled());
+        r.write(HPRT_ADDR, 0);
+        assert!(!keys.polled() && !keys.was_sent());
+    }
+
+    #[test]
+    fn a_core_soft_reset_idles_the_channels_and_empties_the_queues() {
+        let (device, log) = script(1, vec![In::Data(vec![1, 2, 3, 4]), In::Data(vec![5])]);
+        let mut r = Rig::with(device);
+        r.interrupts_on(HCINT);
+        // A transfer that has run and left data in the RX FIFO, and one still waiting.
+        r.start_in(1, 1, 1, DATA0, 1, 8);
+        r.advance_us(1_000);
+        r.start_in(0, 1, 1, DATA0, 1, 8);
+        assert_eq!(r.read(GINTSTS_ADDR) & (RXFLVL | HCINT), RXFLVL | HCINT);
+        r.write(GRSTCTL_ADDR, CSRST);
+        for n in 0..2 {
+            assert_eq!(r.read(hcchar(n)), 0, "channel {n}");
+            assert_eq!(r.read(hcint(n)), 0, "channel {n}");
+            assert_eq!(r.read(hcintmsk(n)), 0, "channel {n}");
+            assert_eq!(r.read(hctsiz(n)), 0, "channel {n}");
+        }
+        assert_eq!(r.read(HAINT_ADDR), 0);
+        assert_eq!(r.read(GINTSTS_ADDR) & (RXFLVL | HCINT), 0);
+        r.advance_us(1_000);
+        assert_eq!(log.borrow().ins.len(), 1, "the waiting transfer is gone");
+    }
+
+    #[test]
+    fn a_core_soft_reset_puts_the_registers_back_except_the_speed_bits() {
+        let mut r = rig();
+        r.write(OTG_BASE + GUSBCFG, 0xFFFF);
+        r.write(OTG_BASE + HCFG, 0x2);
+        r.write(OTG_BASE + HFIR, 1234);
+        r.interrupts_on(HPRTINT);
+        r.write(HAINTMSK_ADDR, 0xFFF);
+        r.write(GRSTCTL_ADDR, CSRST);
+        assert_eq!(r.read(OTG_BASE + GUSBCFG), 0x1440);
+        assert_eq!(r.read(OTG_BASE + HCFG), 0x200 | 0x2);
+        assert_eq!(r.read(OTG_BASE + HFIR), 0xEA60);
+        assert_eq!(r.read(GINTMSK_ADDR), 0);
+        assert_eq!(r.read(GAHBCFG_ADDR), 0);
+        assert_eq!(r.read(HAINTMSK_ADDR), 0);
+    }
+
+    #[test]
+    fn a_core_soft_reset_leaves_the_power_of_the_port() {
+        let mut r = rig();
+        r.port.attach(script(1, vec![]).0);
+        r.write(HPRT_ADDR, PPWR);
+        r.write(GRSTCTL_ADDR, CSRST);
+        assert_eq!(r.read(HPRT_ADDR) & PPWR, PPWR);
+        r.advance_us(200);
+        assert_eq!(r.read(HPRT_ADDR) & PCSTS, PCSTS);
+    }
+
+    #[test]
+    fn a_core_soft_reset_clears_the_latched_flags_and_leaves_the_port() {
+        let mut r = rig();
+        r.port.attach(script(1, vec![]).0);
+        r.enabled_port();
+        r.port.detach();
+        r.advance_us(1);
+        assert_eq!(r.read(GINTSTS_ADDR) & DISCINT, DISCINT);
+        r.write(GRSTCTL_ADDR, CSRST);
+        assert_eq!(r.read(GINTSTS_ADDR) & DISCINT, 0);
+        let (device, _) = script(1, vec![]);
+        let mut r = Rig::with(device);
+        let hprt = r.read(HPRT_ADDR);
+        r.write(GRSTCTL_ADDR, CSRST);
+        assert_eq!(r.read(HPRT_ADDR), hprt, "the device stays connected");
+    }
+
+    #[test]
+    fn a_tx_flush_drops_the_data_staged_for_sending() {
+        let (device, log) = script(0, vec![]);
+        let mut r = Rig::with(device);
+        r.write(hctsiz(0), tsiz(DATA0, 1, 8));
+        r.write(hcchar(0), chan(0, 1, false));
+        r.write(FIFO0, 1);
+        r.write(GRSTCTL_ADDR, TXFFLSH);
+        // The word that was in the FIFO is gone, so one more is half a packet.
+        r.write(FIFO0, 2);
+        r.advance_us(1_000);
+        assert!(log.borrow().outs.is_empty());
+        r.write(FIFO0, 3);
+        r.advance_us(1_000);
+        assert_eq!(log.borrow().outs, [(1, vec![2, 0, 0, 0, 3, 0, 0, 0])]);
+    }
+
+    #[test]
+    fn a_tx_flush_cancels_a_packet_that_was_ready_to_go() {
+        let (device, log) = script(0, vec![]);
+        let mut r = Rig::with(device);
+        r.write(hctsiz(0), tsiz(DATA0, 1, 4));
+        r.write(hcchar(0), chan(0, 1, false));
+        r.write(FIFO0, 1);
+        r.write(GRSTCTL_ADDR, TXFFLSH);
+        r.advance_us(1_000);
+        assert!(log.borrow().outs.is_empty());
+    }
+
+    // A channel for an interrupt endpoint, which sends through the periodic FIFO.
+    fn interrupt_out(device: u32, endpoint: u32) -> u32 {
+        chan(device, endpoint, false) | 3 << 18
+    }
+
+    #[test]
+    fn a_tx_flush_empties_the_fifo_it_names_and_the_one_for_all() {
+        for (txfnum, flushed) in [(0, [true, false]), (1, [false, true]), (0x10, [true, true])] {
+            let (device, log) = script(0, vec![]);
+            let mut r = Rig::with(device);
+            // Channel 0 is a control one (non-periodic), channel 1 an interrupt one (periodic).
+            r.write(hctsiz(0), tsiz(DATA0, 1, 4));
+            r.write(hcchar(0), chan(0, 0, false));
+            r.write(hctsiz(1), tsiz(DATA0, 1, 4));
+            r.write(hcchar(1), interrupt_out(0, 1));
+            r.write(FIFO0, 1);
+            r.write(FIFO0 + 0x1000, 2);
+            r.write(GRSTCTL_ADDR, TXFFLSH | txfnum << 6);
+            r.advance_us(1_000);
+            let sent: Vec<u8> = log
+                .borrow()
+                .outs
+                .iter()
+                .map(|(endpoint, _)| *endpoint)
+                .collect();
+            let expected: Vec<u8> = [(0, flushed[0]), (1, flushed[1])]
+                .into_iter()
+                .filter(|&(_, flushed)| !flushed)
+                .map(|(endpoint, _)| endpoint)
+                .collect();
+            assert_eq!(sent, expected, "TXFNUM {txfnum:#x}");
+        }
+    }
+
+    #[test]
+    fn a_tx_flush_does_not_cancel_a_zero_length_out_with_nothing_in_the_fifo() {
+        let (device, log) = script(0, vec![]);
+        let mut r = Rig::with(device);
+        r.write(hctsiz(0), tsiz(DATA1, 1, 0));
+        r.write(hcchar(0), chan(0, 0, false));
+        r.write(GRSTCTL_ADDR, TXFFLSH | 0x10 << 6);
+        r.advance_us(1_000);
+        assert_eq!(log.borrow().outs, [(0, vec![])]);
+    }
+
+    #[test]
+    fn a_nak_on_a_control_in_is_tried_again_when_the_firmware_starts_the_channel() {
+        let (device, log) = script(0, vec![In::Nak, In::Data(vec![7, 8])]);
+        let mut r = Rig::with(device);
+        r.start_in(0, 0, 0, DATA1, 1, 8);
+        r.advance_us(1_000);
+        assert_eq!(r.read(hcint(0)), NAK);
+        assert_eq!(log.borrow().ins.len(), 1, "no retry of its own");
+        // The halt, and the start again with the same transfer.
+        r.write(hcchar(0), chan(0, 0, true) | CHDIS);
+        assert_eq!(r.read(hcint(0)), NAK | CHH);
+        r.start_in(0, 0, 0, DATA1, 1, 8);
+        r.advance_us(1_000);
+        assert_eq!(r.read(hcint(0)), XFRC | ACK);
+        assert_eq!(r.drain_rx()[0].1, [7, 8]);
     }
 
     // The keyboard, through the registers.
