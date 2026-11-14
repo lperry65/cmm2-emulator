@@ -9,7 +9,7 @@ use crate::memory::MemoryMap;
 use crate::otg::{OTG_BASE, OTG_SIZE, Otg};
 use crate::pwr::{PWR_BASE, PWR_SIZE, Pwr};
 use crate::rcc::{RCC_BASE, RCC_SIZE, Rcc};
-use crate::rtc::{RTC_BASE, RTC_SIZE, Rtc};
+use crate::rtc::{RTC_BASE, RTC_SIZE};
 use crate::timer::{TIM5_BASE, TIM16_BASE, TIMER_SIZE, Timer};
 use crate::usart::{USART_SIZE, USART1_BASE, Usart};
 
@@ -37,7 +37,7 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
         )
         .expect("LTDC window is clear of RAM");
     memory
-        .map_peripheral(RTC_BASE, RTC_SIZE, Box::new(Rtc::new(memory.clock())))
+        .map_peripheral(RTC_BASE, RTC_SIZE, Box::new(memory.rtc()))
         .expect("RTC window is clear of RAM");
     memory
         .map_peripheral(

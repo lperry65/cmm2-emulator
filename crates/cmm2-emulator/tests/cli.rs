@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -1058,9 +1059,10 @@ fn the_flash_file_is_written_when_the_quit_key_ends_the_run() {
 
 #[test]
 fn saving_the_flash_leaves_no_temporary_file() {
-    let flash = flash_path("flash-temp");
-    let _ = std::fs::remove_file(&flash);
-    let temp = PathBuf::from(format!("{}.tmp", flash.display()));
+    // The temporary file is made beside the flash file, so that directory shows it.
+    let dir = temp_path("flash-temp", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let flash = dir.join("board.flash");
 
     run_program(
         "flash-temp",
@@ -1069,8 +1071,8 @@ fn saving_the_flash_leaves_no_temporary_file() {
     );
 
     assert!(flash.exists());
-    assert!(!temp.exists());
-    std::fs::remove_file(&flash).unwrap();
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -1119,7 +1121,7 @@ fn a_flash_file_that_cannot_be_read_is_an_error() {
 }
 
 #[test]
-fn a_flash_file_that_cannot_be_written_is_an_error() {
+fn a_flash_file_in_a_directory_that_is_not_there_is_an_error_at_the_start() {
     let missing = std::env::temp_dir().join("cmm2-cli-no-such-directory/f.flash");
 
     let output = run_program(
@@ -1129,100 +1131,188 @@ fn a_flash_file_that_cannot_be_written_is_an_error() {
     );
 
     assert_eq!(output.status.code(), Some(1));
+    // Found at the start, and not when the run is over and its session is lost.
+    assert!(output.stdout.is_empty());
     assert_eq!(
         stderr(&output),
         format!(
-            "cmm2-emulator: {}: No such file or directory (os error 2)\n",
-            missing.display()
+            "cmm2-emulator: {}: its directory {} does not exist, so the run could not save its flash and clock\n",
+            missing.display(),
+            missing.parent().unwrap().display()
         )
     );
 }
 
-// A card image of four blocks, each filled with its own number, and its inode. The image is
-// written back through a temporary file and a rename, so a card that was written back has a
-// new inode, and the same bytes, as the guest never touches this card.
+// Writes 0x5A to every byte of block 1 of the SD card, which it drives through the GPIO pins
+// the way the firmware does (CMD0, CMD55, ACMD41 and CMD24 over port C and port D), then prints
+// "done\n" on USART1 and ends as `end`. It was assembled with GNU as for a Cortex-M7 (the
+// source is not kept: it is a bit-banged SPI byte routine and the command sequence).
+const WRITE_CARD: [u16; 114] = [
+    0xF640, 0x0000, 0xF6C5, 0x0002, 0xF640, 0x4100, 0xF6C5, 0x0102, 0xF64F, 0x72FF, 0xF6CF, 0x521F,
+    0x6002, 0xF64F, 0x72DF, 0xF6CF, 0x72FF, 0x600A, 0x2201, 0x0492, 0x618A, 0x2640, 0x2700, 0xF000,
+    0xF82C, 0x2677, 0x2700, 0xF000, 0xF828, 0x2669, 0x2740, 0x063F, 0xF000, 0xF823, 0x2658, 0x2701,
+    0xF000, 0xF81F, 0x22FE, 0xF000, 0xF837, 0xF240, 0x2802, 0x225A, 0xF000, 0xF832, 0xF1B8, 0x0801,
+    0xD1F9, 0x22FF, 0xF000, 0xF82C, 0xF241, 0x0000, 0xF2C4, 0x0001, 0x2109, 0x6001, 0x2164, 0x6281,
+    0x216F, 0x6281, 0x216E, 0x6281, 0x2165, 0x6281, 0x210A, 0x6281, 0xE7FE, 0xB500, 0x4632, 0xF000,
+    0xF817, 0x0E3A, 0xF000, 0xF814, 0x0C3A, 0xF000, 0xF811, 0x0A3A, 0xF000, 0xF80E, 0x463A, 0xF000,
+    0xF80B, 0x2201, 0xF000, 0xF808, 0x22FF, 0xF000, 0xF805, 0xF000, 0xF803, 0xF000, 0xF801, 0xBD00,
+    0x2308, 0x0614, 0xF241, 0x0500, 0xBF58, 0xF04F, 0x5580, 0x6185, 0xF44F, 0x6580, 0x6185, 0xF04F,
+    0x6580, 0x6185, 0x0052, 0x3B01, 0xD1EF, 0x4770,
+];
+// Where in WRITE_CARD the end of the program is, and its address.
+const WRITE_CARD_END: usize = 68;
+const WRITE_CARD_END_ADDRESS: &str = "0x08000188";
+
+fn write_card(end: u16) -> [u16; 114] {
+    let mut code = WRITE_CARD;
+    code[WRITE_CARD_END] = end;
+    code
+}
+
+// The smallest card there is, 512 KB: its first four blocks are filled with their own number
+// (1 to 4) and the rest with zeros.
+fn card_image() -> Vec<u8> {
+    let mut image: Vec<u8> = (1..=4u8).flat_map(|b| [b; 512]).collect();
+    image.resize(512 * 1024, 0);
+    image
+}
+
+// A card image as `card_image` makes it, and its inode and time of
+// writing. A card the guest did not write to is not written back, so the file is the same one;
+// one that it did is a new file, as it is written through a temporary file and a rename.
 fn sd_card(name: &str) -> (PathBuf, Vec<u8>) {
     let path = temp_path(name, "img");
-    let image: Vec<u8> = (1..=4u8).flat_map(|b| [b; 512]).collect();
+    let image = card_image();
     std::fs::write(&path, &image).unwrap();
     (path, image)
 }
 
-fn written_back(path: &PathBuf, image: &[u8], inode: u64) -> bool {
-    std::fs::metadata(path).unwrap().ino() != inode && std::fs::read(path).unwrap() == image
+fn inode(path: &PathBuf) -> u64 {
+    std::fs::metadata(path).unwrap().ino()
+}
+
+fn untouched(path: &PathBuf, image: &[u8], inode_before: u64) -> bool {
+    let meta = std::fs::metadata(path).unwrap();
+    meta.ino() == inode_before && std::fs::read(path).unwrap() == image
+}
+
+// The card image as the guest of WRITE_CARD leaves it.
+fn written(image: &[u8]) -> Vec<u8> {
+    let mut image = image.to_vec();
+    image[512..1024].fill(0x5A);
+    image
+}
+
+fn written_back(path: &PathBuf, image: &[u8], inode_before: u64) -> bool {
+    inode(path) != inode_before && std::fs::read(path).unwrap() == written(image)
 }
 
 #[test]
 fn the_sd_file_is_written_back_whichever_way_the_run_ends() {
-    let cases: [(&str, &[u16], &[&str]); 4] = [
-        ("sd-limit", &THREE, &["--run", "10"]),
-        ("sd-console", &THREE, &["--console", "--run", "10"]),
-        ("sd-stop-at", &THREE, &["--stop-at", "0x08000106"]),
-        ("sd-fault", &UNDEFINED, &["--run", "100"]),
+    let cases: [(&str, &[&str]); 3] = [
+        ("sd-limit", &["--run", "1000000"]),
+        ("sd-console", &["--console", "--run", "1000000"]),
+        ("sd-stop-at", &["--stop-at", WRITE_CARD_END_ADDRESS]),
     ];
-    for (name, code, args) in cases {
+    for (name, args) in cases {
         let (card, image) = sd_card(name);
-        let inode = std::fs::metadata(&card).unwrap().ino();
+        let before = inode(&card);
         let mut all = vec!["--sd", card.to_str().unwrap()];
         all.extend_from_slice(args);
 
-        run_program(name, code, &all);
+        let output = run_program(name, &write_card(SPIN), &all);
 
-        assert!(written_back(&card, &image, inode), "{name}");
+        assert!(output.status.success(), "{name}: {}", stderr(&output));
+        assert!(written_back(&card, &image, before), "{name}");
         std::fs::remove_file(&card).unwrap();
     }
 }
 
 #[test]
-fn the_sd_file_is_written_back_when_a_live_run_faults() {
-    let (card, image) = sd_card("sd-fault-live");
-    let inode = std::fs::metadata(&card).unwrap().ino();
+fn the_sd_file_is_written_back_when_the_guest_faults() {
+    for (name, args) in [
+        ("sd-fault-batch", &["--run", "1000000"][..]),
+        ("sd-fault-live", &["--console"][..]),
+    ] {
+        let (card, image) = sd_card(name);
+        let before = inode(&card);
+        let mut all = vec!["--sd", card.to_str().unwrap()];
+        all.extend_from_slice(args);
 
-    let output = run_program(
-        "sd-fault-live",
-        &UNDEFINED,
-        &["--console", "--sd", card.to_str().unwrap()],
-    );
+        let output = run_program(name, &write_card(0xDE00), &all);
 
-    assert_eq!(output.status.code(), Some(1));
-    assert!(written_back(&card, &image, inode));
-    std::fs::remove_file(&card).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        assert!(written_back(&card, &image, before), "{name}");
+        std::fs::remove_file(&card).unwrap();
+    }
 }
 
 #[test]
-fn the_sd_file_is_written_back_when_the_quit_key_ends_the_run() {
-    let (card, image) = sd_card("sd-quit");
-    let inode = std::fs::metadata(&card).unwrap().ino();
-    let path = temp_program("sd-quit", &THREE);
+fn a_card_the_guest_did_not_write_to_leaves_the_sd_file_alone() {
+    let cases: [(&str, &[u16], &[&str]); 5] = [
+        ("sd-clean-limit", &THREE, &["--run", "10"]),
+        ("sd-clean-console", &THREE, &["--console", "--run", "10"]),
+        ("sd-clean-stop-at", &THREE, &["--stop-at", "0x08000106"]),
+        ("sd-clean-fault", &UNDEFINED, &["--run", "100"]),
+        ("sd-clean-fault-live", &UNDEFINED, &["--console"]),
+    ];
+    for (name, code, args) in cases {
+        let (card, image) = sd_card(name);
+        let before = inode(&card);
+        let mut all = vec!["--sd", card.to_str().unwrap()];
+        all.extend_from_slice(args);
+
+        run_program(name, code, &all);
+
+        assert!(untouched(&card, &image, before), "{name}");
+        std::fs::remove_file(&card).unwrap();
+    }
+}
+
+#[test]
+fn changes_made_to_the_sd_file_during_a_clean_run_are_kept() {
+    // The run is long enough to change the file under it; a card never written to is not
+    // written back over it.
+    let (card, _) = sd_card("sd-host-edit");
+    let path = temp_program("sd-host-edit", &ECHO);
     let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
         .args(["--firmware", path.to_str().unwrap(), "--console", "--sd"])
         .arg(&card)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .spawn()
         .expect("failed to run cmm2-emulator");
+    // The guest says "ready" once the card is in and it is running.
+    let mut out = child.stdout.take().unwrap();
+    let mut seen = Vec::new();
+    let mut byte = [0];
+    while !seen.ends_with(b"ready\r\n") && out.read(&mut byte).is_ok_and(|n| n == 1) {
+        seen.push(byte[0]);
+    }
+    std::fs::write(&card, vec![0xEE; 2 * 512]).unwrap();
     child.stdin.as_mut().unwrap().write_all(b"\x1D").unwrap();
-    let status = child.wait().unwrap();
+    assert!(child.wait().unwrap().success());
 
-    assert!(status.success());
-    assert!(written_back(&card, &image, inode));
+    assert_eq!(std::fs::read(&card).unwrap(), vec![0xEE; 2 * 512]);
     std::fs::remove_file(&card).unwrap();
     std::fs::remove_file(&path).unwrap();
 }
 
 #[test]
 fn saving_the_sd_file_leaves_no_temporary_file() {
-    let (card, _) = sd_card("sd-temp");
-    let temp = PathBuf::from(format!("{}.tmp", card.display()));
+    let dir = temp_path("sd-temp", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let card = dir.join("card.img");
+    std::fs::write(&card, card_image()).unwrap();
 
     run_program(
         "sd-temp",
-        &THREE,
-        &["--run", "10", "--sd", card.to_str().unwrap()],
+        &write_card(SPIN),
+        &["--run", "1000000", "--sd", card.to_str().unwrap()],
     );
 
-    assert!(!temp.exists());
-    std::fs::remove_file(&card).unwrap();
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -1276,27 +1366,1325 @@ fn an_sd_file_that_is_not_whole_blocks_is_an_error_and_is_left_alone() {
     }
 }
 
+// The tests that read /proc look at what the kernel says about the emulator's own process and
+// threads, and are for Linux.
+
+// The signals the process has handlers for, from /proc, as a bit for each signal number - 1.
+#[cfg(target_os = "linux")]
+fn proc_mask(pid: u32, thread: u32, field: &str) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/task/{thread}/status")).unwrap();
+    let line = status
+        .lines()
+        .find_map(|line| line.strip_prefix(field))
+        .unwrap();
+    u64::from_str_radix(line.trim(), 16).unwrap()
+}
+
+// Waits until the emulator has its handlers in, which is the first thing it does, so that a
+// signal sent after this is the one it is waiting for and not one that ends it.
+#[cfg(target_os = "linux")]
+fn wait_until_catching(child: &std::process::Child) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while proc_mask(child.id(), child.id(), "SigCgt:") & 1 << (libc::SIGTERM - 1) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the emulator never took its handlers"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// Waits until the emulator is blocked, which an unpaced run, always at work, is not: its state in
+// /proc is sleeping for several looks in a row. That is it waiting in a write to a pipe that
+// is full.
+#[cfg(target_os = "linux")]
+fn wait_until_blocked(child: &std::process::Child) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut sleeping = 0;
+    while sleeping < 10 {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.id())).unwrap();
+        // The state is the field after the command, which is in brackets and may hold anything.
+        let state = stat.rsplit_once(") ").unwrap().1.chars().next();
+        sleeping = if state == Some('S') { sleeping + 1 } else { 0 };
+        assert!(Instant::now() < deadline, "the emulator never blocked");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// Starts a live run of WRITE_CARD with the flash file and the card, and returns it once it has
+// printed "done\n", so that the guest is running and has written the card.
+fn start_writing_run(name: &str, flash: &PathBuf, card: &PathBuf) -> std::process::Child {
+    let path = temp_program(name, &write_card(SPIN));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        .args(["--firmware", path.to_str().unwrap(), "--console", "--flash"])
+        .arg(flash)
+        .arg("--sd")
+        .arg(card)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to run cmm2-emulator");
+    let mut out = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let mut byte = [0];
+        while out.read(&mut byte).is_ok_and(|n| n == 1) {
+            buffer.push(byte[0]);
+            if buffer.ends_with(b"done\n") {
+                let _ = sender.send(());
+                break;
+            }
+        }
+        // Keep draining, so the emulator is never blocked on a full pipe.
+        let _ = std::io::copy(&mut out, &mut std::io::sink());
+    });
+    if receiver.recv_timeout(Duration::from_secs(30)).is_err() {
+        child.kill().unwrap();
+        panic!("the guest never said it was done");
+    }
+    std::fs::remove_file(&path).unwrap();
+    child
+}
+
+fn wait_for(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("the signal did not end the run");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
-fn an_sd_file_that_cannot_be_written_back_is_an_error() {
-    // The temporary file the card is written to first is in the way, as a directory.
-    let (card, _) = sd_card("sd-unwritable");
-    let temp = PathBuf::from(format!("{}.tmp", card.display()));
-    std::fs::create_dir(&temp).unwrap();
+fn the_sd_file_is_written_back_when_the_quit_key_ends_the_run() {
+    let flash = flash_path("sd-quit");
+    let _ = std::fs::remove_file(&flash);
+    let (card, image) = sd_card("sd-quit");
+    let before = inode(&card);
+    let mut child = start_writing_run("sd-quit", &flash, &card);
+
+    child.stdin.as_mut().unwrap().write_all(b"\x1D").unwrap();
+    let status = wait_for(&mut child);
+
+    assert!(status.success());
+    assert!(written_back(&card, &image, before));
+    std::fs::remove_file(&flash).unwrap();
+    std::fs::remove_file(&card).unwrap();
+}
+
+#[test]
+fn a_signal_ends_a_live_run_and_the_files_are_written() {
+    for (name, signal) in [
+        ("signal-int", libc::SIGINT),
+        ("signal-term", libc::SIGTERM),
+        ("signal-hup", libc::SIGHUP),
+    ] {
+        let flash = flash_path(name);
+        let _ = std::fs::remove_file(&flash);
+        let (card, image) = sd_card(name);
+        let before = inode(&card);
+        let mut child = start_writing_run(name, &flash, &card);
+
+        // SAFETY: kill only sends the signal to the child, which is still running.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let status = wait_for(&mut child);
+
+        // The run ends by the signal itself, once its files are written.
+        assert_eq!(status.signal(), Some(signal), "{name}: {status:?}");
+        assert_eq!(
+            std::fs::read(&flash).unwrap().len(),
+            FLASH_FILE_SIZE,
+            "{name}"
+        );
+        assert!(written_back(&card, &image, before), "{name}");
+        std::fs::remove_file(&flash).unwrap();
+        std::fs::remove_file(&card).unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_signal_ends_a_batch_run_with_no_limit_and_the_flash_is_written() {
+    for (name, signal) in [
+        ("signal-batch-term", libc::SIGTERM),
+        ("signal-batch-int", libc::SIGINT),
+    ] {
+        let flash = flash_path(name);
+        let _ = std::fs::remove_file(&flash);
+        let path = temp_program(name, &count_in_flash(SPIN));
+        let trace = temp_path(name, "trace");
+        // A stop address the guest never reaches, and no limit: only the signal ends it.
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+            .args([
+                "--firmware",
+                path.to_str().unwrap(),
+                "--stop-at",
+                "0x08000FF0",
+            ])
+            .arg("--flash")
+            .arg(&flash)
+            .arg("--trace")
+            .arg(&trace)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("failed to run cmm2-emulator");
+        // The trace file has something in it once the run is under way. A signal before that
+        // would end the process without a save, as it has nothing to save.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while std::fs::metadata(&trace).map_or(0, |meta| meta.len()) == 0 {
+            assert!(Instant::now() < deadline, "the run never began");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // SAFETY: kill only sends the signal to the child, which is still running.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let status = wait_for(&mut child);
+        let mut summary = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut summary)
+            .unwrap();
+
+        assert_eq!(status.signal(), Some(signal), "{name}: {status:?}");
+        assert!(
+            summary.starts_with("stopped: interrupted by a signal\n"),
+            "{summary}"
+        );
+        assert_eq!(options_word(&std::fs::read(&flash).unwrap()), 0, "{name}");
+        std::fs::remove_file(&flash).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&trace).unwrap();
+    }
+}
+
+#[test]
+fn a_trace_that_cannot_be_written_does_not_hide_a_fault() {
+    // /dev/full takes the open and refuses every write.
+    let live = run_program(
+        "trace-full-live",
+        &UNDEFINED,
+        &["--console", "--trace", "/dev/full"],
+    );
+    let lines: Vec<String> = stderr(&live).lines().map(str::to_string).collect();
+    assert_eq!(live.status.code(), Some(1));
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(!lines[0].contains("writing the trace"), "{lines:?}");
+    assert!(
+        lines[1].starts_with("cmm2-emulator: writing the trace: "),
+        "{lines:?}"
+    );
+
+    // A batch run says the fault in its summary, and the trace error after it.
+    let batch = run_program(
+        "trace-full-batch",
+        &UNDEFINED,
+        &["--run", "100", "--trace", "/dev/full"],
+    );
+    assert_eq!(batch.status.code(), Some(1));
+    assert!(stdout(&batch).contains("stopped: "), "{}", stdout(&batch));
+    assert!(
+        stderr(&batch).starts_with("cmm2-emulator: writing the trace: "),
+        "{}",
+        stderr(&batch)
+    );
+}
+
+#[test]
+fn the_errors_of_the_trace_and_the_screenshot_are_both_said() {
+    // Neither hides the other: the trace cannot be written, and there is no screen to take a
+    // picture of.
+    let output = run_program(
+        "both-errors",
+        &THREE,
+        &[
+            "--run",
+            "1000",
+            "--trace",
+            "/dev/full",
+            "--screenshot",
+            "/nonexistent/s.ppm",
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let lines: Vec<String> = stderr(&output).lines().map(str::to_string).collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].starts_with("cmm2-emulator: writing the trace: "),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("cmm2-emulator: no screenshot: "),
+        "{lines:?}"
+    );
+}
+
+// A save that fails only at the end, which the checks at the start cannot see: the directory
+// of the flash file is made unwritable once the run is under way, and then a signal ends it.
+// With the screenshot that cannot be taken, that is two errors, said in the order they came.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_save_that_fails_at_the_end_is_said_after_the_screenshot() {
+    if root() {
+        return;
+    }
+    let dir = temp_path("late-save", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let flash = dir.join("board.flash");
+    let trace = temp_path("late-save", "trace");
+    let path = temp_program("late-save", &THREE);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        .args([
+            "--firmware",
+            path.to_str().unwrap(),
+            "--stop-at",
+            "0x08000FF0",
+        ])
+        .arg("--flash")
+        .arg(&flash)
+        .args(["--screenshot", "/nonexistent/s.ppm"])
+        .arg("--trace")
+        .arg(&trace)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run cmm2-emulator");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::fs::metadata(&trace).map_or(0, |meta| meta.len()) == 0 {
+        assert!(Instant::now() < deadline, "the run never began");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    mode(&dir, 0o555);
+
+    // SAFETY: kill only sends the signal to the child, which is still running.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let status = wait_for(&mut child);
+    mode(&dir, 0o755);
+    let mut said = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut said)
+        .unwrap();
+
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    let lines: Vec<&str> = said.lines().collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].starts_with("cmm2-emulator: no screenshot: "),
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines[1],
+        format!(
+            "cmm2-emulator: {}: Permission denied (os error 13)",
+            flash.display()
+        )
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&trace).unwrap();
+    std::fs::remove_file(&path).unwrap();
+}
+
+// Starts the emulator on `code` with `args`, with SIGHUP ignored as nohup leaves it.
+fn spawn_with_sighup_ignored(name: &str, code: &[u16], args: &[&str]) -> std::process::Child {
+    let path = temp_program(name, code);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"));
+    command
+        .args(["--firmware", path.to_str().unwrap()])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null());
+    // SAFETY: signal with SIG_IGN is async-signal-safe and runs between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    command.spawn().expect("failed to run cmm2-emulator")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_signal_that_was_ignored_when_the_emulator_started_is_still_ignored() {
+    let mut child = spawn_with_sighup_ignored("signal-nohup", &THREE, &["--console"]);
+    wait_until_catching(&child);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // SAFETY: kill only sends the signal to the child, which is still running.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGHUP) }, 0);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(child.try_wait().unwrap().is_none(), "SIGHUP ended the run");
+
+    // The others are not ignored, so they still end it.
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(wait_for(&mut child).signal(), Some(libc::SIGTERM));
+    std::fs::remove_file(temp_path("signal-nohup", "bin")).unwrap();
+}
+
+// Sets UE and TE in USART1_CR1 and then sends 'x' for ever. The address of USART1 is the
+// literal at +16.
+const SPAM: [u16; 10] = [
+    0x4803, 0x2109, 0x6001, 0x2278, 0x6282, 0xE7FD, 0x0000, 0x0000, 0x1000, 0x4001,
+];
+
+// A pipe filled to the last byte, so that the next write to it blocks with nothing written.
+fn full_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
+    use std::os::fd::AsRawFd;
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    let fd = writer.as_raw_fd();
+    // SAFETY: fcntl on a descriptor this function owns; the flag is shared with the other end
+    // of the dup that the child gets, so it is put back before it goes.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let mut chunk = 4096;
+        while chunk > 0 {
+            match writer.write(&vec![b'.'; chunk]) {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => chunk /= 2,
+                Err(err) => panic!("{err}"),
+            }
+        }
+        libc::fcntl(fd, libc::F_SETFL, flags);
+    }
+    (reader, writer)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_blocked_writing_to_a_pipe_nobody_reads_ends_on_a_signal() {
+    let flash = flash_path("signal-blocked");
+    let _ = std::fs::remove_file(&flash);
+    let path = temp_program("signal-blocked", &SPAM);
+    // Never read from: the pipe is full, and the emulator blocks in its first write.
+    let (_reader, writer) = full_pipe();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        .args(["--firmware", path.to_str().unwrap()])
+        .args(["--console", "--unpaced", "--flash"])
+        .arg(&flash)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(writer))
+        .spawn()
+        .expect("failed to run cmm2-emulator");
+    wait_until_blocked(&child);
+
+    // SAFETY: kill only sends the signal to the child, which is still running.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let status = wait_for(&mut child);
+
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert_eq!(std::fs::read(&flash).unwrap().len(), FLASH_FILE_SIZE);
+    std::fs::remove_file(&flash).unwrap();
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn a_read_only_sd_file_is_a_write_protected_card_and_is_not_written_back() {
+    if root() {
+        return;
+    }
+    let (card, image) = sd_card("sd-readonly");
+    let before = inode(&card);
+    std::fs::set_permissions(&card, std::os::unix::fs::PermissionsExt::from_mode(0o444)).unwrap();
+
+    // The guest writes anyway, as one that ignores the switch would.
+    let output = run_program(
+        "sd-readonly",
+        &write_card(SPIN),
+        &["--run", "1000000", "--sd", card.to_str().unwrap()],
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).ends_with("the card is write-protected because the file is read-only\n")
+    );
+    assert!(untouched(&card, &image, before));
+    std::fs::set_permissions(&card, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    std::fs::remove_file(&card).unwrap();
+}
+
+#[test]
+fn an_sd_file_under_512_kb_is_an_error_and_is_left_alone() {
+    let card = temp_path("sd-tiny", "img");
+    std::fs::write(&card, vec![7; 4 * 512]).unwrap();
 
     let output = run_program(
-        "sd-unwritable",
+        "sd-tiny",
         &THREE,
         &["--run", "10", "--sd", card.to_str().unwrap()],
     );
 
-    std::fs::remove_dir(&temp).unwrap();
-    std::fs::remove_file(&card).unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         stderr(&output),
         format!(
-            "cmm2-emulator: {}: Is a directory (os error 21)\n",
+            "cmm2-emulator: {}: 2048 bytes is smaller than the 524288 bytes (512 KB) of the smallest card\n",
             card.display()
         )
     );
+    assert_eq!(std::fs::read(&card).unwrap(), vec![7; 4 * 512]);
+    std::fs::remove_file(&card).unwrap();
+}
+
+#[test]
+fn a_read_only_flash_file_in_a_writable_directory_is_saved_as_the_save_replaces_it() {
+    let flash = flash_path("flash-readonly");
+    let _ = std::fs::remove_file(&flash);
+    run_program(
+        "flash-readonly-1",
+        &THREE,
+        &["--run", "10", "--flash", flash.to_str().unwrap()],
+    );
+    mode(&flash, 0o444);
+    let before = inode(&flash);
+
+    let output = run_program(
+        "flash-readonly-2",
+        &THREE,
+        &["--run", "10", "--flash", flash.to_str().unwrap()],
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_ne!(inode(&flash), before, "the file was replaced");
+    assert_eq!(std::fs::metadata(&flash).unwrap().mode() & 0o777, 0o444);
+    mode(&flash, 0o644);
+    std::fs::remove_file(&flash).unwrap();
+}
+
+fn mode(path: &PathBuf, mode: u32) {
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode)).unwrap();
+}
+
+// As root a mode bit stops nothing, so the tests that depend on one are not run.
+fn root() -> bool {
+    // SAFETY: geteuid has no arguments and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[test]
+fn a_flash_file_in_a_directory_that_cannot_be_written_is_an_error_at_the_start() {
+    if root() {
+        return;
+    }
+    let dir = temp_path("flash-dir-ro", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let flash = dir.join("board.flash");
+    run_program(
+        "flash-dir-ro-1",
+        &THREE,
+        &["--run", "10", "--flash", flash.to_str().unwrap()],
+    );
+    mode(&dir, 0o555);
+
+    let output = run_program(
+        "flash-dir-ro-2",
+        &THREE,
+        &["--run", "10", "--flash", flash.to_str().unwrap()],
+    );
+
+    mode(&dir, 0o755);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "cmm2-emulator: {}: its directory is not writable, so the run could not save its flash and clock\n",
+            flash.display()
+        )
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// Runs the emulator with `args` in a user and mount namespace in which `dir` is a read-only
+// mount (the file system is read-only to it, whatever the modes). None, with a note, when the
+// machine does not let a user make one.
+fn run_with_read_only_mount(dir: &Path, firmware: &Path, args: &[&str]) -> Option<Output> {
+    let script =
+        "mount --bind \"$1\" \"$1\" && mount -o remount,bind,ro \"$1\" && shift && exec \"$@\"";
+    let output = Command::new("unshare")
+        .args(["-rm", "sh", "-c", script, "sh"])
+        .arg(dir)
+        .arg(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        .args(["--firmware", firmware.to_str().unwrap()])
+        .args(args)
+        .env("SDL_VIDEODRIVER", "dummy")
+        .output();
+    match output {
+        // unshare, or the mount in it, was refused: sh says which on stderr.
+        Ok(output) if !output.status.success() && stderr(&output).contains("unshare:") => {
+            eprintln!(
+                "skipped: no user and mount namespaces here: {}",
+                stderr(&output)
+            );
+            None
+        }
+        Ok(output) if output.status.code() == Some(32) => {
+            eprintln!(
+                "skipped: no mounts in a user namespace here: {}",
+                stderr(&output)
+            );
+            None
+        }
+        Ok(output) => Some(output),
+        Err(err) => {
+            eprintln!("skipped: no unshare here: {err}");
+            None
+        }
+    }
+}
+
+#[test]
+fn a_flash_file_on_a_read_only_file_system_is_an_error_at_the_start() {
+    let dir = temp_path("flash-ro-mount", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let flash = dir.join("board.flash");
+    run_program(
+        "flash-ro-mount-1",
+        &THREE,
+        &["--run", "10", "--flash", flash.to_str().unwrap()],
+    );
+    mode(&flash, 0o664);
+    let firmware = temp_program("flash-ro-mount-2", &THREE);
+
+    let output = run_with_read_only_mount(
+        &dir,
+        &firmware,
+        &["--run", "10", "--flash", flash.to_str().unwrap()],
+    );
+
+    if let Some(output) = output {
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert_eq!(
+            stderr(&output),
+            format!(
+                "cmm2-emulator: {}: its file system is read-only, so the run could not save its flash and clock\n",
+                flash.display()
+            )
+        );
+    }
+    std::fs::remove_file(&firmware).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn an_sd_file_on_a_read_only_file_system_is_a_write_protected_card_that_is_not_written_back() {
+    let dir = temp_path("sd-ro-mount", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let card = dir.join("card.img");
+    std::fs::write(&card, card_image()).unwrap();
+    mode(&card, 0o664);
+    let firmware = temp_program("sd-ro-mount", &write_card(SPIN));
+
+    // The guest writes anyway, as one that ignores the switch would.
+    let output = run_with_read_only_mount(
+        &dir,
+        &firmware,
+        &["--run", "1000000", "--sd", card.to_str().unwrap()],
+    );
+
+    if let Some(output) = output {
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(
+            stderr(&output),
+            format!(
+                "cmm2-emulator: {}: the card is write-protected because its file system is read-only\n",
+                card.display()
+            )
+        );
+        assert_eq!(std::fs::read(&card).unwrap(), card_image());
+    }
+    std::fs::remove_file(&firmware).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn an_sd_file_in_a_directory_that_cannot_be_written_is_a_write_protected_card() {
+    if root() {
+        return;
+    }
+    let dir = temp_path("sd-dir-ro", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let card = dir.join("card.img");
+    std::fs::write(&card, card_image()).unwrap();
+    mode(&dir, 0o555);
+
+    let output = run_program(
+        "sd-dir-ro",
+        &write_card(SPIN),
+        &["--run", "1000000", "--sd", card.to_str().unwrap()],
+    );
+
+    mode(&dir, 0o755);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "cmm2-emulator: {}: the card is write-protected because its directory is not writable\n",
+            card.display()
+        )
+    );
+    assert_eq!(std::fs::read(&card).unwrap(), card_image());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_first_run_through_a_dangling_link_makes_the_file_it_points_to() {
+    let dir = temp_path("flash-dangling", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let link = dir.join("link.flash");
+    std::os::unix::fs::symlink("real.flash", &link).unwrap();
+
+    let output = run_program(
+        "flash-dangling",
+        &THREE,
+        &["--run", "10", "--flash", link.to_str().unwrap()],
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(
+        std::fs::read(dir.join("real.flash")).unwrap().len(),
+        FLASH_FILE_SIZE
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_batch_run_blocked_writing_its_trace_to_a_pipe_nobody_reads_ends_on_a_signal() {
+    let flash = flash_path("signal-trace-blocked");
+    let _ = std::fs::remove_file(&flash);
+    let path = temp_program("signal-trace-blocked", &SPAM);
+    // The trace of the peripherals goes to stdout, which is full and never read.
+    let (_reader, writer) = full_pipe();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        .args(["--firmware", path.to_str().unwrap()])
+        .args(["--trace-mmio", "--stop-at", "0x08000FF0", "--flash"])
+        .arg(&flash)
+        .stdout(Stdio::from(writer))
+        .spawn()
+        .expect("failed to run cmm2-emulator");
+    wait_until_blocked(&child);
+
+    // SAFETY: kill only sends the signal to the child, which is still running.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let status = wait_for(&mut child);
+
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert_eq!(std::fs::read(&flash).unwrap().len(), FLASH_FILE_SIZE);
+    std::fs::remove_file(&flash).unwrap();
+    std::fs::remove_file(&path).unwrap();
+}
+
+// The local mode flags of the terminal on `fd`.
+fn lflag(fd: libc::c_int) -> libc::tcflag_t {
+    // SAFETY: tcgetattr fills a plain termios.
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        assert_eq!(libc::tcgetattr(fd, &mut termios), 0);
+        termios.c_lflag
+    }
+}
+
+#[test]
+fn two_signals_in_a_row_leave_the_terminal_as_it_was() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty fills in two descriptors.
+    let opened = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(opened, 0);
+    let cooked = lflag(slave);
+    let path = temp_program("signal-pty", &ECHO);
+    // SAFETY: dup of a descriptor this test owns; the new one is handed to the child.
+    let stdin = unsafe { OwnedFd::from_raw_fd(libc::dup(slave)) };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        .args(["--firmware", path.to_str().unwrap(), "--console"])
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("failed to run cmm2-emulator");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while lflag(slave) == cooked {
+        assert!(Instant::now() < deadline, "the terminal never went raw");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    for _ in 0..2 {
+        // SAFETY: kill only sends the signal to the child, which is still running.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    }
+    let status = wait_for(&mut child);
+
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert_eq!(lflag(slave), cooked, "the terminal is still raw");
+    // SAFETY: closing the two descriptors made above.
+    unsafe {
+        libc::close(master);
+        libc::close(slave);
+    }
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_threads_the_run_makes_have_the_signals_blocked_and_the_main_one_takes_them() {
+    let flash = flash_path("signal-threads");
+    let _ = std::fs::remove_file(&flash);
+    let path = temp_program("signal-threads", &ECHO);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        .args([
+            "--firmware",
+            path.to_str().unwrap(),
+            "--console",
+            "--window",
+        ])
+        .arg("--flash")
+        .arg(&flash)
+        .env("SDL_VIDEODRIVER", "dummy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to run cmm2-emulator");
+    // The guest says "ready" once everything is made and the run has started.
+    let mut out = child.stdout.take().unwrap();
+    let mut seen = Vec::new();
+    let mut byte = [0];
+    while !seen.ends_with(b"ready\r\n") && out.read(&mut byte).is_ok_and(|n| n == 1) {
+        seen.push(byte[0]);
+    }
+    let pid = child.id();
+    let ending: u64 = 1 << (libc::SIGINT - 1) | 1 << (libc::SIGTERM - 1) | 1 << (libc::SIGHUP - 1);
+    let threads: Vec<u32> = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert!(threads.len() > 1, "{threads:?}: the stdin thread is one");
+    for thread in threads {
+        let blocked = proc_mask(pid, thread, "SigBlk:") & ending;
+        let expected = if thread == pid { 0 } else { ending };
+        assert_eq!(blocked, expected, "thread {thread}");
+    }
+
+    // SAFETY: kill only sends the signal to the child, which is still running.
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+    let status = wait_for(&mut child);
+
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert_eq!(std::fs::read(&flash).unwrap().len(), FLASH_FILE_SIZE);
+    std::fs::remove_file(&flash).unwrap();
+    std::fs::remove_file(&path).unwrap();
+}
+
+fn make_fifo(path: &Path) {
+    let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    // SAFETY: mkfifo with a NUL-terminated name that lives through the call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_signal_ends_a_load_that_is_stuck_at_once() {
+    // The firmware is a FIFO with no writer, so the load waits in its open for ever. Nothing
+    // has been run, so there is nothing to save: the signal ends the process, by itself.
+    for (name, signal) in [("stuck-int", libc::SIGINT), ("stuck-term", libc::SIGTERM)] {
+        let fifo = temp_path(name, "fifo");
+        make_fifo(&fifo);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+            .args(["--firmware", fifo.to_str().unwrap(), "--run", "10"])
+            .spawn()
+            .expect("failed to run cmm2-emulator");
+        wait_until_catching(&child);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(child.try_wait().unwrap().is_none(), "{name}: not stuck");
+
+        // SAFETY: kill only sends the signal to the child, which is still running.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let status = wait_for(&mut child);
+
+        assert_eq!(status.signal(), Some(signal), "{name}");
+        std::fs::remove_file(&fifo).unwrap();
+    }
+}
+
+#[test]
+fn what_is_not_a_regular_file_is_refused_for_both_files_and_is_never_opened() {
+    let dir = temp_path("not-regular", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let fifo = dir.join("pipe");
+    make_fifo(&fifo);
+
+    // The FIFO would hang the read for ever, so a refusal that returns is the test.
+    for path in [fifo.as_path(), dir.as_path(), Path::new("/dev/null")] {
+        for option in ["--sd", "--flash"] {
+            let output = run_program(
+                "not-regular",
+                &THREE,
+                &["--run", "10", option, path.to_str().unwrap()],
+            );
+            assert_eq!(output.status.code(), Some(1), "{option} {}", path.display());
+            assert!(output.stdout.is_empty());
+            assert_eq!(
+                stderr(&output),
+                format!("cmm2-emulator: {}: not a regular file\n", path.display()),
+                "{option}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_name_that_ends_in_a_slash_or_dots_is_refused_at_the_start_for_both_files() {
+    let dir = temp_path("slash", "d");
+    std::fs::create_dir(&dir).unwrap();
+    for tail in ["flash/", "flash/.", "flash/..", "."] {
+        for option in ["--flash", "--sd"] {
+            let path = format!("{}/{tail}", dir.display());
+            let output = run_program("slash", &THREE, &["--run", "10", option, &path]);
+            assert_eq!(output.status.code(), Some(1), "{option} {path}");
+            assert_eq!(
+                stderr(&output),
+                format!(
+                    "cmm2-emulator: {path}: not a file name (it is empty, or ends in a slash, or in . or ..)\n"
+                ),
+                "{option}"
+            );
+        }
+    }
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_file_name_as_long_as_there_can_be_is_saved_and_a_longer_one_is_refused_at_the_start() {
+    let dir = temp_path("long-name", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let longest = dir.join("f".repeat(255));
+    let output = run_program(
+        "long-name-1",
+        &THREE,
+        &["--run", "10", "--flash", longest.to_str().unwrap()],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    // The card too: its name plus a suffix would not have fitted.
+    let card = dir.join("c".repeat(255));
+    std::fs::write(&card, card_image()).unwrap();
+    let output = run_program(
+        "long-name-2",
+        &write_card(SPIN),
+        &["--run", "1000000", "--sd", card.to_str().unwrap()],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(std::fs::read(&card).unwrap()[512..1024], [0x5A; 512]);
+    // Nothing else is left beside them.
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+
+    let too_long = dir.join("f".repeat(256));
+    let output = run_program(
+        "long-name-3",
+        &THREE,
+        &["--run", "10", "--flash", too_long.to_str().unwrap()],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "cmm2-emulator: {}: a name on its path is longer than the file system allows, so the run could not save its flash and clock\n",
+            too_long.display()
+        )
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// What a run does with a trace that goes to a pipe or a FIFO that nobody reads from: the first
+// signal ends it, and it saves.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_blocked_writing_its_trace_file_to_a_stalled_reader_ends_on_a_signal() {
+    use std::os::unix::fs::OpenOptionsExt;
+    // /dev/stdout is the full pipe the run is given as its stdout, and a FIFO is one with a
+    // reader that holds it open and never reads. Each is a file the trace is written to.
+    for (name, fifo) in [("trace-stdout", false), ("trace-fifo", true)] {
+        let flash = flash_path(name);
+        let _ = std::fs::remove_file(&flash);
+        let path = temp_program(name, &THREE);
+        let (_reader, writer) = full_pipe();
+        let trace_fifo = temp_path(name, "fifo");
+        let mut _held = None;
+        let trace = if fifo {
+            make_fifo(&trace_fifo);
+            // A reader that never reads, opened first so that the run's open does not wait.
+            _held = Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&trace_fifo)
+                    .unwrap(),
+            );
+            trace_fifo.to_str().unwrap().to_string()
+        } else {
+            "/dev/stdout".to_string()
+        };
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+            .args(["--firmware", path.to_str().unwrap(), "--run", "100000000"])
+            .args(["--trace", &trace, "--flash"])
+            .arg(&flash)
+            .stdout(Stdio::from(writer))
+            .spawn()
+            .expect("failed to run cmm2-emulator");
+        wait_until_blocked(&child);
+
+        // SAFETY: kill only sends the signal to the child, which is still running.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        let status = wait_for(&mut child);
+
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}");
+        assert_eq!(
+            std::fs::read(&flash).unwrap().len(),
+            FLASH_FILE_SIZE,
+            "{name}"
+        );
+        std::fs::remove_file(&flash).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        if fifo {
+            std::fs::remove_file(&trace_fifo).unwrap();
+        }
+    }
+}
+
+#[test]
+fn an_empty_file_name_is_a_usage_error_for_every_file_option() {
+    // An unset shell variable gives one, and it would otherwise be found out at the end.
+    for option in ["--flash", "--sd", "--trace", "--screenshot"] {
+        let output = run_program("empty-name", &THREE, &["--run", "10", option, ""]);
+        assert_eq!(output.status.code(), Some(2), "{option}");
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            stderr(&output),
+            format!("cmm2-emulator: {option} needs a file name, not an empty one\n{USAGE}\n"),
+            "{option}"
+        );
+    }
+}
+
+#[test]
+fn a_link_to_a_name_that_is_not_a_file_name_is_refused_at_the_start() {
+    let dir = temp_path("link-slash", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let link = dir.join("lnk");
+    std::os::unix::fs::symlink("newfile/", &link).unwrap();
+
+    let flash = run_program(
+        "link-slash-1",
+        &THREE,
+        &["--run", "10", "--flash", link.to_str().unwrap()],
+    );
+    assert_eq!(flash.status.code(), Some(1));
+    assert_eq!(
+        stderr(&flash),
+        format!(
+            "cmm2-emulator: {}: it leads to {}/newfile/, which cannot be the name of a file, so the run could not save its flash and clock\n",
+            link.display(),
+            dir.display()
+        )
+    );
+    let card = run_program(
+        "link-slash-2",
+        &THREE,
+        &["--run", "10", "--sd", link.to_str().unwrap()],
+    );
+    assert_eq!(card.status.code(), Some(1));
+    assert!(stderr(&card).starts_with(&format!("cmm2-emulator: {}: ", link.display())));
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// Writes to AIRCR (the literals at +8 and +12) to reset the system, over and over: each reset is
+// a line on standard error.
+const RESET_FOR_EVER: [u16; 8] = [
+    0x4801, 0x4902, 0x6001, 0xE7FD, 0xED0C, 0xE000, 0x0004, 0x05FA,
+];
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_blocked_writing_to_a_standard_error_nobody_reads_ends_on_a_signal() {
+    let flash = flash_path("signal-stderr");
+    let _ = std::fs::remove_file(&flash);
+    let path = temp_program("signal-stderr", &RESET_FOR_EVER);
+    // The pipe is full and never read, and the guest is a line of it for each reset.
+    let (_reader, writer) = full_pipe();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        .args(["--firmware", path.to_str().unwrap()])
+        .args(["--console", "--unpaced", "--flash"])
+        .arg(&flash)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(writer))
+        .spawn()
+        .expect("failed to run cmm2-emulator");
+    wait_until_blocked(&child);
+
+    // SAFETY: kill only sends the signal to the child, which is still running.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let status = wait_for(&mut child);
+
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert_eq!(std::fs::read(&flash).unwrap().len(), FLASH_FILE_SIZE);
+    std::fs::remove_file(&flash).unwrap();
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_blocked_writing_to_a_terminal_nobody_reads_ends_on_a_signal() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty fills in two descriptors.
+    let opened = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(opened, 0);
+    let flash = flash_path("signal-tty");
+    let _ = std::fs::remove_file(&flash);
+    let path = temp_program("signal-tty", &SPAM);
+    // SAFETY: dup of a descriptor this test owns; the new one is handed to the child.
+    let tty = unsafe { OwnedFd::from_raw_fd(libc::dup(slave)) };
+    // Nothing reads the other end, so the terminal fills and the run waits in a write.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        .args(["--firmware", path.to_str().unwrap()])
+        .args(["--console", "--unpaced", "--flash"])
+        .arg(&flash)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(tty))
+        .spawn()
+        .expect("failed to run cmm2-emulator");
+    wait_until_blocked(&child);
+
+    // SAFETY: kill only sends the signal to the child, which is still running.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let status = wait_for(&mut child);
+
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert_eq!(std::fs::read(&flash).unwrap().len(), FLASH_FILE_SIZE);
+    // SAFETY: closing the two descriptors made above.
+    unsafe {
+        libc::close(master);
+        libc::close(slave);
+    }
+    std::fs::remove_file(&flash).unwrap();
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn a_directory_that_cannot_be_read_does_not_fail_a_save_that_has_been_made() {
+    if root() {
+        return;
+    }
+    // Write and search but not read: the file can be made and renamed in, and the directory
+    // cannot be opened to be synced, nor to look at its attributes. Both are said, as warnings.
+    let dir = temp_path("dir-unreadable", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let flash = dir.join("board.flash");
+    mode(&dir, 0o300);
+
+    let output = run_program(
+        "dir-unreadable",
+        &THREE,
+        &["--run", "10", "--flash", flash.to_str().unwrap()],
+    );
+
+    mode(&dir, 0o755);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let lines: Vec<String> = stderr(&output).lines().map(str::to_string).collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].contains("its directory cannot be read"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].contains("written, but its directory could not be synced"),
+        "{lines:?}"
+    );
+    assert_eq!(std::fs::read(&flash).unwrap().len(), FLASH_FILE_SIZE);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_temporary_file_nobody_holds_is_removed_at_the_start_and_one_that_is_held_is_kept() {
+    let dir = temp_path("stale-temp", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let flash = dir.join("board.flash");
+    let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+    let left = dir.join(".cmm2.4242.1.tmp");
+    let held = dir.join(".cmm2.4242.2.tmp");
+    for file in [&left, &held] {
+        std::fs::write(file, b"left behind").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    // Held by a save that is going on, as this test's own lock stands for.
+    let holder = std::fs::File::open(&held).unwrap();
+    // SAFETY: flock on a descriptor that is open.
+    assert_eq!(
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&holder), libc::LOCK_EX) },
+        0
+    );
+
+    let output = run_program(
+        "stale-temp",
+        &THREE,
+        &["--run", "10", "--flash", flash.to_str().unwrap()],
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!left.exists());
+    assert_eq!(std::fs::read(&held).unwrap(), b"left behind");
+    drop(holder);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn output_to_the_master_of_a_terminal_arrives() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty fills in two descriptors; the slave is put in raw mode through a termios
+    // that was got from it.
+    unsafe {
+        assert_eq!(
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null()
+            ),
+            0
+        );
+        let mut termios: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(slave, &mut termios);
+        libc::cfmakeraw(&mut termios);
+        libc::tcsetattr(slave, libc::TCSANOW, &termios);
+    }
+    // SAFETY: dup of a descriptor this test owns; the new one is handed to the child.
+    let as_stdout = unsafe { OwnedFd::from_raw_fd(libc::dup(master)) };
+
+    // A run that prints its summary to the master, which is not a thing to be reopened: that
+    // would make a new pair, and the summary would go nowhere.
+    let path = temp_program("master", &THREE);
+    let status = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        .args(["--firmware", path.to_str().unwrap(), "--run", "1000"])
+        .stdout(Stdio::from(as_stdout))
+        .status()
+        .expect("failed to run cmm2-emulator");
+    assert!(status.success());
+
+    let mut got = vec![0u8; 4096];
+    // What was sent is waiting, or nothing ever will be: a wait of a few seconds says which, and
+    // a test that fails does not hang.
+    let mut waiting = libc::pollfd {
+        fd: slave,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll on one live pollfd.
+    assert_eq!(
+        unsafe { libc::poll(&mut waiting, 1, 5000) },
+        1,
+        "nothing arrived"
+    );
+    // SAFETY: reading into a live buffer from the slave, which has data waiting.
+    let count = unsafe { libc::read(slave, got.as_mut_ptr().cast(), got.len()) };
+    let got = String::from_utf8_lossy(&got[..usize::try_from(count).unwrap()]).into_owned();
+    assert!(got.starts_with("stopped: instruction limit\n"), "{got:?}");
+    assert!(got.contains("instructions 1000\n"), "{got:?}");
+    // SAFETY: closing the two descriptors made above.
+    unsafe {
+        libc::close(master);
+        libc::close(slave);
+    }
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn an_old_fifo_named_like_a_temporary_file_does_not_hang_the_start() {
+    let dir = temp_path("stale-fifo", "d");
+    std::fs::create_dir(&dir).unwrap();
+    let fifo = dir.join(".cmm2.1.1.tmp");
+    make_fifo(&fifo);
+    // Two hours old, by its path: opening a FIFO would wait for a writer.
+    let two_hours_ago = std::time::SystemTime::now() - Duration::from_secs(7200);
+    let secs = two_hours_ago
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: secs as libc::time_t,
+            tv_nsec: 0,
+        },
+    ];
+    let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: utimensat with a NUL-terminated name and two timespecs that live through the call.
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), 0) },
+        0
+    );
+    let flash = dir.join("board.flash");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        .args([
+            "--firmware",
+            temp_program("stale-fifo", &THREE).to_str().unwrap(),
+        ])
+        .args(["--run", "10", "--flash", flash.to_str().unwrap()])
+        .spawn()
+        .expect("failed to run cmm2-emulator");
+    let status = wait_for(&mut child);
+
+    assert!(status.success());
+    assert!(fifo.exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(temp_path("stale-fifo", "bin")).unwrap();
 }

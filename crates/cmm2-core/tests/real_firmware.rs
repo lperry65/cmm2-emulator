@@ -553,9 +553,11 @@ fn real_firmware_draws_a_frame_at_the_prompt() {
     }
 }
 
-// A 64 MB FAT32 card image made with mkfs.vfat, or None, with a note on stderr, when the tool
-// is not installed. It lives in the temp directory under the test's own name.
-fn fat32_image(name: &str) -> Option<Vec<u8>> {
+// A 64 MB FAT32 card image made with mkfs.vfat. The test is ignored and already needs the
+// firmware, and it needs this tool as well (dosfstools): without it the test fails and says so,
+// and does not pass having tested nothing. The file lives in the temp directory under the
+// test's own name.
+fn fat32_image(name: &str) -> Vec<u8> {
     let path = std::env::temp_dir().join(format!("cmm2-core-{}-{name}.img", std::process::id()));
     std::fs::File::create(&path)
         .and_then(|file| file.set_len(64 << 20))
@@ -565,15 +567,17 @@ fn fat32_image(name: &str) -> Option<Vec<u8>> {
         .arg(&path)
         .output();
     let image = match made {
-        Ok(output) if output.status.success() => Some(std::fs::read(&path).unwrap()),
-        Ok(output) => panic!("mkfs.vfat: {}", String::from_utf8_lossy(&output.stderr)),
-        Err(err) => {
-            eprintln!("skipped: no mkfs.vfat on this machine ({err})");
-            None
-        }
+        Ok(output) if output.status.success() => Ok(std::fs::read(&path).unwrap()),
+        Ok(output) => Err(format!(
+            "mkfs.vfat: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(err) => Err(format!(
+            "this test needs mkfs.vfat (the dosfstools package) to make a card image: {err}"
+        )),
     };
     std::fs::remove_file(&path).unwrap();
-    image
+    image.unwrap_or_else(|message| panic!("{message}"))
 }
 
 // A little-endian number of up to four bytes.
@@ -624,9 +628,7 @@ fn type_keys(cpu: &mut Cpu, console: &Console, keys: &str) -> (String, u64) {
 #[test]
 #[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
 fn real_firmware_lists_saves_and_runs_a_program_on_a_card() {
-    let Some(image) = fat32_image("saves") else {
-        return;
-    };
+    let image = fat32_image("saves");
     let firmware = firmware();
     let irqs = Irqs::new();
     let memory = cmm2_memory(&irqs);
@@ -658,6 +660,31 @@ fn real_firmware_lists_saves_and_runs_a_program_on_a_card() {
     let image = sd.eject().unwrap();
     let file = fat32_file(&image, b"T       BAS").expect("no T.BAS on the card");
     assert!(String::from_utf8_lossy(&file).contains("PRINT \"FROM THE CARD\""));
+}
+
+// A card with its write-protect switch on is read, and the firmware refuses a write to it, with
+// its own message; the image is left as it was and the card is not marked as written to.
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_refuses_to_write_to_a_write_protected_card() {
+    let image = fat32_image("protected");
+    let firmware = firmware();
+    let irqs = Irqs::new();
+    let memory = cmm2_memory(&irqs);
+    let console = memory.console();
+    let sd = memory.sd_slot();
+    sd.insert(image.clone()).unwrap();
+    sd.set_write_protected(true);
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
+    boot_to_second_prompt(&mut cpu, &console);
+    let mut say = |keys: &str| type_keys(&mut cpu, &console, keys).0;
+
+    let files = say("FILES\r");
+    assert!(files.contains("0 directories, 0 files"), "{files:?}");
+    let refused = say("OPEN \"W.TXT\" FOR OUTPUT AS #1\r");
+    assert!(refused.contains("write protected"), "{refused:?}");
+    assert!(!sd.modified());
+    assert_eq!(sd.eject().unwrap(), image);
 }
 
 // With no card the socket reports it empty, and the firmware says so without a card to ask.

@@ -13,6 +13,7 @@ use crate::console::Console;
 use crate::display::{Display, Frame, FrameError};
 use crate::flash_ops::FlashOps;
 use crate::peripheral::{Peripheral, PeripheralAccess, RegisterStub, ResetCause};
+use crate::rtc::Rtc;
 use crate::sd_slot::SdSlot;
 use crate::svd::Svd;
 use crate::usb::UsbPort;
@@ -133,6 +134,7 @@ pub struct MemoryMap {
     clock: Clock,
     console: Console,
     sd_slot: SdSlot,
+    rtc: Rtc,
     usb_port: UsbPort,
     display: Display,
 }
@@ -163,6 +165,7 @@ impl MemoryMap {
             pc: Rc::new(Cell::new(0)),
             flash_ops: FlashOps::new(),
             usb_port: UsbPort::new(clock.clone()),
+            rtc: Rtc::new(clock.clone()),
             clock,
             console: Console::new(),
             sd_slot: SdSlot::new(),
@@ -194,6 +197,12 @@ impl MemoryMap {
     /// The SD socket, shared with the front end, which puts a card image in and takes it back.
     pub fn sd_slot(&self) -> SdSlot {
         self.sd_slot.clone()
+    }
+
+    /// The real-time clock, shared with the front end, which reads and sets its time and date
+    /// off the bus. `cmm2_memory` maps it where the guest sees it.
+    pub fn rtc(&self) -> Rtc {
+        self.rtc.clone()
     }
 
     /// The USB host port, shared with the front end, which plugs devices into it.

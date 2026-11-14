@@ -48,7 +48,7 @@ pub use pwr::{PWR_BASE, PWR_SIZE, Pwr, PwrRegisters};
 pub use rcc::{RCC_BASE, RCC_SIZE, Rcc, RccRegisters};
 pub use registers::{Registers, WordAccess};
 pub use rtc::{RTC_BASE, RTC_SIZE, Rtc, RtcRegisters};
-pub use sd::{BLOCK, ImageSizeError};
+pub use sd::{BLOCK, ImageSizeError, MIN_IMAGE_SIZE};
 pub use sd_slot::SdSlot;
 pub use svd::{Field, Lookup, Svd, SvdError};
 pub use timer::{TIM5_BASE, TIM16_BASE, TIMER_SIZE, Timer, TimerRegisters};

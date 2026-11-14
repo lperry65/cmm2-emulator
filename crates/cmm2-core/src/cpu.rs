@@ -22,7 +22,6 @@ use crate::flash_ops::{FlashOp, FlashOps};
 use crate::irq::Irqs;
 use crate::memory::MemoryMap;
 use crate::peripheral::ResetCause;
-use crate::rtc;
 
 /// Cortex-M7 r1p1.
 const CPUID: u32 = 0x411F_C271;
@@ -354,7 +353,9 @@ impl Cpu {
         for addr in (USER_FLASH_BASE..FLASH_BASE + FLASH_SIZE as u32).step_by(4) {
             bytes.extend(self.read32(addr).to_le_bytes());
         }
-        for word in rtc::read_calendar(&mut self.memory.borrow_mut()) {
+        // Straight from the clock, not over the bus, so that a trace of the peripherals does
+        // not log the reads.
+        for word in self.memory.borrow().rtc().calendar() {
             bytes.extend(word.to_le_bytes());
         }
         bytes
@@ -375,7 +376,7 @@ impl Cpu {
         }
         let (words, _) = calendar.as_chunks::<4>();
         let calendar = [words[0], words[1]].map(u32::from_le_bytes);
-        rtc::write_calendar(&mut self.memory.borrow_mut(), calendar);
+        self.memory.borrow().rtc().set_calendar(calendar);
         Ok(())
     }
 
@@ -755,7 +756,7 @@ mod tests {
     }
 
     fn set_clock(cpu: &mut Cpu, tr: u32, dr: u32) {
-        crate::rtc::write_calendar(&mut cpu.memory(), [tr, dr]);
+        cpu.memory().rtc().set_calendar([tr, dr]);
     }
 
     #[test]
@@ -813,6 +814,20 @@ mod tests {
         let mut second = board(&THREE);
         second.load_persistent(&state).unwrap();
         assert_eq!(second.persistent(), state);
+    }
+
+    #[test]
+    fn saving_and_loading_the_state_leave_no_trace_on_the_bus() {
+        let mut cpu = board(&THREE);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        cpu.memory()
+            .set_peripheral_trace(Some(Box::new(move |access| {
+                sink.borrow_mut().push(*access)
+            })));
+        let state = cpu.persistent();
+        cpu.load_persistent(&state).unwrap();
+        assert_eq!(seen.borrow().len(), 0, "{:?}", seen.borrow());
     }
 
     #[test]

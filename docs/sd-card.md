@@ -291,12 +291,24 @@ bit-bang pins (`sd_slot.rs`, read and driven by the GPIO ports C and D), the `--
 ignored test that boots the real firmware on a FAT32 image from `mkfs.vfat`, lists it, saves a
 program with `AUTOSAVE`, lists and runs it back and finds the file in the image.
 
-- The card answers CMD0, CMD8, CMD55/ACMD41, CMD58, CMD17 and CMD24, with R1 `0x04` (illegal
-  command) for the rest, and R1 `0x40` for a block past the end. CMD9, CMD10, CMD18/12, CMD25 and
-  ACMD23 are not there, as nothing I ran needed them. SPI3 (`OPTION SD TIMING FAST`) is not there.
+- The card answers CMD0, CMD8, CMD55/ACMD41, CMD58, CMD17 and CMD24, and since the review of
+  that work also CMD18 with CMD12 (a stream of blocks, stopped with the stuff byte, R1 and busy),
+  CMD25 with the 0xFC and 0xFD tokens and ACMD23 (accepted and ignored), CMD9 (a version 2.0 CSD
+  made from the image size, `C_SIZE` counted in 512 KB, so `--sd` takes no image under 512 KB)
+  and CMD10 (a made-up CID, fixed); both need ACMD41 done, as only CMD0, CMD1, CMD8, ACMD41,
+  CMD58 and CMD59 are valid in the idle state as I remember the specification. CMD58
+  before ACMD41 answers with the OCR busy bit clear, and R1 0x01. R1 `0x04` (illegal command) is
+  for the rest, and R1 `0x40` for a block past the end. I looked for something the firmware does
+  that uses the new ones (a 640 KB file written with `PRINT #`, `COPY`, a read back, `FILES`,
+  `MM.INFO(DISK SIZE)` and `MM.INFO(FREE SPACE)`, all on a 64 MB FAT32 image) and the card only
+  ever saw CMD17 and CMD24, so the new commands are unit tested against the specification as I
+  remember it and not seen against the firmware. SPI3 (`OPTION SD TIMING FAST`) is not there.
+- The card knows whether a write changed it, and the front end only writes the image back to the
+  `--sd` file when it did.
 - PD3 reads low with a card in the socket and high without, and then the firmware says "SD card
-  not present" without sending anything to the card. PH12 still reads low, as the board does, so a
-  card is never write protected.
+  not present" without sending anything to the card. PH12 reads low, as the board does, unless the
+  front end says the card is protected (a `--sd` file that cannot be written back: read-only, or
+  in a directory or on a file system that cannot be written), when it reads high.
 - Measured on the real firmware: the first command that reaches the card is 5.9 million
   instructions, nearly all of it the slow bit-bang of the initialisation; a `FILES` after that is
   about 0.4 to 0.5 million, an `AUTOSAVE` that writes a file about 6 million and a `RUN` of it

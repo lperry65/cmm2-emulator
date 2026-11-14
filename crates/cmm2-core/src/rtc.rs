@@ -10,9 +10,11 @@
 //! counting through it: the time base is an absolute cycle count, which a reset does not
 //! change.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::clock::{CORE_HZ, Clock};
-use crate::memory::MemoryMap;
-use crate::peripheral::StubRegisters;
+use crate::peripheral::{Peripheral, ResetCause, StubRegisters};
 use crate::registers::{Registers, WordAccess};
 use crate::svd::Svd;
 
@@ -36,7 +38,9 @@ const RSF: u32 = 1 << 5;
 const INITF: u32 = 1 << 6;
 const INIT: u32 = 1 << 7;
 
-// The bits that exist: TR has no PM bit in 24-hour format, and the rest is reserved.
+// The bits that exist. TR has a PM bit (22) as well as the hour, minute and second digits. Only
+// the 24-hour format is modelled, so the bit is kept as written and never read as AM or PM.
+// The rest is reserved.
 const TR_MASK: u32 = 0x007F_7F7F;
 const DR_MASK: u32 = 0x00FF_FF3F;
 const PRER_MASK: u32 = 0x007F_7FFF;
@@ -77,6 +81,9 @@ struct DateTime {
     hours: u32,
     minutes: u32,
     seconds: u32,
+    /// The PM bit of TR. Only the 24-hour format is modelled, so it means nothing to the
+    /// counting; it is carried so that what the guest wrote to it reads back.
+    pm: bool,
 }
 
 impl DateTime {
@@ -93,12 +100,16 @@ impl DateTime {
             hours: bcd_unpack(tr >> 16 & 0x3F).min(23),
             minutes: bcd_unpack(tr >> 8 & 0x7F).min(59),
             seconds: bcd_unpack(tr & 0x7F).min(59),
+            pm: tr >> 22 & 1 != 0,
         }
     }
 
     /// The TR and DR values.
     fn to_registers(self) -> (u32, u32) {
-        let tr = bcd_pack(self.hours) << 16 | bcd_pack(self.minutes) << 8 | bcd_pack(self.seconds);
+        let tr = u32::from(self.pm) << 22
+            | bcd_pack(self.hours) << 16
+            | bcd_pack(self.minutes) << 8
+            | bcd_pack(self.seconds);
         let dr = bcd_pack(self.year) << 16
             | self.weekday << 13
             | bcd_pack(self.month) << 8
@@ -151,9 +162,12 @@ struct Reading {
 /// INIT is set the counters are stopped and TR and DR are what the firmware writes. The real
 /// RTC ignores writes to TR, DR and PRER outside initialisation mode, and so does this one.
 ///
-/// Unless BYPSHAD is set, a read of TR keeps a snapshot for the reads of SSR and DR that
-/// follow, and the read of DR drops it, so that the three agree. A read of SSR or DR with no
-/// snapshot gets the current value.
+/// Unless BYPSHAD is set, a read of TR locks the date, and a read of SSR locks the time and
+/// the date, as they are then, and the read of DR lets go. That is as I remember RM0433 (not
+/// checked against the manual): reading SSR or TR locks the higher-order shadow registers
+/// until DR is read. So TR after TR is the current time with the date held, and SSR is always
+/// the current value, so that a guest that waits on either is not stuck. A read of DR with
+/// nothing locked gets the current value. A system reset lets go of the lock.
 ///
 /// RTC_ISR is worked out on every read, and only INIT is stored. The alarm and wake-up
 /// registers are always writable (nothing is enabled) and the shadow registers are always in
@@ -168,7 +182,15 @@ pub struct RtcRegisters {
     stored: StubRegisters,
     clock: Clock,
     anchor: u64,
-    snapshot: Option<Reading>,
+    lock: Option<Lock>,
+}
+
+/// What the reads have locked, as it was when they did.
+#[derive(Debug, Clone, Copy)]
+struct Lock {
+    dr: u32,
+    /// Only a read of SSR locks TR.
+    tr: Option<u32>,
 }
 
 impl RtcRegisters {
@@ -204,8 +226,25 @@ impl RtcRegisters {
         }
     }
 
+    /// TR and DR now, as `reading` has them, for the front end. Nothing is locked, so it
+    /// leaves what the guest sees alone.
+    fn calendar(&mut self) -> [u32; 2] {
+        let now = self.reading();
+        [now.tr, now.dr]
+    }
+
+    /// Sets the time and date as the firmware does, in initialisation mode, and starts the
+    /// counters from them.
+    fn set_calendar(&mut self, [tr, dr]: [u32; 2]) {
+        self.write_isr(INIT, u32::MAX);
+        self.write(TR, tr, u32::MAX);
+        self.write(DR, dr, u32::MAX);
+        self.write_isr(0, u32::MAX);
+    }
+
     // Moves INIT to its new value. Setting it folds the time so far into TR and DR, which
-    // then stand still; clearing it starts the counters from what is stored.
+    // then stand still; clearing it starts the counters from what is stored. Either way the
+    // time changes under the lock, so it is let go.
     fn write_isr(&mut self, value: u32, mask: u32) {
         let was_in_init_mode = self.in_init_mode();
         let now = self.reading();
@@ -214,32 +253,56 @@ impl RtcRegisters {
             (false, true) => {
                 self.stored.write(TR, now.tr, u32::MAX);
                 self.stored.write(DR, now.dr, u32::MAX);
+                self.lock = None;
             }
-            (true, false) => self.anchor = self.clock.now(),
+            (true, false) => {
+                self.anchor = self.clock.now();
+                self.lock = None;
+            }
             _ => {}
         }
     }
 }
 
 impl Registers for RtcRegisters {
+    // The backup domain keeps the time and the registers through a system reset, but what the
+    // reads had locked is not part of that.
+    fn reset(&mut self, _cause: ResetCause) {
+        self.lock = None;
+    }
+
     fn read(&mut self, offset: u32) -> u32 {
         let bypass = self.stored.read(CR) & BYPSHAD != 0;
-        let shadow = |this: &mut Self| match this.snapshot {
-            Some(snapshot) if !bypass => snapshot,
-            _ => this.reading(),
-        };
         match offset {
             TR => {
                 let now = self.reading();
-                self.snapshot = (!bypass).then_some(now);
-                now.tr
+                match self.lock {
+                    Some(Lock { tr: Some(tr), .. }) if !bypass => tr,
+                    Some(_) => now.tr,
+                    None => {
+                        self.lock = (!bypass).then_some(Lock {
+                            dr: now.dr,
+                            tr: None,
+                        });
+                        now.tr
+                    }
+                }
             }
-            SSR => shadow(self).ssr,
-            DR => {
-                let reading = shadow(self);
-                self.snapshot = None;
-                reading.dr
+            SSR => {
+                let now = self.reading();
+                if !bypass {
+                    let lock = self.lock.get_or_insert(Lock {
+                        dr: now.dr,
+                        tr: None,
+                    });
+                    lock.tr.get_or_insert(now.tr);
+                }
+                now.ssr
             }
+            DR => match self.lock.take() {
+                Some(lock) if !bypass => lock.dr,
+                _ => self.reading().dr,
+            },
             ISR => {
                 let init = self.stored.read(ISR) & INIT;
                 let initf = if init != 0 { INITF } else { 0 };
@@ -270,34 +333,47 @@ impl Registers for RtcRegisters {
     }
 }
 
-pub type Rtc = WordAccess<RtcRegisters>;
+/// The RTC as the machine holds it. It is a cheap handle: clones share the clock, so the
+/// memory map serves the registers to the guest and the front end keeps one for the time and
+/// date, which it reads and sets without going through the bus (and so without the trace).
+#[derive(Clone, Debug)]
+pub struct Rtc(Rc<RefCell<WordAccess<RtcRegisters>>>);
 
 impl Rtc {
     /// The counters run from cycle 0 on 00:00:00 on Monday 01/01/00, the reset values, until
     /// the firmware sets the clock.
     pub fn new(clock: Clock) -> Rtc {
-        WordAccess::wrap(RtcRegisters {
+        Rtc(Rc::new(RefCell::new(WordAccess::wrap(RtcRegisters {
             stored: StubRegisters::with_reset_values(RTC_BASE, Svd::stm32h743()),
             clock,
             anchor: 0,
-            snapshot: None,
-        })
+            lock: None,
+        }))))
+    }
+
+    /// The time and date, `[TR, DR]`, as they are now.
+    pub(crate) fn calendar(&self) -> [u32; 2] {
+        self.0.borrow_mut().inner_mut().calendar()
+    }
+
+    /// Sets the time and date from `[TR, DR]`, so the clock carries on from there.
+    pub(crate) fn set_calendar(&self, calendar: [u32; 2]) {
+        self.0.borrow_mut().inner_mut().set_calendar(calendar);
     }
 }
 
-/// The time and date, TR and DR, as the firmware would read them from the clock on `memory`.
-pub(crate) fn read_calendar(memory: &mut MemoryMap) -> [u32; 2] {
-    // TR first: it keeps the snapshot that DR then agrees with.
-    [memory.read32(RTC_BASE + TR), memory.read32(RTC_BASE + DR)]
-}
+impl Peripheral for Rtc {
+    fn read(&mut self, offset: u32, size: u8) -> u32 {
+        self.0.borrow_mut().read(offset, size)
+    }
 
-/// Sets the clock on `memory` to the time and date `[TR, DR]`, in initialisation mode like the
-/// firmware does, so it carries on from there.
-pub(crate) fn write_calendar(memory: &mut MemoryMap, [tr, dr]: [u32; 2]) {
-    memory.write32(RTC_BASE + ISR, INIT);
-    memory.write32(RTC_BASE + TR, tr);
-    memory.write32(RTC_BASE + DR, dr);
-    memory.write32(RTC_BASE + ISR, 0);
+    fn write(&mut self, offset: u32, size: u8, value: u32) {
+        self.0.borrow_mut().write(offset, size, value);
+    }
+
+    fn reset(&mut self, cause: ResetCause) {
+        self.0.borrow_mut().reset(cause);
+    }
 }
 
 #[cfg(test)]
@@ -347,6 +423,7 @@ mod tests {
             hours: h,
             minutes: m,
             seconds: s,
+            pm: false,
         }
     }
 
@@ -440,7 +517,13 @@ mod tests {
     fn invalid_digits_are_clamped() {
         // Hours 35 and digits above 9 in minutes and seconds, day 0, month 13, year 165.
         let t = DateTime::from_registers(0x0075_9A9F, 0x00FF_0D00);
-        assert_eq!(t, date_time(99, 12, 1, 1, 23, 20, 25));
+        assert_eq!(
+            t,
+            DateTime {
+                pm: true,
+                ..date_time(99, 12, 1, 1, 23, 20, 25)
+            }
+        );
         // Day 31 of February.
         let t = DateTime::from_registers(0, 0x0025_0231);
         assert_eq!(t, date_time(25, 2, 28, 1, 0, 0, 0));
@@ -552,8 +635,11 @@ mod tests {
         assert_eq!(m.read32(TR_ADDR), 0);
         assert_eq!(m.read32(DR_ADDR), 0x0000_2101);
         assert_eq!(m.read32(SSR_ADDR), 0x00FF);
+        // The read of SSR locked the time, and DR lets go of it.
+        m.read32(DR_ADDR);
         m.clock().set(SECOND);
         assert_eq!(m.read32(TR_ADDR), 0x0000_0001);
+        m.read32(DR_ADDR);
         m.clock().set(61 * SECOND);
         assert_eq!(m.read32(TR_ADDR), 0x0000_0101);
     }
@@ -580,6 +666,7 @@ mod tests {
         m.clock().set(SECOND / 2);
         assert_eq!(m.read32(SSR_ADDR), 0x7FFF - 0x4000);
         assert_eq!(m.read32(TR_ADDR), 0);
+        m.read32(DR_ADDR);
         m.clock().set(SECOND);
         assert_eq!(m.read32(TR_ADDR), 1);
         assert_eq!(m.read32(SSR_ADDR), 0x7FFF);
@@ -599,6 +686,7 @@ mod tests {
         assert_eq!(m.read32(SSR_ADDR), 0xFF);
         m.write32(ISR_ADDR, 0);
         assert_eq!(m.read32(TR_ADDR), 0x0012_0000);
+        m.read32(DR_ADDR);
         m.clock().set(12 * SECOND);
         assert_eq!(m.read32(TR_ADDR), 0x0012_0003);
         assert_eq!(m.read32(DR_ADDR), 0x0026_9112);
@@ -662,18 +750,132 @@ mod tests {
     }
 
     #[test]
-    fn reading_tr_holds_ssr_and_dr_until_dr_is_read() {
+    fn reading_tr_holds_the_date_until_dr_is_read() {
         let mut m = machine();
         set_clock(&mut m, 0x0023_5959, 0x0026_9112);
         m.clock().set(SECOND / 2);
         assert_eq!(m.read32(TR_ADDR), 0x0023_5959);
         m.clock().set(SECOND);
-        // The snapshot, not the new second and day.
-        assert_eq!(m.read32(SSR_ADDR), 0xFF - 128);
+        // The date as it was at the read of TR, not the new day.
         assert_eq!(m.read32(DR_ADDR), 0x0026_9112);
         // The read of DR let it go.
         assert_eq!(m.read32(DR_ADDR), 0x0026_B113);
+    }
+
+    #[test]
+    fn tr_and_ssr_stay_current_after_a_read_of_tr() {
+        // A guest that reads TR and then waits on either of them is not stuck.
+        let mut m = machine();
+        set_clock(&mut m, 0x0023_5958, 0x0026_9112);
+        assert_eq!(m.read32(TR_ADDR), 0x0023_5958);
+        m.clock().set(SECOND / 2);
+        assert_eq!(m.read32(SSR_ADDR), 0xFF - 128);
+        m.clock().set(2 * SECOND);
         assert_eq!(m.read32(SSR_ADDR), 0xFF);
+        // The date is still the one TR locked, from before midnight.
+        assert_eq!(m.read32(DR_ADDR), 0x0026_9112);
+        assert_eq!(m.read32(TR_ADDR), 0x0000_0000);
+        assert_eq!(m.read32(DR_ADDR), 0x0026_B113);
+    }
+
+    #[test]
+    fn a_read_of_ssr_holds_tr_too_until_dr_is_read() {
+        let mut m = machine();
+        set_clock(&mut m, 0x0023_5958, 0x0026_9112);
+        m.read32(SSR_ADDR);
+        m.clock().set(2 * SECOND);
+        assert_eq!(m.read32(TR_ADDR), 0x0023_5958);
+        assert_eq!(m.read32(SSR_ADDR), 0xFF);
+        assert_eq!(m.read32(DR_ADDR), 0x0026_9112);
+        assert_eq!(m.read32(TR_ADDR), 0x0000_0000);
+    }
+
+    #[test]
+    fn a_system_reset_lets_go_of_the_lock() {
+        let mut m = machine();
+        set_clock(&mut m, 0x0023_5958, 0x0026_9112);
+        m.read32(SSR_ADDR);
+        m.clock().set(2 * SECOND);
+        m.reset_peripherals(ResetCause::Software);
+        assert_eq!(m.read32(TR_ADDR), 0x0000_0000);
+        assert_eq!(m.read32(DR_ADDR), 0x0026_B113);
+    }
+
+    #[test]
+    fn the_pm_bit_is_kept_while_the_clock_counts() {
+        let mut m = machine();
+        set_clock(&mut m, 1 << 22 | 0x0011_5958, 0x0026_9112);
+        m.clock().set(3 * SECOND);
+        assert_eq!(m.read32(TR_ADDR), 1 << 22 | 0x0012_0001);
+        m.read32(DR_ADDR);
+        // And through a stop of the clock for INIT.
+        m.write32(ISR_ADDR, INIT);
+        assert_eq!(m.read32(TR_ADDR), 1 << 22 | 0x0012_0001);
+    }
+
+    #[test]
+    fn a_read_of_ssr_locks_the_time_and_date_until_dr_is_read() {
+        let mut m = machine();
+        set_clock(&mut m, 0x0023_5959, 0x0026_9112);
+        m.clock().set(SECOND / 2);
+        assert_eq!(m.read32(SSR_ADDR), 0xFF - 128);
+        m.clock().set(SECOND);
+        assert_eq!(m.read32(TR_ADDR), 0x0023_5959);
+        assert_eq!(m.read32(DR_ADDR), 0x0026_9112);
+        assert_eq!(m.read32(DR_ADDR), 0x0026_B113);
+    }
+
+    #[test]
+    fn ssr_on_its_own_stays_current_so_that_waiting_on_it_ends() {
+        let mut m = machine();
+        m.clock().set(SECOND / 2);
+        assert_eq!(m.read32(SSR_ADDR), 0xFF - 128);
+        m.clock().set(SECOND / 2 + SECOND / 4);
+        assert_eq!(m.read32(SSR_ADDR), 0xFF - 192);
+    }
+
+    #[test]
+    fn a_lock_does_not_survive_setting_the_clock() {
+        let mut m = machine();
+        set_clock(&mut m, 0x0023_5958, 0x0026_9112);
+        // TR locked, DR never read; then the clock is set again.
+        m.read32(TR_ADDR);
+        set_clock(&mut m, 0x0001_0203, 0x0030_3231);
+        assert_eq!(m.read32(DR_ADDR), 0x0030_3231);
+        assert_eq!(m.read32(TR_ADDR), 0x0001_0203);
+    }
+
+    #[test]
+    fn a_lock_does_not_survive_entering_init_mode() {
+        let mut m = machine();
+        set_clock(&mut m, 0x0023_5958, 0x0026_9112);
+        m.read32(TR_ADDR);
+        m.write32(ISR_ADDR, INIT);
+        m.write32(DR_ADDR, 0x0030_3231);
+        assert_eq!(m.read32(DR_ADDR), 0x0030_3231);
+    }
+
+    #[test]
+    fn the_pm_bit_of_tr_is_kept_though_only_24_hour_format_is_modelled() {
+        let mut m = machine();
+        m.write32(ISR_ADDR, INIT);
+        m.write32(TR_ADDR, 1 << 22);
+        assert_eq!(m.read32(TR_ADDR), 1 << 22);
+        assert_eq!(TR_MASK & 1 << 22, 1 << 22);
+    }
+
+    #[test]
+    fn the_handle_reads_and_sets_the_calendar_off_the_bus() {
+        let rtc = Rtc::new(Clock::new());
+        assert_eq!(rtc.calendar(), [0, 0x0000_2101]);
+        rtc.set_calendar([0x0012_0000, 0x0026_9112]);
+        assert_eq!(rtc.calendar(), [0x0012_0000, 0x0026_9112]);
+        // A read through it takes no lock, so what the guest reads is left alone.
+        let mut guest = rtc.clone();
+        guest.write(ISR, 4, 0);
+        assert_eq!(guest.read(TR, 4), 0x0012_0000);
+        let _ = rtc.calendar();
+        assert_eq!(guest.read(TR, 4), 0x0012_0000);
     }
 
     #[test]

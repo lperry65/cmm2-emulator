@@ -14,6 +14,9 @@ pub struct SdSlot(Rc<RefCell<Slot>>);
 #[derive(Debug)]
 struct Slot {
     card: Option<SdCard>,
+    /// The write-protect switch is on. It belongs to the socket, and stays when a card is
+    /// changed.
+    protected: bool,
     /// Chip select is low. It starts out high, as the board pulls it up.
     selected: bool,
     clock: bool,
@@ -29,6 +32,7 @@ impl Default for Slot {
     fn default() -> Slot {
         Slot {
             card: None,
+            protected: false,
             selected: false,
             clock: false,
             shift: 0,
@@ -57,6 +61,23 @@ impl SdSlot {
         let card = slot.card.take();
         slot.restart_byte();
         card.map(SdCard::into_image)
+    }
+
+    /// Sets the write-protect switch. The firmware reads it from PH12 and refuses to write to a
+    /// protected card; the card itself takes no notice of it, as a real one does not.
+    pub fn set_write_protected(&self, protected: bool) {
+        self.0.borrow_mut().protected = protected;
+    }
+
+    /// The write-protect switch is on.
+    pub fn write_protected(&self) -> bool {
+        self.0.borrow().protected
+    }
+
+    /// Whether the card in the socket has been written to in a way that changed it, so that its
+    /// image is worth writing back. False with no card.
+    pub fn modified(&self) -> bool {
+        self.0.borrow().card.as_ref().is_some_and(SdCard::dirty)
     }
 
     /// The card-detect switch: there is a card in the socket.
@@ -268,6 +289,43 @@ mod tests {
         slot.set_chip_select(true);
         slot.set_chip_select(false);
         assert_eq!(command(&slot, 0, 0), 0x01);
+    }
+
+    #[test]
+    fn the_write_protect_switch_is_the_sockets_and_stays_through_a_change_of_card() {
+        let slot = SdSlot::new();
+        assert!(!slot.write_protected());
+        slot.set_write_protected(true);
+        slot.insert(vec![0; 512]).unwrap();
+        assert!(slot.write_protected());
+        slot.eject();
+        assert!(slot.write_protected());
+        slot.set_write_protected(false);
+        assert!(!slot.write_protected());
+    }
+
+    #[test]
+    fn the_slot_says_whether_the_card_was_written_to() {
+        let slot = slot_with_card();
+        assert!(!slot.modified());
+        slot.set_chip_select(false);
+        command(&slot, 0, 0);
+        command(&slot, 55, 0);
+        command(&slot, 41, 0x4000_0000);
+        assert_eq!(command(&slot, 17, 1), 0);
+        assert!(!slot.modified(), "a read");
+        assert_eq!(command(&slot, 24, 1), 0);
+        transfer(&slot, 0xFF);
+        transfer(&slot, 0xFE);
+        for _ in 0..512 + 2 {
+            transfer(&slot, 0x99);
+        }
+        assert!(slot.modified());
+        // A card put in its place is its own, and with none the answer is no.
+        slot.insert(vec![0; 512]).unwrap();
+        assert!(!slot.modified());
+        slot.eject();
+        assert!(!slot.modified());
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub struct RunOptions {
     /// back at the end.
     pub flash: Option<String>,
     /// A card image for the SD socket, which has to exist already and is written back at the
-    /// end.
+    /// end if the guest changed the card.
     pub sd: Option<String>,
 }
 
@@ -63,6 +63,8 @@ pub enum ArgError {
     ConsoleMmioNeedsFile,
     TraceFromNeedsTrace,
     BadKeys(String),
+    /// A file option was given an empty name, as an unset shell variable gives.
+    EmptyName(String),
     NothingToRun,
 }
 
@@ -89,6 +91,10 @@ impl fmt::Display for ArgError {
                 "cmm2-emulator: --trace-from needs --trace or --trace-mmio"
             )?,
             ArgError::BadKeys(arg) => writeln!(f, "cmm2-emulator: bad keys '{arg}'")?,
+            ArgError::EmptyName(option) => writeln!(
+                f,
+                "cmm2-emulator: {option} needs a file name, not an empty one"
+            )?,
             ArgError::NothingToRun => {
                 writeln!(f, "cmm2-emulator: nothing to run, give --run or --stop-at")?
             }
@@ -134,6 +140,16 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, ArgError
     }
 }
 
+/// The value of a file option, which has to be there and cannot be empty (an unset shell
+/// variable gives that, and it would only be found out when the run was over).
+fn file_name(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String, ArgError> {
+    match args.next() {
+        None => Err(ArgError::Usage),
+        Some(name) if name.is_empty() => Err(ArgError::EmptyName(option.to_string())),
+        Some(name) => Ok(name),
+    }
+}
+
 fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOptions, ArgError> {
     let mut options = RunOptions::default();
     while let Some(arg) = args.next() {
@@ -142,7 +158,7 @@ fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOption
             "--stop-at" => {
                 options.stop_at = Some(parse_address(&args.next().ok_or(ArgError::Usage)?)?)
             }
-            "--trace" => options.trace = Some(args.next().ok_or(ArgError::Usage)?),
+            "--trace" => options.trace = Some(file_name(&mut args, "--trace")?),
             "--trace-mmio" => options.trace_mmio = true,
             "--trace-from" => {
                 options.trace_from = Some(parse_count(&args.next().ok_or(ArgError::Usage)?)?)
@@ -151,9 +167,9 @@ fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOption
             "--window" => options.window = true,
             "--console-keys" => options.console_keys = true,
             "--unpaced" => options.unpaced = true,
-            "--flash" => options.flash = Some(args.next().ok_or(ArgError::Usage)?),
-            "--sd" => options.sd = Some(args.next().ok_or(ArgError::Usage)?),
-            "--screenshot" => options.screenshot = Some(args.next().ok_or(ArgError::Usage)?),
+            "--flash" => options.flash = Some(file_name(&mut args, "--flash")?),
+            "--sd" => options.sd = Some(file_name(&mut args, "--sd")?),
+            "--screenshot" => options.screenshot = Some(file_name(&mut args, "--screenshot")?),
             "--on" => {
                 let text = args.next().ok_or(ArgError::Usage)?;
                 let keys = parse_keys(&args.next().ok_or(ArgError::Usage)?)?;
@@ -494,6 +510,24 @@ mod tests {
         assert_eq!(
             parse_args(&["--firmware", "f", "--run", "9", "--sd"]),
             Err(ArgError::Usage)
+        );
+    }
+
+    #[test]
+    fn an_empty_file_name_is_refused_for_every_file_option() {
+        for option in ["--flash", "--sd", "--trace", "--screenshot"] {
+            assert_eq!(
+                parse_args(&["--firmware", "f", "--run", "9", option, ""]),
+                Err(ArgError::EmptyName(option.into())),
+                "{option}"
+            );
+        }
+        assert_eq!(
+            ArgError::EmptyName("--flash".into())
+                .to_string()
+                .lines()
+                .next(),
+            Some("cmm2-emulator: --flash needs a file name, not an empty one")
         );
     }
 

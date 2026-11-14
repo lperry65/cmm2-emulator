@@ -127,10 +127,81 @@ to run as fast as the host allows. A plain `--run` is never paced. Today the hos
 
 `--flash <file>` keeps the board's settings between runs, as a real board does. If the file
 exists it is loaded at the start, and the flash and the clock are written back to it when the run
-ends (quit key, window closed, `--run` limit, `--stop-at` or a fault), through a temporary file
-and a rename, so a crash never leaves half a file. The first run, with no file yet, goes through
-the first-boot setup and saves the options it makes. A second run with the same file reaches the
-prompt with no setup questions and no reset:
+ends. That is the quit key, the window closed, the `--run` limit, `--stop-at`, a fault, a SIGINT,
+SIGTERM or SIGHUP (Ctrl-C in a terminal that is not in raw mode, `kill`, the terminal being
+closed), and a panic in the emulator, which is saved from and then goes on as a panic (the
+terminal is put back before its message prints, and while the run goes the message is held back
+until the files are written, and then said, as standard error may be a pipe that nobody is
+reading and a message with a backtrace may not fit in it). A panic that comes while another is
+being unwound (a `Drop` that panics) is an abort, and nothing is saved then; what was held and the new message are written at once, so that they are not lost with it. The write goes through a temporary file in the
+same directory (named `.cmm2.<pid>.<time>.tmp`, so that one left by a crash is never in the
+way), which is synced and renamed over the file, and then the directory is synced, so a crash
+never leaves half a file. A directory that cannot be synced (not readable, or a file system with
+no such thing) is a warning on stderr, as the file is in its place by then. A crash does leave
+that temporary file, as big as the card. A save holds an advisory lock (`flock`) on its temporary
+file while it is open, which goes when the process does, however it ends. When a run starts, the
+`.cmm2.<pid>.<time>.tmp` files in the directory that have not been changed for a minute and that
+can be locked are removed: nobody is writing them. So a live emulator's file on this host is never touched,
+whatever the pid in its name means to this host (another host or container sharing the
+directory) and whatever the clock does. On a file system whose locks are not shared between
+hosts (NFS mounted with `local_lock=flock` or `nolock`, say) a lock does not show a save on
+another host, and then a left-over file of a save that is going on there could be removed by
+an emulator starting here, and that save would fail when it renames it (the old file is kept
+and nothing is lost, but the run's changes are). Where locking does not work at all the lock
+fails and nothing is removed, so a left-over file there has to be removed by hand. Another one
+that is left is a file with no read and no write right (mode 000), which cannot be locked:
+`rm .cmm2.*.tmp` in the directory clears it. The files that are looked at are only regular
+files (a FIFO, or a link, with such a name is left alone). The name has to be digits only, with a process id above 0, to count. A symlink is followed, even a dangling one (the first save creates what
+it points to), so the file it points to is the one replaced and the link stays. The file keeps
+its permissions. It does not keep its owner, which only a privileged process can set, and a hard
+link to the old file stops seeing the contents, as the file is replaced and not written in
+place. What the save needs is a directory it can make a file in, so the file's own permissions do
+not matter (a read-only file is replaced and keeps its mode). That is looked at when the run
+starts, with the effective user's rights, and a `--flash` file that could not be saved is an error
+then, naming why: the directory does not exist (or a part of the path is not a directory, or the
+links loop), a directory on the path cannot be searched, the directory is not writable (or is
+append-only), the file system is read-only, the file is immutable or append-only (`chattr +i`,
+`+a`), or it is another user's file in a sticky directory such as /tmp (unless the user has
+CAP_FOWNER, which is looked at and not just being root). A file that cannot be read is refused in
+words as well. A name that is empty (an unset shell variable), or ends in a slash, or in `.` or
+`..`, or is longer than the file system allows (255 bytes on most) is refused too, and so is a
+link that leads to such a name. The
+temporary file has a short name of its own, so that a name of any allowed length can be saved. Both files have to be regular files: a device, a FIFO or a directory is refused before
+anything is opened (a FIFO would hang the load, and `sudo` with `--sd /dev/mmcblk0` would read a
+whole card and then rename a file over its node). What cannot be seen at the start, and so can
+still fail when the run is over and lose it, is the rest: a full disk or quota, a file made
+immutable during the run, a network file system that goes away, a security module (SELinux,
+AppArmor) that says no.
+
+With `--console` the terminal is in raw mode, so Ctrl-C goes to the guest and the quit key is
+Ctrl-]; a signal sent from outside (SIGTERM, SIGHUP) still ends the run, and so does SIGINT with
+`--window` and no `--console`. A signal that was ignored when the emulator started (a job run
+with `nohup`, or in the background from a shell that ignores SIGINT) stays ignored. When a signal
+ends a run the files are written first, and then the emulator ends by that same signal, so the
+exit status is 128 plus its number and a shell stops a loop or an `&&` chain. A second signal
+ends it at once, with no save, and with nothing said of a panic's message that was being held
+(the handler cannot take a lock or allocate): that is what a second Ctrl-C means, and the run is lost back to
+the last time the files were written, which is the start of it. The same is true of a run that is
+blocked writing to a pipe, a FIFO or a terminal that nobody reads: the first signal ends it and
+it saves. Everything the run writes (the guest's output, the summary, the lines on stderr,
+`--trace-mmio`, and the `--trace` file, which may be a FIFO or `/dev/stdout`) goes through one
+writer, which writes by what the descriptor is. Regular files, and the memory devices that take
+any write at once (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random` and `/dev/urandom`), are
+written directly, 64 KB at a time, with no waiting. A pipe, a FIFO or the slave side of a
+terminal is reopened through `/proc/self/fd` with `O_NONBLOCK`, which is an open file description
+of its own (stdin and stderr stay blocking), written 64 KB at a time, and when it takes no more
+the writer waits for it to, or for the signal, whichever comes first; there is no instant in
+which a signal can be missed. Anything else (a socket, the master side of a pseudo-terminal, any
+other device, or no /proc) is written the old way, in small chunks after a wait, and there a
+signal in the instants between the wait and the write can be missed, and a second one ends the
+run without the save. A signal that comes while the files are being written waits for the
+end of the run as any other, and a second one still ends it at once. Before the run begins, while the files are
+being read (which can be slow, or stuck on a hung mount), a signal ends the process at once with
+its own status, as there is nothing to save yet. From the start of the run the main thread takes
+the signals, as the threads the emulator makes (stdin, SDL) have them blocked; threads that SDL
+makes later by itself are not covered. What nothing can save is the process being killed outright (SIGKILL), an abort, or the power going.
+The first run, with no file yet, goes through the first-boot setup and saves the options it makes.
+A second run with the same file reaches the prompt with no setup questions and no reset:
 
 ```
 cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --flash board.flash
@@ -140,16 +211,42 @@ The file holds only what the user changes, never the firmware, so it stays valid
 to a newer firmware `.bin`: the stored program and saved options (flash from 0x08120000 to the
 end, 896 KB) and then the clock's time and date (8 bytes), which a real board's battery keeps. The
 firmware asks its setup questions again if the clock has not been set, so the clock has to be
-saved too. The time stands still while the emulator is off. The file must be exactly 917,512
-bytes, or the run stops with an error and the file is left alone.
+saved too. The STM32's RTC runs on emulated time, not the host's: it counts with the machine's
+clock, so it is slower than the wall clock when the host is slow, and it stands still while the
+emulator is off. The Gen 2's real time comes from the external DS3231, which will supply the
+host's time when it is modelled. The file must be exactly 917,512 bytes, or the run stops with an
+error and the file is left alone.
+
+The address 0x08120000, where the user flash starts and the firmware ends, is only known to me
+for MMBasic 7.00.00b5 (its image ends 216 bytes below it); I have not checked it against another
+release. A firmware image that reaches it is refused at the start with an error, so that a
+release that does not fit is noticed and its tail is not merged into the `--flash` file.
 
 `--sd <file>` puts an SD card in the socket, with the file as its contents. The firmware drives the
 card in SPI mode over GPIO pins, and the card is a model of that: it answers the commands the
-firmware sends (initialisation, single-block read and write) from the image. The file has to exist
-and has to be a whole number of 512-byte blocks, or the run stops with an error and the file is
-left alone; the emulator never makes a card out of nothing. When the run ends, by any of the ways
-above, the card is written back to the file, through a temporary file and a rename as `--flash`
-is. Without `--sd` the socket is empty and the firmware says "SD card not present".
+firmware sends (initialisation, single-block and multiple-block read and write, and the CSD and
+CID registers) from the image. The file has to exist and has to be a whole number of 512-byte
+blocks, and at least 512 KB (the smallest size a version 2.0 CSD can describe), or the run stops
+with an error and the file is left alone; the emulator never makes a card out of nothing. When the run ends, by any of the ways above, the card is written back to the
+file, in the way `--flash` is, but only if the guest has changed the card. A card that was only
+read leaves the file alone, so a run that never wrote to it does not touch it (its time and inode
+stay the same), and changes made to the file on the host meanwhile are not lost. If the guest did
+write, the whole image is written back from the emulator's copy and replaces the file, so do not
+change the file on the host during such a run. A card is write-protected,
+as with the switch on a real one, when its file could not be written back: the file is read-only
+(its permissions say so), or its directory is not writable (or is append-only), or its file
+system is read-only, or the file is immutable or append-only, or it is another user's file in a
+sticky directory such as /tmp (the same reasons as for `--flash`, which refuses to start
+instead). The
+emulator says which on stderr; the firmware reads the pin, says "The physical drive is write
+protected" and does not write, and nothing is written back whatever happens. Without `--sd` the socket is empty and the
+firmware says "SD card not present".
+
+The whole image is held in memory for the run, so the card is as big as the RAM you can spare. I
+have only used 64 MB. A few GB is reasonable (a 4 GB card is a 4 GB allocation, read at the start
+and written back at the end if the guest wrote to it); I would not go past that. The card says
+it is an SDHC card, with the size of the image rounded down to 512 KB in its CSD. Its CID is made
+up: manufacturer 0, application "CM", product "CMM2E", serial number 1, made in January 2026.
 
 The image needs a FAT file system on it, which I make with the usual tools and not with the
 emulator. For a 64 MB FAT32 card:
@@ -164,8 +261,10 @@ cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --flash board.flas
 `mcopy -i card.img file.bas ::` should do it, though I have not tried that here. The firmware sets the card up the first time it is used, which costs
 about 5 million instructions; after that it is quick. The CMM2 has no `SAVE` or `LOAD` for
 programs: `FILES`, `RUN "T.BAS"`, `LIST "T.BAS"`, `EDIT "T.BAS"` and `AUTOSAVE "T.BAS"` use the
-card. `OPTION SD TIMING FAST` (the SPI3 peripheral) is not modelled yet, and nor are the multi-block
-commands, which the firmware does not use for anything I have tried.
+card. `OPTION SD TIMING FAST` (the SPI3 peripheral) is not modelled yet. The multiple-block
+commands and the CSD and CID are there and unit tested, but the firmware did not use them for
+anything I tried with it (a 640 KB file written, copied and read back, `FILES` and `MM.INFO`), so
+they have not been seen working against the real firmware.
 
 Building needs the SDL2 development files (`libsdl2-dev` on Debian and Ubuntu).
 

@@ -24,11 +24,13 @@ const AFRH: u32 = 0x24;
 // The ports and pins of the SD socket.
 const PORT_C: usize = 2;
 const PORT_D: usize = 3;
+const PORT_H: usize = 7;
 const SD_SCK: u32 = 10;
 const SD_MISO: u32 = 11;
 const SD_MOSI: u32 = 12;
 const SD_CS: u32 = 2;
 const SD_DETECT: u32 = 3;
+const SD_PROTECT: u32 = 12;
 
 // Reset values per port (MODER, OSPEEDR, PUPDR), A to K. They follow RM0433. The SVD gives
 // GPIOA's values to every port, which is wrong for B to K.
@@ -50,8 +52,9 @@ const RESETS: [[u32; 3]; GPIO_PORTS] = [
 // board read D3, F9 and H12 low with their pull-ups enabled (2026-11-12, at the idle prompt,
 // with a USB keyboard attached), so something outside the chip drives them. D3 is the SD
 // socket's card-detect switch, so it comes from the SD slot instead and is not in this table.
-// H12 is the write-protect switch: nothing in the socket sets it.
-const HELD_LOW: [u16; GPIO_PORTS] = [0, 0, 0, 0, 0, 1 << 9, 0, 1 << 12, 0, 0, 0];
+// H12 is the write-protect switch, which comes from the SD slot as well: it is low (not
+// protected) unless the slot says otherwise.
+const HELD_LOW: [u16; GPIO_PORTS] = [0, 0, 0, 0, 0, 1 << 9, 0, 0, 0, 0, 0];
 
 // Pins in alternate-function mode that read high, A to K: the levels the real board read at
 // the idle prompt (same occasion, same keyboard). They stand in for the peripherals that
@@ -103,12 +106,14 @@ impl GpioRegisters {
             && self.pupdr >> (2 * pin) & 3 == 0b01
     }
 
-    // The SD card holds its data-out wire low for a 0 bit, and the card-detect switch closes
-    // when a card is in.
+    // The SD card holds its data-out wire low for a 0 bit, the card-detect switch closes when a
+    // card is in, and the write-protect switch is open (the pin high, with its pull-up) only when
+    // the card is protected.
     fn card_pulls_low(&self, pin: u32) -> bool {
         match (self.port, pin) {
             (PORT_C, SD_MISO) => !self.sd.miso(),
             (PORT_D, SD_DETECT) => self.sd.present(),
+            (PORT_H, SD_PROTECT) => !self.sd.write_protected(),
             _ => false,
         }
     }
@@ -476,6 +481,21 @@ mod tests {
         sd.eject();
         configure(&mut m, GPIOD, 3, 0, 1);
         assert_eq!(pin(&mut m, GPIOD, 3), 1);
+    }
+
+    #[test]
+    fn write_protect_reads_high_when_the_slot_says_protected() {
+        let sd = card_in();
+        sd.set_write_protected(true);
+        let mut m = machine_with(&sd);
+        configure(&mut m, GPIOH, 12, 0, 1);
+        assert_eq!(pin(&mut m, GPIOH, 12), 1);
+        // The pull-up is what lifts it, as for the card-detect switch.
+        configure(&mut m, GPIOH, 12, 0, 0);
+        assert_eq!(pin(&mut m, GPIOH, 12), 0);
+        sd.set_write_protected(false);
+        configure(&mut m, GPIOH, 12, 0, 1);
+        assert_eq!(pin(&mut m, GPIOH, 12), 0);
     }
 
     #[test]
