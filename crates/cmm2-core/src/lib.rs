@@ -18,6 +18,7 @@ mod peripheral;
 mod pwr;
 mod rcc;
 mod registers;
+mod rng;
 mod rtc;
 mod sd;
 mod sd_slot;
@@ -40,7 +41,7 @@ pub use flash_ops::{FlashOp, FlashOps};
 pub use gpio::{GPIO_BASE, GPIO_PORT_SIZE, GPIO_PORTS, Gpio, GpioRegisters};
 pub use irq::Irqs;
 pub use ltdc::{LTDC_BASE, LTDC_SIZE, Ltdc, LtdcRegisters};
-pub use machine::cmm2_memory;
+pub use machine::{cmm2_memory, cmm2_memory_with_rng_seed};
 pub use memory::{
     AccessKind, DTCM_BASE, DTCM_SIZE, MemoryError, MemoryMap, REGIONS, RegionSpec, UnmappedAccess,
 };
@@ -49,6 +50,7 @@ pub use peripheral::{Peripheral, PeripheralAccess, RegisterStub, ResetCause, Stu
 pub use pwr::{PWR_BASE, PWR_SIZE, Pwr, PwrRegisters};
 pub use rcc::{RCC_BASE, RCC_SIZE, Rcc, RccRegisters};
 pub use registers::{Registers, WordAccess};
+pub use rng::{RNG_BASE, RNG_SIZE, Rng, RngRegisters};
 pub use rtc::{RTC_BASE, RTC_SIZE, Rtc, RtcRegisters};
 pub use sd::{BLOCK, ImageSizeError, MIN_IMAGE_SIZE};
 pub use sd_slot::SdSlot;

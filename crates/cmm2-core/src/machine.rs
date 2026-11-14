@@ -9,11 +9,23 @@ use crate::memory::MemoryMap;
 use crate::otg::{OTG_BASE, OTG_SIZE, Otg};
 use crate::pwr::{PWR_BASE, PWR_SIZE, Pwr};
 use crate::rcc::{RCC_BASE, RCC_SIZE, Rcc};
+use crate::rng::{RNG_BASE, RNG_SIZE, Rng};
 use crate::rtc::{RTC_BASE, RTC_SIZE};
 use crate::timer::{TIM5_BASE, TIM16_BASE, TIMER_SIZE, Timer};
 use crate::usart::{USART_SIZE, USART1_BASE, Usart};
 
+/// The machine's memory map, with the RNG's values seeded from the host, so that they differ from
+/// run to run, as the chip's do.
 pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
+    build_memory(irqs, None)
+}
+
+/// The same, with the RNG seeded with `seed`, so that a run repeats.
+pub fn cmm2_memory_with_rng_seed(irqs: &Irqs, seed: u64) -> MemoryMap {
+    build_memory(irqs, Some(seed))
+}
+
+fn build_memory(irqs: &Irqs, rng_seed: Option<u64>) -> MemoryMap {
     let mut memory = MemoryMap::new();
     // The layout is fixed, so none of this can overlap.
     memory
@@ -21,6 +33,7 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
         .expect("PWR window is clear of RAM");
     let rcc = Rcc::new(memory.clock());
     let pixel_clock = rcc.pixel_clock();
+    let rng_clock = rcc.rng_clock();
     memory
         .map_peripheral(RCC_BASE, RCC_SIZE, Box::new(rcc))
         .expect("RCC window is clear of RAM");
@@ -36,6 +49,13 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
             )),
         )
         .expect("LTDC window is clear of RAM");
+    memory
+        .map_peripheral(
+            RNG_BASE,
+            RNG_SIZE,
+            Box::new(Rng::new(memory.clock(), rng_clock, irqs.clone(), rng_seed)),
+        )
+        .expect("RNG window is clear of RAM");
     memory
         .map_peripheral(RTC_BASE, RTC_SIZE, Box::new(memory.rtc()))
         .expect("RTC window is clear of RAM");
@@ -107,6 +127,17 @@ mod tests {
         let mut m = cmm2_memory(&Irqs::new());
         m.write32(0x5802_4400, 1 << 16); // RCC_CR: HSEON
         assert_eq!(m.read32(0x5802_4400) & 1 << 17, 1 << 17); // HSERDY
+    }
+
+    #[test]
+    fn the_rng_is_served_by_the_model() {
+        let mut m = cmm2_memory_with_rng_seed(&Irqs::new(), 1);
+        m.write32(0x5802_44DC, 1 << 6); // RCC_AHB2ENR: RNGEN
+        m.write32(0x4802_1800, 1 << 2); // RNG_CR: RNGEN
+        m.clock().set(10_000);
+        assert_eq!(m.read32(0x4802_1804), 1); // RNG_SR: DRDY
+        assert_ne!(m.read32(0x4802_1808), 0); // RNG_DR
+        assert!(m.take_unmapped().is_empty());
     }
 
     #[test]

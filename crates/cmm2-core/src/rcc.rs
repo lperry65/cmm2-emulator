@@ -3,7 +3,8 @@
 //!
 //! One clock is worked out from the registers: PLL3's R output, which is the LTDC's pixel
 //! clock. The firmware sets it for each video mode, so the frame timing follows from it. The
-//! other PLL outputs are only stored. PLL3 only locks (PLL3RDY) when the reference and the VCO
+//! other PLL outputs are only stored. The RNG's clock gate, reset and kernel clock choice are
+//! handed to the RNG (see docs/rng.md). PLL3 only locks (PLL3RDY) when the reference and the VCO
 //! are in the chip's ranges; otherwise it has no clock and never becomes ready.
 
 use std::cell::{Cell, RefCell};
@@ -14,16 +15,24 @@ use crate::peripheral::{ResetCause, StubRegisters};
 use crate::registers::{Registers, WordAccess, follow};
 use crate::svd::Svd;
 
+mod rng_clock;
+pub(crate) use rng_clock::{RngClock, RngClockState};
+
 pub const RCC_BASE: u32 = 0x5802_4400;
 pub const RCC_SIZE: u32 = 0x400;
 
 // Register offsets and bit positions, as the SVD gives them.
 const CR: u32 = 0x00;
 const CFGR: u32 = 0x10;
+const D2CCIP2R: u32 = 0x54;
 const PLLCKSELR: u32 = 0x28;
 const PLLCFGR: u32 = 0x2C;
 const PLL3DIVR: u32 = 0x40;
 const PLL3FRACR: u32 = 0x44;
+const AHB2RSTR: u32 = 0x84;
+const AHB2ENR: u32 = 0xDC;
+// The same register as AHB2ENR, at a second offset (RM0433 8.7.42, Table 68).
+const C1_AHB2ENR: u32 = 0x13C;
 const BDCR: u32 = 0x70;
 const CSR: u32 = 0x74;
 const RSR: u32 = 0xD0;
@@ -57,6 +66,18 @@ const SFTRSTF: u32 = 1 << 24;
 const POWER_ON_FLAGS: u32 = 1 << 21 | 1 << 22 | 1 << 23; // BORRSTF, PINRSTF, PORRSTF
 const FLAGS: u32 = 0x55FA_0000;
 
+// The RNG's bits: RCC_AHB2ENR.RNGEN and RCC_AHB2RSTR.RNGRST (bit 6 of both), and the two bits
+// of RCC_D2CCIP2R that pick its kernel clock (RM0433 8.7.5, p. 416, and Figure 58, p. 364).
+const RNGEN: u32 = 1 << 6;
+const RNGRST: u32 = 1 << 6;
+const RNGSEL_SHIFT: u32 = 8;
+const RNGSEL_HZ: [u64; 4] = [
+    48_000_000, // hsi48_ck
+    // pll1_q_ck. PLL1 is not worked out, so I take it as 48 MHz. The firmware picks hsi48.
+    48_000_000, 32_768, // lse_ck
+    32_000, // lsi_ck, nominally 32 kHz
+];
+
 /// The board's crystal. PLL3 is fed from it, and the PLL sources the board does not use (the
 /// internal oscillators) are not modelled.
 const HSE_HZ: u64 = 8_000_000;
@@ -71,6 +92,8 @@ const ANY_PLL_ON: u32 = 1 << 24 | 1 << 26 | PLL3ON; // RCC_CR
 const PLL3_CONFIG_BITS: u32 = 7 << 22 | 3 << 10 | PLL3VCOSEL;
 // The registers that PLL3's R output depends on.
 const PLL3_INPUTS: [u32; 5] = [CR, PLLCKSELR, PLLCFGR, PLL3DIVR, PLL3FRACR];
+// The registers that the RNG's clocks and reset depend on.
+const RNG_INPUTS: [u32; 3] = [D2CCIP2R, AHB2ENR, AHB2RSTR];
 
 /// The pixel clock in Hz, as the RCC works it out from PLL3's registers, or 0 while PLL3 has no
 /// R output. A cheap handle: clones share the value, so the LTDC can see what the firmware
@@ -139,6 +162,7 @@ pub struct RccRegisters {
     sh_reg: u32,
     rsr: u32,
     pixel_clock: PixelClock,
+    rng_clock: RngClock,
 }
 
 /// What PLL3's VCO comes to, for the source and dividers the firmware has set.
@@ -237,10 +261,25 @@ impl RccRegisters {
         let hz = self.pll3_r_hz();
         self.pixel_clock.set(hz);
     }
+
+    /// Tells the RNG what its clocks and reset are now.
+    fn update_rng_clock(&mut self) {
+        let sel = self.stored.read(D2CCIP2R) >> RNGSEL_SHIFT & 3;
+        self.rng_clock.set(RngClockState {
+            enabled: self.stored.read(AHB2ENR) & RNGEN != 0,
+            in_reset: self.stored.read(AHB2RSTR) & RNGRST != 0,
+            kernel_hz: RNGSEL_HZ[sel as usize],
+        });
+    }
 }
 
 impl Registers for RccRegisters {
     fn read(&mut self, offset: u32) -> u32 {
+        let offset = if offset == C1_AHB2ENR {
+            AHB2ENR
+        } else {
+            offset
+        };
         let value = self.stored.read(offset);
         match offset {
             CR => {
@@ -265,6 +304,11 @@ impl Registers for RccRegisters {
     }
 
     fn write(&mut self, offset: u32, value: u32, mask: u32) {
+        let offset = if offset == C1_AHB2ENR {
+            AHB2ENR
+        } else {
+            offset
+        };
         if offset == RSR {
             if value & mask & RMVF != 0 {
                 self.rsr &= !FLAGS;
@@ -278,6 +322,9 @@ impl Registers for RccRegisters {
             }
             if PLL3_INPUTS.contains(&offset) {
                 self.update_pixel_clock();
+            }
+            if RNG_INPUTS.contains(&offset) {
+                self.update_rng_clock();
             }
         }
     }
@@ -293,6 +340,7 @@ impl Registers for RccRegisters {
             ResetCause::Software => SFTRSTF | PINRSTF,
         };
         self.update_pixel_clock();
+        self.update_rng_clock();
     }
 }
 
@@ -304,8 +352,14 @@ impl Rcc {
             stored: StubRegisters::with_reset_values(RCC_BASE, Svd::stm32h743()),
             sh_reg: 0,
             rsr: POWER_ON_FLAGS,
-            pixel_clock: PixelClock::new(clock),
+            pixel_clock: PixelClock::new(clock.clone()),
+            rng_clock: RngClock::new(clock),
         })
+    }
+
+    /// The RNG's clocks and reset, for the RNG to run by.
+    pub(crate) fn rng_clock(&self) -> RngClock {
+        self.inner().rng_clock.clone()
     }
 
     /// The pixel clock, for the LTDC to run its frame by.
