@@ -66,6 +66,9 @@ struct Shared {
     /// every 6 ms of machine time while there is nothing to send, and about every 25 ms while
     /// there is (docs/usb-host.md section 12).
     polls: Cell<u32>,
+    /// What `polls` and `led_updates` were when a report was last handed to the firmware.
+    report_polls: Cell<u32>,
+    report_led_updates: Cell<u32>,
 }
 
 impl KeyReport {
@@ -114,6 +117,18 @@ impl KeyReport {
     /// How many times the firmware has polled since the keyboard was reset.
     pub fn polls(&self) -> u32 {
         self.0.polls.get()
+    }
+
+    /// `polls()` as it was when the keyboard last handed the firmware a report, which is when the
+    /// firmware got the keys in it.
+    pub fn polls_at_report(&self) -> u32 {
+        self.0.report_polls.get()
+    }
+
+    /// `led_updates()` as it was when the keyboard last handed the firmware a report: an update
+    /// after that is the firmware's answer to what the report had in it.
+    pub fn led_updates_at_report(&self) -> u32 {
+        self.0.report_led_updates.get()
     }
 }
 
@@ -214,6 +229,8 @@ impl UsbDevice for HidKeyboard {
         self.keys.0.leds.set(0);
         self.keys.0.led_updates.set(0);
         self.keys.0.polls.set(0);
+        self.keys.0.report_polls.set(0);
+        self.keys.0.report_led_updates.set(0);
         *self = HidKeyboard::new(self.keys.clone());
     }
 
@@ -264,6 +281,8 @@ impl UsbDevice for HidKeyboard {
                     In::Nak
                 } else {
                     self.sent = report;
+                    shared.report_polls.set(shared.polls.get());
+                    shared.report_led_updates.set(shared.led_updates.get());
                     In::Data(report.to_vec())
                 }
             }
@@ -705,6 +724,38 @@ mod tests {
             kb.out(0, &[leds]);
         }
         assert_eq!(report.led_updates(), 2);
+    }
+
+    #[test]
+    fn the_counts_are_kept_as_they_were_when_a_report_was_handed_over() {
+        let (mut kb, report) = configured();
+        kb.in_token(1, 8);
+        assert_eq!(
+            (report.polls_at_report(), report.led_updates_at_report()),
+            (0, 0)
+        );
+        kb.setup([0x21, 0x09, 0, 0x02, 0, 0, 1, 0]);
+        kb.out(0, &[1]);
+        report.set([0, 0, 0x04, 0, 0, 0, 0, 0]);
+        kb.in_token(1, 8);
+        assert_eq!(
+            (report.polls_at_report(), report.led_updates_at_report()),
+            (2, 1)
+        );
+        // The firmware answers it, and the counts at the report stay where they were.
+        kb.setup([0x21, 0x09, 0, 0x02, 0, 0, 1, 0]);
+        kb.out(0, &[0]);
+        kb.in_token(1, 8);
+        assert_eq!(report.led_updates(), 2);
+        assert_eq!(
+            (report.polls_at_report(), report.led_updates_at_report()),
+            (2, 1)
+        );
+        kb.reset();
+        assert_eq!(
+            (report.polls_at_report(), report.led_updates_at_report()),
+            (0, 0)
+        );
     }
 
     #[test]

@@ -63,8 +63,12 @@ struct Key {
     /// The firmware has been sent a report that has it as a key, and not only the error.
     appeared: bool,
     /// It went down while six other keys were down, so the keyboard has no slot for it: it is
-    /// the rollover error until the firmware has been sent that, and is never typed.
+    /// the rollover error until the firmware has been sent that.
     overflow: bool,
+    /// The firmware has been sent the error for it. It is reported as a key, in its turn, if it
+    /// is still down when there is room (with the modifiers down then), and lost if it is let go
+    /// before, unless the report it is in has not been sent yet.
+    errored: bool,
 }
 
 /// The keys held and the report they make. A cheap handle on the keyboard's `KeyReport`, which
@@ -146,13 +150,7 @@ impl UsbKeys {
             self.keys.pop();
         }
         if (is_modifier(usage) || self.active()) && !self.is_down(usage) {
-            let overflow = !is_modifier(usage)
-                && self
-                    .keys
-                    .iter()
-                    .filter(|key| key.down && !is_modifier(key.usage))
-                    .count()
-                    >= SLOTS;
+            let overflow = !is_modifier(usage) && self.keys_down() >= SLOTS;
             self.keys.push(Key {
                 usage,
                 down: true,
@@ -161,6 +159,7 @@ impl UsbKeys {
                 sent: false,
                 appeared: false,
                 overflow,
+                errored: false,
             });
             // The firmware answers a lock key when it is reported (see `settle`), and the LEDs are
             // counted from here.
@@ -217,7 +216,8 @@ impl UsbKeys {
     /// the first, and not as the keyboard is reset), once the lock keys sent so far have been
     /// answered, and with no key waiting to be sent, so the comparison waits for all that, or for
     /// `LED_WAIT_POLLS` polls if the firmware never does. It also waits while the user holds a
-    /// lock key, as a tap would be let go of by the release. `num` is `None` where the host does
+    /// lock key, as a tap would be let go of by the release, and while six keys are down, as a tap
+    /// would be a seventh and lost. `num` is `None` where the host does
     /// not say, and then Num Lock is left as it is.
     pub fn follow_locks(&mut self, caps: bool, num: Option<bool>) {
         if !self.active() {
@@ -248,7 +248,9 @@ impl UsbKeys {
                 || report.polls().saturating_sub(keys.polls) >= LED_WAIT_POLLS
         });
         let held = self.is_down(CAPS_LOCK) || self.is_down(NUM_LOCK);
-        let current = first && answered && !held && !self.pending() && report.was_sent();
+        // A tap now would be a seventh key, and lost.
+        let full = self.keys_down() >= SLOTS;
+        let current = first && answered && !held && !full && !self.pending() && report.was_sent();
         if current && self.lock_keys.is_some() {
             self.lock_keys = None;
         }
@@ -258,6 +260,14 @@ impl UsbKeys {
     /// Has `follow_locks` look at the locks again, as when the window gets the focus back.
     pub fn check_locks(&mut self) {
         self.locks_followed = false;
+    }
+
+    // How many keys other than modifiers are down.
+    fn keys_down(&self) -> usize {
+        self.keys
+            .iter()
+            .filter(|key| key.down && !is_modifier(key.usage))
+            .count()
     }
 
     fn is_down(&self, usage: u8) -> bool {
@@ -283,24 +293,44 @@ impl UsbKeys {
     fn settle(&mut self) {
         if self.report.was_sent() {
             self.reported = self.report.get();
+            let error = self.reported[2] == ROLLOVER;
+            // What the keyboard counted as it handed the report over, not as the window looks.
+            let (polls, updates) = (
+                self.report.polls_at_report(),
+                self.report.led_updates_at_report(),
+            );
             for key in &mut self.keys {
                 key.sent |= key.shown;
+                key.errored |= error && key.overflow;
                 // A lock key toggles the firmware's lock when it first comes in a report as a
                 // key: one that was lost to the error, or is held through it, does so later.
                 if !key.appeared && self.reported[2..].contains(&key.usage) {
                     key.appeared = true;
                     if let (CAPS_LOCK | NUM_LOCK, Some(locks)) = (key.usage, &mut self.lock_keys) {
+                        // One reported late has waited since it went down, and the firmware's
+                        // answer is to be waited for from when it was reported: the polls and
+                        // the LED updates before then are not its. Presses that have been
+                        // answered by then are done with.
+                        if key.errored {
+                            locks.polls = polls;
+                            if updates >= locks.updates + locks.presses {
+                                locks.updates = updates;
+                                locks.presses = 0;
+                            }
+                        }
                         locks.presses += 1;
                     }
                 }
             }
         }
-        self.keys.retain(|key| key.down || !key.sent);
+        self.keys
+            .retain(|key| key.down || !(key.sent || (key.errored && !key.shown)));
     }
 
     // The report for the keys as they are now.
     fn publish(&mut self) {
-        self.keys.retain(|key| key.down || !key.sent);
+        self.keys
+            .retain(|key| key.down || !(key.sent || (key.errored && !key.shown)));
         if !self.active() {
             // Nothing is polling, so there is nothing to keep a key for: only the modifiers are
             // kept, down, for when it does.
@@ -335,6 +365,11 @@ impl UsbKeys {
     fn build(&mut self) -> [u8; 8] {
         let mut in_report: Vec<usize> = Vec::new();
         let mut modifiers = None;
+        // A key that had no slot and is still waiting for one takes the modifiers that are down
+        // when it is reported, as on a keyboard; the others those they went down with, which
+        // is for a tap that waited a poll.
+        let down_now = self.modifiers_down();
+        let own = |key: &Key| if key.errored { down_now } else { key.modifiers };
         let mut held_back = false;
         // The keys that are held are in the report whatever came before them in the order, so
         // a key waiting for its turn has only the slots they leave.
@@ -350,9 +385,9 @@ impl UsbKeys {
                 // is sent ahead of that key and not with it, or the firmware would see the key
                 // held with a modifier it never had.
                 let bit = 1 << (key.usage - FIRST_MODIFIER);
-                let before_a_key = self.keys[at + 1..].iter().any(|later| {
-                    !later.sent && !is_modifier(later.usage) && later.modifiers & bit == 0
-                });
+                let before_a_key = self.keys[at + 1..]
+                    .iter()
+                    .any(|later| !later.sent && !is_modifier(later.usage) && own(later) & bit == 0);
                 held_back |= !key.sent && before_a_key;
                 continue;
             }
@@ -369,11 +404,11 @@ impl UsbKeys {
                 || waiting_in_report + held >= SLOTS
                 || self.reported[2..].contains(&key.usage)
                 || taken(key.usage)
-                || modifiers.is_some_and(|bits| bits != key.modifiers);
+                || modifiers.is_some_and(|bits| bits != own(key));
             if clashes {
                 held_back = true;
             } else {
-                modifiers = Some(key.modifiers);
+                modifiers = Some(own(key));
                 waiting_in_report += 1;
                 in_report.push(at);
             }
@@ -394,17 +429,12 @@ impl UsbKeys {
             count += 1;
         }
         // More keys down than there are slots is the rollover error, which reports no key: the
-        // firmware is told only that there are too many, as by a real keyboard, and a key
-        // that went down with no slot for it is lost.
+        // firmware is told only that there are too many, as by a real keyboard.
         // A key that went down with no slot for it makes the error until the firmware has been
         // sent it, whatever has come up since: the keyboard would have been polled while the
         // seven were down, and the emulator is polled too slowly to be sure it was.
-        let down = self
-            .keys
-            .iter()
-            .filter(|key| key.down && !is_modifier(key.usage))
-            .count();
-        let rollover = down > SLOTS || self.keys.iter().any(|key| key.overflow && !key.sent);
+        let rollover =
+            self.keys_down() > SLOTS || self.keys.iter().any(|key| key.overflow && !key.errored);
         if rollover || count > SLOTS {
             report[2..].fill(ROLLOVER);
         }
@@ -412,10 +442,11 @@ impl UsbKeys {
             key.shown = if is_modifier(key.usage) {
                 modifiers >> (key.usage - FIRST_MODIFIER) & 1 != 0
             } else {
-                // The error report shows no key, but the firmware has had it with every key that
-                // is down in it. A key that is let go before then has not been seen, and waits.
+                // The error report shows no key: the firmware has only the keys it already had,
+                // and the others, down or let go, wait for their turn. A key that had no slot
+                // is lost if it is let go before it has one (see `errored`).
                 if rollover {
-                    key.overflow || (key.down && key.sent)
+                    key.down && key.sent
                 } else {
                     in_report.contains(&at)
                 }
@@ -1018,6 +1049,225 @@ mod tests {
         // The firmware has not shown it on the LEDs yet, so the host's lock is not compared.
         keys.follow_locks(true, Some(false));
         assert_eq!(delivered(&mut keys, &mut keyboard), NOTHING);
+    }
+
+    #[test]
+    fn keys_are_reported_in_the_order_they_went_down_after_the_error() {
+        let (mut keys, mut keyboard, _) = polled();
+        keys.press(LEFT_SHIFT);
+        for usage in A..A + 7 {
+            keys.press(usage);
+        }
+        // The error goes out, and the next report has the keys that fit.
+        let mut reports = Vec::new();
+        for _ in 0..3 {
+            if let In::Data(report) = poll(&mut keyboard) {
+                reports.push(report.try_into().unwrap());
+            }
+            keys.sync();
+        }
+        keys.release(A);
+        reports.extend(delivered(&mut keys, &mut keyboard));
+        // Typed in the order they went down: G, which the error was for, is not ahead of F.
+        let typed = typed_keys(reports.clone());
+        assert!(typed.is_sorted(), "{typed:?} {reports:?}");
+        assert_eq!(
+            reports.last(),
+            Some(&[2, 0, B, 6, 7, 8, 9, 0x0A]),
+            "{reports:?}"
+        );
+    }
+
+    #[test]
+    fn the_locks_are_not_followed_while_six_keys_are_down() {
+        let (mut keys, mut keyboard, _) = polled_with_leds(0);
+        for usage in A..A + 6 {
+            keys.press(usage);
+        }
+        delivered(&mut keys, &mut keyboard);
+        // A tap of Caps Lock now would be a seventh key, and lost.
+        keys.follow_locks(true, Some(false));
+        assert_eq!(delivered(&mut keys, &mut keyboard), NOTHING);
+        for usage in A..A + 6 {
+            keys.release(usage);
+        }
+        delivered(&mut keys, &mut keyboard);
+        keys.follow_locks(true, Some(false));
+        assert_eq!(delivered(&mut keys, &mut keyboard).len(), 2);
+    }
+
+    /// Six keys held, Caps Lock pressed as a seventh and held, `polls` polls and `updates` LED
+    /// updates by the firmware while it waits, then a key comes up and Caps Lock is reported.
+    fn caps_reported_late(polls: u32, updates: u32) -> (UsbKeys, HidKeyboard) {
+        let (mut keys, mut keyboard, _) = polled_with_leds(0);
+        for usage in A..A + 6 {
+            keys.press(usage);
+        }
+        delivered(&mut keys, &mut keyboard);
+        keys.press(CAPS_LOCK);
+        for _ in 0..polls {
+            poll(&mut keyboard);
+            keys.sync();
+        }
+        for _ in 0..updates {
+            set_leds(&mut keyboard, 0);
+        }
+        keys.release(A);
+        delivered(&mut keys, &mut keyboard);
+        keys.release(CAPS_LOCK);
+        delivered(&mut keys, &mut keyboard);
+        (keys, keyboard)
+    }
+
+    #[test]
+    fn the_wait_for_a_lock_key_held_through_the_error_counts_from_when_it_was_reported() {
+        let (mut keys, mut keyboard) = caps_reported_late(LED_WAIT_POLLS - 50, 0);
+        // More than LED_WAIT_POLLS since the press, and less since the report.
+        for _ in 0..100 {
+            poll(&mut keyboard);
+        }
+        keys.follow_locks(true, Some(false));
+        assert_eq!(delivered(&mut keys, &mut keyboard), NOTHING);
+    }
+
+    #[test]
+    fn the_leds_set_while_a_lock_key_waited_are_not_its_answer() {
+        let (mut keys, mut keyboard) = caps_reported_late(10, 1);
+        keys.follow_locks(true, Some(false));
+        assert_eq!(delivered(&mut keys, &mut keyboard), NOTHING);
+        // Its own answer, and then the host's lock is compared.
+        set_leds(&mut keyboard, 0);
+        keys.follow_locks(true, Some(false));
+        assert_eq!(delivered(&mut keys, &mut keyboard).len(), 2);
+    }
+
+    /// Six keys held and sent (A to F), with `modifier` down before them if it is not 0, G as a
+    /// seventh, and the error gone out for it.
+    fn error_sent_for_a_seventh(modifier: u8) -> (UsbKeys, HidKeyboard) {
+        let (mut keys, mut keyboard, _) = polled();
+        if modifier != 0 {
+            keys.press(modifier);
+        }
+        for usage in A..A + 6 {
+            keys.press(usage);
+        }
+        delivered(&mut keys, &mut keyboard);
+        keys.press(A + 6);
+        let In::Data(error) = poll(&mut keyboard) else {
+            panic!("the error is a report");
+        };
+        assert_eq!(error[2..], [ROLLOVER; 6]);
+        keys.sync();
+        (keys, keyboard)
+    }
+
+    #[test]
+    fn a_seventh_key_takes_the_modifiers_that_are_down_when_it_is_reported() {
+        // Shift came up while the error was the report, and the key is not typed with it.
+        let (mut keys, mut keyboard) = error_sent_for_a_seventh(LEFT_SHIFT);
+        keys.release(LEFT_SHIFT);
+        keys.release(A);
+        let reports = delivered(&mut keys, &mut keyboard);
+        assert!(reports.iter().all(|report| report[0] == 0), "{reports:?}");
+        assert_eq!(reports.last(), Some(&[0, 0, B, 6, 7, 8, 9, 0x0A]));
+        // And the other way: Shift pressed while it waited is down when it is reported.
+        let (mut keys, mut keyboard) = error_sent_for_a_seventh(0);
+        keys.press(LEFT_SHIFT);
+        keys.release(A);
+        let reports = delivered(&mut keys, &mut keyboard);
+        assert_eq!(
+            reports.last(),
+            Some(&[2, 0, B, 6, 7, 8, 9, 0x0A]),
+            "{reports:?}"
+        );
+    }
+
+    #[test]
+    fn a_seventh_key_reported_and_let_go_before_the_next_poll_is_typed() {
+        let (mut keys, mut keyboard) = error_sent_for_a_seventh(0);
+        // A slot frees, which sets the report with G in it, and G comes up before it is polled.
+        keys.release(A);
+        keys.release(A + 6);
+        let reports = delivered(&mut keys, &mut keyboard);
+        assert!(
+            reports.iter().any(|report| report[2..].contains(&(A + 6))),
+            "{reports:?}"
+        );
+    }
+
+    #[test]
+    fn the_answer_to_a_lock_key_reported_late_that_came_before_the_look_is_counted() {
+        let (mut keys, mut keyboard, _) = polled_with_leds(0);
+        for usage in A..A + 6 {
+            keys.press(usage);
+        }
+        delivered(&mut keys, &mut keyboard);
+        keys.press(CAPS_LOCK);
+        poll(&mut keyboard);
+        keys.sync();
+        keys.release(A);
+        // The report with Caps Lock in it goes out, and the firmware answers it before the window
+        // looks at the keys again.
+        poll(&mut keyboard);
+        set_leds(&mut keyboard, LED_CAPS);
+        keys.sync();
+        keys.release(CAPS_LOCK);
+        delivered(&mut keys, &mut keyboard);
+        // The lock is on in the firmware and off at the host: decided at once, with a tap.
+        keys.follow_locks(false, Some(false));
+        assert_eq!(delivered(&mut keys, &mut keyboard).len(), 2);
+    }
+
+    #[test]
+    fn the_wait_for_a_lock_key_held_through_the_error_counts_from_the_report_that_had_it() {
+        let (mut keys, mut keyboard, _) = polled_with_leds(0);
+        for usage in A..A + 6 {
+            keys.press(usage);
+        }
+        delivered(&mut keys, &mut keyboard);
+        keys.press(CAPS_LOCK);
+        poll(&mut keyboard);
+        keys.sync();
+        keys.release(A);
+        // It is handed over, and the window does not look for as long as the firmware never
+        // answers: the wait is over by then, though the look is just now.
+        for _ in 0..=LED_WAIT_POLLS {
+            poll(&mut keyboard);
+        }
+        keys.sync();
+        keys.release(CAPS_LOCK);
+        delivered(&mut keys, &mut keyboard);
+        keys.follow_locks(true, Some(false));
+        assert_eq!(delivered(&mut keys, &mut keyboard).len(), 2);
+    }
+
+    #[test]
+    fn an_earlier_lock_key_that_was_answered_does_not_hold_a_later_one_to_its_count() {
+        let (mut keys, mut keyboard, _) = polled_with_leds(0);
+        // Caps Lock tapped and answered, and the locks not looked at since.
+        keys.press(CAPS_LOCK);
+        keys.release(CAPS_LOCK);
+        delivered(&mut keys, &mut keyboard);
+        set_leds(&mut keyboard, LED_CAPS);
+        // Another, held as a seventh, with the firmware setting the LEDs while it waits.
+        for usage in A..A + 6 {
+            keys.press(usage);
+        }
+        delivered(&mut keys, &mut keyboard);
+        keys.press(NUM_LOCK);
+        poll(&mut keyboard);
+        keys.sync();
+        set_leds(&mut keyboard, LED_CAPS);
+        keys.release(A);
+        delivered(&mut keys, &mut keyboard);
+        keys.release(NUM_LOCK);
+        delivered(&mut keys, &mut keyboard);
+        // Num Lock has not been answered: the host's locks are not compared yet.
+        keys.follow_locks(true, Some(false));
+        assert_eq!(delivered(&mut keys, &mut keyboard), NOTHING);
+        set_leds(&mut keyboard, LED_CAPS | LED_NUM);
+        keys.follow_locks(true, Some(false));
+        assert_eq!(delivered(&mut keys, &mut keyboard).len(), 2);
     }
 
     #[test]

@@ -732,6 +732,11 @@ impl Ds3231Slot {
     }
 
     /// Takes back what `saved` gave. The chip is left as it was if the offset is refused.
+    ///
+    /// An offset saved by the build before the chip had its own calendar (the one with the weekday
+    /// and the 12-hour form, e32008d) was worked out in Gregorian days and is read in the chip's
+    /// now, which differs after 28 February 2100: a chip those set past it loads a day early, and
+    /// the saved bytes cannot tell that build from this one (docs/ds3231.md).
     pub fn load(&self, bytes: [u8; STATE_SIZE]) -> Result<(), OffsetError> {
         let millis = i64::from_le_bytes(bytes[..8].try_into().expect("eight bytes"));
         let offset = checked((bytes[8] & 1 != 0).then_some(millis))?;
@@ -749,8 +754,10 @@ impl Ds3231Slot {
         self.0.borrow_mut().make_new();
     }
 
-    /// Takes the offset an earlier version saved: whole seconds from the host's local time, 0 for
-    /// a chip never set. The time it meant is kept, now as an offset from UTC.
+    /// Takes the offset the first version saved: whole seconds from the host's local time, 0 for
+    /// a chip never set. The time it meant is kept, now as an offset from UTC. That version
+    /// counted in Gregorian days, so the date it showed now is converted to the chip's calendar
+    /// exactly, which is the same until 28 February 2100.
     pub fn load_v1(&self, seconds: i64) -> Result<(), OffsetError> {
         let millis = checked(Some(seconds.saturating_mul(1000)))?;
         let mut chip = self.0.borrow_mut();
@@ -760,7 +767,14 @@ impl Ds3231Slot {
         } else {
             let now = chip.clock.now();
             let zone = now.local.seconds() - now.utc_millis.div_euclid(1000);
-            checked(millis.map(|millis| millis.saturating_add(zone * 1000)))?
+            let gregorian = checked(millis.map(|millis| millis.saturating_add(zone * 1000)))?;
+            // The date it showed now, taken in the chip's calendar.
+            gregorian.map_or(Ok(None), |gregorian| {
+                let wall = now.utc_millis.saturating_add(gregorian);
+                let time = HostTime::from_seconds(wall.div_euclid(1000));
+                let target = time.chip_seconds() * 1000 + wall.rem_euclid(1000);
+                checked(Some(target.saturating_sub(now.utc_millis)))
+            })?
         };
         chip.make_new();
         chip.offset = offset;
@@ -1822,6 +1836,24 @@ mod tests {
         assert_eq!(bus.chip.offset_millis(), Some(-MAX_OFFSET_MILLIS));
         let saved = bus.chip.saved().unwrap();
         Bus::at(december()).chip.load(saved).unwrap();
+    }
+
+    #[test]
+    fn the_offset_of_the_first_version_past_2100_is_the_date_it_showed() {
+        // It counted in Gregorian days: 2100-03-05 is the day after 4 March, and the chip's
+        // calendar has a 29 February before it, so the chip shows the same date by being a day
+        // on in its days.
+        let bus = Bus::at(december());
+        let shown = HostTime::new(2100, 3, 5, 12, 0, 0);
+        let seconds = shown.seconds() - bus.clock.now().local.seconds();
+        bus.chip.load_v1(seconds).unwrap();
+        assert_eq!(bus.chip.time(), shown);
+        bus.clock.advance(86_400);
+        assert_eq!(bus.chip.time(), HostTime::new(2100, 3, 6, 12, 0, 0));
+        // Before 2100 it is as it was.
+        let bus = Bus::at(december());
+        bus.chip.load_v1(3600).unwrap();
+        assert_eq!(bus.chip.time(), HostTime::new(2026, 12, 24, 14, 45, 56));
     }
 
     #[test]

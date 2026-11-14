@@ -627,62 +627,70 @@ a system reset or the port losing its power), `KeyReport::leds()` is the LED byt
 and `KeyReport::was_sent()` is true once the keyboard has handed over, or found the firmware already
 had, the report as it now is.
 
-**The report is the keys that are held.** Each poll the keyboard reports the keys that are down at that
-moment, as a real keyboard does: the modifiers and up to six keys in press order, `0x01` in all six
-slots with more than six down. A held key is in every report for as long as it is held, so the
+**The report is the keys that are held.** Each poll the keyboard reports the keys that are down at
+that moment, as a real keyboard does: the modifiers and up to six keys in press order, `0x01` in all
+six slots with more than six down. A held key is in every report for as long as it is held, so the
 firmware repeats it itself and `KEYDOWN()` sees it, and keys that are held together appear together.
-(An earlier version queued a report for every change of the keys and sent one per poll. It could
-not keep up with typing: a keystroke cost two reports of 25 ms each, so it drained about five
-characters a second of host time unpaced, and it would have replayed a stall minutes late. That
-version, and the one before it, which dropped a Shift as soon as its own press was sent, typed
-`a` for a quick Shift and `a`, and `l` for `ll`, both of which the real firmware showed.)
+(An earlier version queued a report for every change of the keys and sent one per poll. It could not
+keep up with typing: a keystroke cost two reports of 25 ms each, so it drained about five characters
+a second of host time unpaced, and it would have replayed a stall minutes late. That version, and
+the one before it, which dropped a Shift as soon as its own press was sent, typed `a` for a quick
+Shift and `a`, and `l` for `ll`, both of which the real firmware showed.)
 
 The one thing added to a real keyboard, because the emulator is polled more slowly than real time: a
 key that is let go before a poll has reported it stays in the report until one has, together with
-the modifiers that were down when it went down, so a tap is never lost, Shift with a letter types the
-capital however soon the Shift comes up, and Ctrl-C arrives. A tap is two polls, the key and then
-the report without it, as on hardware. What cannot share a report waits for the next:
- - the same key again (it is reported, then let go for a poll, then reported again, so `ll` types two);
+the modifiers that were down when it went down, so a tap is never lost, Shift with a letter types
+the capital however soon the Shift comes up, and Ctrl-C arrives. A tap is two polls, the key and
+then the report without it, as on hardware. What cannot share a report waits for the next:
+ - the same key again (it is reported, then let go for a poll, then reported again, so `ll` types
+   two);
  - a key that went down with different modifiers than one still waiting (`a` and then a quick
-   Shift with `B` are two reports, so `a` is not typed as `A`);
+Shift with `B` are two reports, so `a` is not typed as `A`);
  - a seventh key at once (taps over six in one go are six and then the rest, in order);
  - everything after the first of these that waits, so the order is kept.
-A modifier pressed after a waiting key is held back from the report with it, and appears in the next.
-A modifier that was tapped before a key, and was up again before that key went down, is sent in a
-report of its own ahead of it, and the key follows without it: the two were never held together,
-and `KEYDOWN(7)` must not say they were while the key is held. A modifier tapped while a key is
-held is in the report with it, as it was.
-A key that is down when there are more than six is the rollover error, as before, and the keys
-that were down in it are counted as told of. A key that was waiting and was let go before then was
-not in that report, so it is not counted: it waits for its turn like any other tap. (This is a key
-that went down with fewer than six others down. A key that goes down with six already down has no
-slot, and is dealt with below.)
+A modifier pressed after a waiting key is held back from the report with it, and appears in the
+next. A modifier that was tapped before a key, and was up again before that key went down, is sent
+in a report of its own ahead of it, and the key follows without it: the two were never held
+together, and `KEYDOWN(7)` must not say they were while the key is held. A modifier tapped while a
+key is held is in the report with it, as it was. A key that is down when there are more than six is
+the rollover error, as before, and the keys that were down in it and had been in a report before are
+counted as told of. A key that was waiting and was let go before then was not in that report, so it
+is not counted: it waits for its turn like any other tap. (This is a key that went down with fewer
+than six others down. A key that goes down with six already down has no slot, and is dealt with
+below.)
 
-So typing faster than one key per poll can put two different keys in one report. They are both typed,
-in the order they were pressed, as the firmware types every key that is in a report and was not in
-the one before in slot order. Nothing a user types is lost this way. What can be lost: a key
+So typing faster than one key per poll can put two different keys in one report. They are both
+typed, in the order they were pressed, as the firmware types every key that is in a report and was
+not in the one before in slot order. Nothing a user types is lost this way. What can be lost: a key
 pressed and let go while the firmware is not polling is kept and typed late, six at a time, when it
 does (there is no bound on how many are kept; the firmware does not stop polling short of a reset,
-which drops them); and a modifier that is tapped on its own and held back stays until the key before it
-has gone. A key that goes down while six others are down is a seventh key, and a real keyboard sends
-the rollover error (`0x01` in every slot) for as long as it is down, with no key in the report. A
-seventh key that is let go while the error is the report is lost, as on a keyboard. One that is
-still held when a slot frees is reported then, and typed, as a keyboard does.
-The emulator is polled more slowly than real time, so the error is sent whenever a seventh key went
-down with six others, until the firmware has had it once, whatever has come up since: a keyboard
-polled while the seven overlapped would have sent it, so the seventh key is lost when it is let go
-before then, even if the other six, or one of them, come up first. The firmware sees the error, then
-the keys that remain, as it would from the keyboard. Keys that were down when the error went out, and
-had not been in a report before, are not counted as seen by it: they are reported afterwards, and
-typed, even if they come up before the next poll. Nothing is left waiting for the lost key, so
-the window's lock following (below) is not held up by it. A Caps Lock or Num Lock is waited for
-(the LED update the firmware answers it with) when it is first reported as a key, and not when it
-goes down, so one lost to the error is not waited for and one held through it is. A key that was already waiting when the
-seven were down, because it was tapped before the seventh key went down, was seen by the keyboard
-alone and is not lost: it is typed once there is room.
+which drops them); and a modifier that is tapped on its own and held back stays until the key before
+it has gone. A key that goes down while six others are down is a seventh key, and a real keyboard
+sends the rollover error (`0x01` in every slot) for as long as it is down, with no key in the
+report. A seventh key that is let go while the error is the report is lost, as on a keyboard. One
+that is still held when a slot frees is reported then, and typed, as a keyboard does, in its turn:
+after the keys that went down before it and have not been reported yet. The emulator is polled more
+slowly than real time, so the error is sent whenever a seventh key went down with six others, until
+the firmware has had it once, whatever has come up since: a keyboard polled while the seven
+overlapped would have sent it, so the seventh key is lost when it is let go before then, even if the
+other six, or one of them, come up first. The firmware sees the error, then the keys that remain, as
+it would from the keyboard. Keys that were down when the error went out, and had not been in a
+report before, are not counted as seen by it: they are reported afterwards, and typed, even if they
+come up before the next poll. Nothing is left waiting for the lost key, so the window's lock
+following (below) is not held up by it, and it does not tap a lock while six keys are down, as the
+tap would be a seventh key and lost. A Caps Lock or Num Lock is waited for (the LED update the
+firmware answers it with) when it is first reported as a key, and not when it goes down, so one lost
+to the error is not waited for and one held through it is, counting its polls and LED updates from
+when it is reported. A seventh key that is held takes the modifiers that are down when it is
+reported, not those it went down with, as a keyboard reports them, and one that comes up after its
+report is set and before it is polled is still sent. The polls and LED updates of a lock key held
+through the error are counted as the keyboard handed over its report, so an answer that came before
+the window looked is not lost. A key that was already waiting when the seven were down, because it
+was tapped before the seventh key went down, was seen by the keyboard alone and is not lost: it is
+typed once there is room.
 
-Property tested (`usb_keys.rs`, 3000 random sequences of presses and releases of three keys and three
-modifiers, with the firmware polling at random in between, and no more than one key going down
+Property tested (`usb_keys.rs`, 3000 random sequences of presses and releases of three keys and
+three modifiers, with the firmware polling at random in between, and no more than one key going down
 between two polls): a model of the firmware types exactly the keys that were pressed, in order, each
 with the modifiers that were down when it was pressed. On the real firmware: a held `a` is
 `KEYDOWN(1)` = 97 in every one of the readings 20 ms apart after the first (none lost in 40); a key
