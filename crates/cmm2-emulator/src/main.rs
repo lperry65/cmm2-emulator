@@ -1,5 +1,6 @@
 mod args;
 mod keys;
+mod local_clock;
 mod pacing;
 mod script;
 mod signals;
@@ -25,8 +26,9 @@ use args::{Command, RunOptions};
 use cmm2_core::{
     AccessKind, CORE_HZ, Console, Cpu, CpuError, Firmware, FirmwareError, FrameError, HidKeyboard,
     ImageSizeError, Irqs, KeyReport, MIN_IMAGE_SIZE, MemoryError, PeripheralAccess,
-    PersistentSizeError, SdSlot, Stop, Svd, cmm2_memory,
+    PersistentError, SdSlot, Stop, Svd, cmm2_memory,
 };
+use local_clock::LocalClock;
 use pacing::{Pacer, RealTime};
 use script::Script;
 use terminal::RawMode;
@@ -262,7 +264,7 @@ enum RunError {
     /// The `--flash` file is not the size of the saved state.
     FlashSize {
         path: String,
-        source: PersistentSizeError,
+        source: PersistentError,
     },
     /// The `--sd` file could not be read or written.
     Sd {
@@ -419,6 +421,8 @@ fn build_machine(path: &str, options: &RunOptions) -> Result<Machine, RunError> 
     let trace = trace_out(options)?;
     let console = memory.console();
     let sd = memory.sd_slot();
+    // The board's DS3231 is always fitted, and keeps the host's time.
+    memory.ds3231().set_host_clock(Box::new(LocalClock));
     let mut cpu = Cpu::new(&firmware, memory, irqs)?;
     if let Some(path) = &options.flash {
         load_flash(&mut cpu, path)?;
@@ -1860,6 +1864,81 @@ mod tests {
 
     fn mode(path: &Path, mode: u32) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn the_ds3231_is_fitted_and_shows_the_hosts_time() {
+        let dir = scratch("ds3231-fitted");
+        let firmware = dir.join("firmware.bin");
+        let mut image = vec![0; 64];
+        image[..4].copy_from_slice(&0x2000_8000u32.to_le_bytes());
+        image[4..8].copy_from_slice(&0x0800_0021u32.to_le_bytes());
+        std::fs::write(&firmware, image).unwrap();
+
+        let machine = build_machine(firmware.to_str().unwrap(), &RunOptions::default()).unwrap();
+
+        // The chip's own default clock stands at the year 2000, until the host's is attached.
+        let shown = machine.cpu.memory().ds3231().time();
+        assert_ne!(shown.year, 2000);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_ds3231_offset_is_kept_in_the_flash_file_between_runs() {
+        let dir = scratch("flash-offset");
+        let file = dir.join("board.flash");
+        let path = file.to_str().unwrap();
+        let options = RunOptions {
+            flash: Some(path.to_string()),
+            ..RunOptions::default()
+        };
+        let mut first = idle_cpu();
+        first
+            .memory()
+            .ds3231()
+            .set_offset_millis(Some(-4 * 86_400_000 - 5000))
+            .unwrap();
+        save_flash(&mut first, &options).unwrap();
+
+        let mut second = idle_cpu();
+        load_flash(&mut second, path).unwrap();
+
+        assert_eq!(
+            second.memory().ds3231().offset_millis(),
+            Some(-4 * 86_400_000 - 5000)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_ds3231_never_set_keeps_the_flash_file_the_size_it_was_before_it_was_modelled() {
+        let dir = scratch("flash-size-unset");
+        let file = dir.join("board.flash");
+        let options = RunOptions {
+            flash: Some(file.to_str().unwrap().to_string()),
+            ..RunOptions::default()
+        };
+        let mut cpu = idle_cpu();
+        save_flash(&mut cpu, &options).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap().len(), PERSISTENT_SIZE);
+        assert_eq!(PERSISTENT_SIZE, 917_512);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_flash_file_with_a_ds3231_offset_that_is_too_far_away_is_refused() {
+        let dir = scratch("flash-offset-far");
+        let file = dir.join("board.flash");
+        let mut cpu = idle_cpu();
+        let mut bytes = cpu.persistent();
+        bytes.extend(i64::MAX.to_le_bytes());
+        bytes.extend([1, 0x88]);
+        std::fs::write(&file, bytes).unwrap();
+
+        let err = load_flash(&mut cpu, file.to_str().unwrap()).unwrap_err();
+
+        assert!(err.to_string().ends_with("more than 200 years"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

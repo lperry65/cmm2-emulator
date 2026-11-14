@@ -17,6 +17,7 @@ use zmu_cortex_m::executor::Executor;
 use zmu_cortex_m::peripheral::nvic::NVIC;
 
 use crate::clock::Clock;
+use crate::ds3231::{OffsetError, STATE_SIZE};
 use crate::firmware::{FLASH_BASE, FLASH_SIZE, Firmware, USER_FLASH_BASE, USER_FLASH_SIZE};
 use crate::flash_ops::{FlashOp, FlashOps};
 use crate::irq::Irqs;
@@ -43,8 +44,43 @@ impl fmt::Display for CpuError {
 impl std::error::Error for CpuError {}
 
 /// What a real board keeps with the power off: the user flash, then the clock's time and date
-/// (TR and DR, a word each), which its battery keeps going.
+/// (TR and DR, a word each), which its battery keeps going. This is the size of the saved
+/// state of a board whose DS3231 is as it was made.
 pub const PERSISTENT_SIZE: usize = USER_FLASH_SIZE + 8;
+
+/// The state with the DS3231's after it (`Ds3231Slot::saved`), once the guest has set its time or
+/// cleared its status.
+const WITH_DS3231_SIZE: usize = PERSISTENT_SIZE + STATE_SIZE;
+
+/// The size of the state that the first version with a DS3231 saved: the DS3231's offset from the
+/// host's local time, in seconds, an i64.
+const VERSION_1_SIZE: usize = PERSISTENT_SIZE + 8;
+
+/// Saved state that cannot be loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistentError {
+    /// The wrong length.
+    Size(PersistentSizeError),
+    /// The DS3231's saved clock is too far from the host's.
+    Offset(OffsetError),
+}
+
+impl fmt::Display for PersistentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PersistentError::Size(size) => size.fmt(f),
+            PersistentError::Offset(offset) => offset.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for PersistentError {}
+
+impl From<OffsetError> for PersistentError {
+    fn from(offset: OffsetError) -> PersistentError {
+        PersistentError::Offset(offset)
+    }
+}
 
 /// Saved state of the wrong length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +92,8 @@ impl fmt::Display for PersistentSizeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "the saved flash and clock are {PERSISTENT_SIZE} bytes, not {}",
+            "the saved flash and clock are {PERSISTENT_SIZE} bytes, or {WITH_DS3231_SIZE} with the \
+             DS3231's state ({VERSION_1_SIZE} from the first version that had it), not {}",
             self.got
         )
     }
@@ -355,26 +392,41 @@ impl Cpu {
         }
         // Straight from the clock, not over the bus, so that a trace of the peripherals does
         // not log the reads.
-        for word in self.memory.borrow().rtc().calendar() {
+        let memory = self.memory.borrow();
+        for word in memory.rtc().calendar() {
             bytes.extend(word.to_le_bytes());
         }
+        // The DS3231's, if it is not as it was made, which keeps the file the size it was before
+        // for a board whose clock was never set.
+        bytes.extend(memory.ds3231().saved().into_iter().flatten());
         bytes
     }
 
     /// Restores what `persistent` gave out. The firmware is not touched, so state saved from
-    /// an older firmware still loads.
-    pub fn load_persistent(&mut self, bytes: &[u8]) -> Result<(), PersistentSizeError> {
-        if bytes.len() != PERSISTENT_SIZE {
-            return Err(PersistentSizeError { got: bytes.len() });
+    /// an older firmware still loads. State saved without the DS3231's leaves it as it was
+    /// made, and the state of the first version with a DS3231 is converted. Nothing is loaded
+    /// if it is refused.
+    pub fn load_persistent(&mut self, bytes: &[u8]) -> Result<(), PersistentError> {
+        let (flash, rest) = bytes
+            .split_at_checked(USER_FLASH_SIZE)
+            .ok_or(PersistentSizeError { got: bytes.len() })
+            .map_err(PersistentError::Size)?;
+        let ds3231 = self.memory.borrow().ds3231();
+        match bytes.len() {
+            PERSISTENT_SIZE => ds3231.load_new(),
+            VERSION_1_SIZE => ds3231.load_v1(i64::from_le_bytes(
+                rest[8..].try_into().expect("eight bytes"),
+            ))?,
+            WITH_DS3231_SIZE => ds3231.load(rest[8..].try_into().expect("the state's size"))?,
+            got => return Err(PersistentError::Size(PersistentSizeError { got })),
         }
-        let (flash, calendar) = bytes.split_at(USER_FLASH_SIZE);
         let (words, _) = flash.as_chunks::<4>();
         for (addr, word) in (USER_FLASH_BASE..).step_by(4).zip(words) {
             self.processor
                 .write32(addr, u32::from_le_bytes(*word))
                 .expect("the user flash is inside the core's flash");
         }
-        let (words, _) = calendar.as_chunks::<4>();
+        let (words, _) = rest[..8].as_chunks::<4>();
         let calendar = [words[0], words[1]].map(u32::from_le_bytes);
         self.memory.borrow().rtc().set_calendar(calendar);
         Ok(())
@@ -394,8 +446,8 @@ mod tests {
     use super::*;
     use crate::{AccessKind, FLASH_BASE, Firmware, PeripheralAccess, Svd, UnmappedAccess};
     use crate::{Console, FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController, cmm2_memory};
+    use crate::{Ds3231Slot, SdSlot, TIM16_BASE, TIMER_SIZE, Timer};
     use crate::{GPIO_PORT_SIZE, Gpio, RCC_BASE, RCC_SIZE, RTC_BASE, RTC_SIZE, Rcc, Rtc};
-    use crate::{SdSlot, TIM16_BASE, TIMER_SIZE, Timer};
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
@@ -766,8 +818,11 @@ mod tests {
         assert_eq!(state.len(), PERSISTENT_SIZE);
         assert_eq!(USER_FLASH_BASE, 0x0812_0000);
         assert_eq!(PERSISTENT_SIZE, 0xE_0008);
+        assert_eq!(WITH_DS3231_SIZE, 0xE_0012);
+        assert_eq!(VERSION_1_SIZE, 0xE_0010);
         assert!(state[..USER_FLASH_SIZE].iter().all(|&byte| byte == 0xFF));
-        // The clock's reset values: 00:00:00 on Monday 01/01/00.
+        // The clock's reset values: 00:00:00 on Monday 01/01/00. Nothing of the DS3231's, which
+        // is as it was made.
         assert_eq!(state[USER_FLASH_SIZE..], [0, 0, 0, 0, 0x01, 0x21, 0, 0]);
     }
 
@@ -809,11 +864,115 @@ mod tests {
             state[USER_FLASH_SIZE..USER_FLASH_SIZE + 4],
             0x12_30_45u32.to_le_bytes()
         );
-        assert_eq!(state[USER_FLASH_SIZE + 4..], 0x26_91_12u32.to_le_bytes());
+        assert_eq!(
+            state[USER_FLASH_SIZE + 4..USER_FLASH_SIZE + 8],
+            0x26_91_12u32.to_le_bytes()
+        );
 
         let mut second = board(&THREE);
         second.load_persistent(&state).unwrap();
         assert_eq!(second.persistent(), state);
+    }
+
+    #[test]
+    fn the_ds3231_is_saved_after_the_clock_once_it_is_set_and_carries_on_in_a_new_machine() {
+        let mut first = board(&THREE);
+        first
+            .memory()
+            .ds3231()
+            .set_offset_millis(Some(-86_400_000 * 3 - 7))
+            .unwrap();
+        let state = first.persistent();
+        assert_eq!(state.len(), WITH_DS3231_SIZE);
+        let ds3231 = &state[PERSISTENT_SIZE..];
+        assert_eq!(ds3231[..8], (-86_400_000i64 * 3 - 7).to_le_bytes());
+        // Time set, and the status as the chip powers up.
+        assert_eq!(ds3231[8..], [1, 0x88]);
+
+        let mut second = board(&THREE);
+        second.load_persistent(&state).unwrap();
+        assert_eq!(
+            second.memory().ds3231().offset_millis(),
+            Some(-86_400_000 * 3 - 7)
+        );
+        assert_eq!(second.persistent(), state);
+    }
+
+    #[test]
+    fn a_ds3231_with_its_time_never_set_but_its_status_cleared_is_saved_and_loaded() {
+        let mut first = board(&THREE);
+        let mut saved = [0; STATE_SIZE];
+        saved[9] = 0x08;
+        first.memory().ds3231().load(saved).unwrap();
+        let state = first.persistent();
+        assert_eq!(state[PERSISTENT_SIZE + 8..], [0, 0x08]);
+
+        let mut second = board(&THREE);
+        second.memory().ds3231().set_offset_millis(Some(5)).unwrap();
+        second.load_persistent(&state).unwrap();
+        assert_eq!(second.memory().ds3231().offset_millis(), None);
+        assert_eq!(second.persistent(), state);
+    }
+
+    #[test]
+    fn state_saved_before_the_ds3231_was_modelled_loads_and_leaves_it_as_it_was_made() {
+        let mut cpu = board(&THREE);
+        cpu.memory()
+            .ds3231()
+            .set_offset_millis(Some(99_000))
+            .unwrap();
+        let mut old = vec![0xFF; PERSISTENT_SIZE];
+        old[..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        old[USER_FLASH_SIZE..USER_FLASH_SIZE + 4].copy_from_slice(&0x12_00_00u32.to_le_bytes());
+        old[USER_FLASH_SIZE + 4..].copy_from_slice(&0x26_91_12u32.to_le_bytes());
+
+        cpu.load_persistent(&old).unwrap();
+
+        assert_eq!(cpu.memory().ds3231().offset_millis(), None);
+        assert_eq!(cpu.read32(USER_FLASH_BASE), 0x1234_5678);
+        // Saved again it is the same bytes, so a build without a DS3231 can still read it.
+        assert_eq!(cpu.persistent(), old);
+    }
+
+    #[test]
+    fn state_saved_by_the_first_version_with_a_ds3231_is_converted() {
+        let mut cpu = board(&THREE);
+        let mut v1 = vec![0xFF; VERSION_1_SIZE];
+        v1[USER_FLASH_SIZE..USER_FLASH_SIZE + 8].fill(0);
+        v1[PERSISTENT_SIZE..].copy_from_slice(&(-3600i64).to_le_bytes());
+
+        cpu.load_persistent(&v1).unwrap();
+
+        // The host's clock was UTC (the default FixedClock): seconds on, as milliseconds.
+        assert_eq!(cpu.memory().ds3231().offset_millis(), Some(-3_600_000));
+        v1[PERSISTENT_SIZE..].fill(0);
+        cpu.load_persistent(&v1).unwrap();
+        assert_eq!(cpu.memory().ds3231().offset_millis(), None);
+        assert_eq!(cpu.persistent().len(), PERSISTENT_SIZE);
+    }
+
+    #[test]
+    fn a_saved_offset_that_is_too_far_away_is_refused_and_nothing_is_loaded() {
+        let mut cpu = board(&THREE);
+        let mut state = vec![0xFF; WITH_DS3231_SIZE];
+        state[USER_FLASH_SIZE..PERSISTENT_SIZE].fill(0);
+        state[PERSISTENT_SIZE..PERSISTENT_SIZE + 8].copy_from_slice(&i64::MAX.to_le_bytes());
+        state[PERSISTENT_SIZE + 8] = 1;
+        state[0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        let error = cpu.load_persistent(&state).unwrap_err();
+        assert_eq!(
+            error,
+            PersistentError::Offset(OffsetError { millis: i64::MAX })
+        );
+        assert_eq!(cpu.read32(USER_FLASH_BASE), 0xFFFF_FFFF);
+        assert!(error.to_string().contains("200 years"));
+
+        let mut v1 = vec![0; VERSION_1_SIZE];
+        v1[PERSISTENT_SIZE..].copy_from_slice(&i64::MIN.to_le_bytes());
+        assert!(matches!(
+            cpu.load_persistent(&v1),
+            Err(PersistentError::Offset(_))
+        ));
     }
 
     #[test]
@@ -833,10 +992,19 @@ mod tests {
     #[test]
     fn state_of_the_wrong_length_is_refused() {
         let mut cpu = board(&THREE);
-        for len in [0, USER_FLASH_SIZE, PERSISTENT_SIZE - 4, PERSISTENT_SIZE + 4] {
+        for len in [
+            0,
+            USER_FLASH_SIZE,
+            PERSISTENT_SIZE - 4,
+            PERSISTENT_SIZE + 4,
+            VERSION_1_SIZE - 4,
+            VERSION_1_SIZE + 1,
+            WITH_DS3231_SIZE - 1,
+            WITH_DS3231_SIZE + 4,
+        ] {
             assert_eq!(
                 cpu.load_persistent(&vec![0; len]),
-                Err(PersistentSizeError { got: len })
+                Err(PersistentError::Size(PersistentSizeError { got: len }))
             );
         }
         assert!(
@@ -844,6 +1012,15 @@ mod tests {
                 .iter()
                 .all(|&byte| byte == 0xFF)
         );
+    }
+
+    #[test]
+    fn the_size_error_names_every_size_that_loads() {
+        let message = PersistentSizeError { got: 3 }.to_string();
+        for size in [PERSISTENT_SIZE, VERSION_1_SIZE, WITH_DS3231_SIZE] {
+            assert!(message.contains(&size.to_string()), "{message}");
+        }
+        assert!(message.ends_with("not 3"), "{message}");
     }
 
     /// An instruction that is either a halfword or a load of a pool word into a register.
@@ -1498,7 +1675,7 @@ mod tests {
             .map_peripheral(
                 GPIOB_MODER,
                 GPIO_PORT_SIZE,
-                Box::new(Gpio::new(1, SdSlot::new())),
+                Box::new(Gpio::new(1, SdSlot::new(), Ds3231Slot::default())),
             )
             .unwrap();
         memory

@@ -58,7 +58,7 @@ pub fn cmm2_memory(irqs: &Irqs) -> MemoryMap {
             .map_peripheral(
                 GPIO_BASE + port as u32 * GPIO_PORT_SIZE,
                 GPIO_PORT_SIZE,
-                Box::new(Gpio::new(port, memory.sd_slot())),
+                Box::new(Gpio::new(port, memory.sd_slot(), memory.ds3231())),
             )
             .expect("GPIO window is clear of RAM");
     }

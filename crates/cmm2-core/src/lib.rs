@@ -4,6 +4,7 @@ mod clock;
 mod console;
 mod cpu;
 mod display;
+mod ds3231;
 mod firmware;
 mod flash;
 mod flash_ops;
@@ -28,8 +29,9 @@ mod usb_keyboard;
 
 pub use clock::{CORE_HZ, Clock};
 pub use console::Console;
-pub use cpu::{Cpu, CpuError, Fault, PERSISTENT_SIZE, PersistentSizeError, Stop};
+pub use cpu::{Cpu, CpuError, Fault, PERSISTENT_SIZE, PersistentError, PersistentSizeError, Stop};
 pub use display::{Frame, FrameError};
+pub use ds3231::{Ds3231Slot, FixedClock, HostClock, HostNow, HostTime, OffsetError, STATE_SIZE};
 pub use firmware::{
     FLASH_BASE, FLASH_SIZE, Firmware, FirmwareError, USER_FLASH_BASE, USER_FLASH_SIZE, VectorTable,
 };

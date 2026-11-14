@@ -11,6 +11,7 @@ use std::rc::Rc;
 use crate::clock::Clock;
 use crate::console::Console;
 use crate::display::{Display, Frame, FrameError};
+use crate::ds3231::Ds3231Slot;
 use crate::flash_ops::FlashOps;
 use crate::peripheral::{Peripheral, PeripheralAccess, RegisterStub, ResetCause};
 use crate::rtc::Rtc;
@@ -134,6 +135,7 @@ pub struct MemoryMap {
     clock: Clock,
     console: Console,
     sd_slot: SdSlot,
+    ds3231: Ds3231Slot,
     rtc: Rtc,
     usb_port: UsbPort,
     display: Display,
@@ -169,6 +171,7 @@ impl MemoryMap {
             clock,
             console: Console::new(),
             sd_slot: SdSlot::new(),
+            ds3231: Ds3231Slot::default(),
             display: Display::default(),
         }
     }
@@ -197,6 +200,12 @@ impl MemoryMap {
     /// The SD socket, shared with the front end, which puts a card image in and takes it back.
     pub fn sd_slot(&self) -> SdSlot {
         self.sd_slot.clone()
+    }
+
+    /// The DS3231 on PD4 and PD5, shared with the front end, which gives it the host's clock and
+    /// keeps its offset from one run to the next.
+    pub fn ds3231(&self) -> Ds3231Slot {
+        self.ds3231.clone()
     }
 
     /// The real-time clock, shared with the front end, which reads and sets its time and date

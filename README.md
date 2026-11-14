@@ -210,12 +210,39 @@ cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --flash board.flas
 The file holds only what the user changes, never the firmware, so it stays valid when you move
 to a newer firmware `.bin`: the stored program and saved options (flash from 0x08120000 to the
 end, 896 KB) and then the clock's time and date (8 bytes), which a real board's battery keeps. The
-firmware asks its setup questions again if the clock has not been set, so the clock has to be
-saved too. The STM32's RTC runs on emulated time, not the host's: it counts with the machine's
-clock, so it is slower than the wall clock when the host is slow, and it stands still while the
-emulator is off. The Gen 2's real time comes from the external DS3231, which will supply the
-host's time when it is modelled. The file must be exactly 917,512 bytes, or the run stops with an
-error and the file is left alone.
+firmware asks its setup questions again if the clock has not been set, so the clock has to be saved
+too. The STM32's RTC runs on emulated time, not the host's: it counts with the machine's clock, so
+it is slower than the wall clock when the host is slow, and it stands still while the emulator is
+off. That makes the file 917,512 bytes, and the run stops with an error, leaving the file alone, if
+it is any other size than the three below.
+
+The Gen 2's real time comes from the external DS3231, and the emulator has one fitted, always. It
+is on PD4 and PD5, bit-banged by the firmware, and `OPTION DS3231 ON` at the prompt switches the
+firmware over to it (it saves the option and reboots), as on the board. Until you set the time the
+chip shows the host PC's local time (the system's time zone), so `TIME$` and `DATE$` follow the
+PC's clock, daylight saving changes included. Setting `TIME$ =` or `DATE$ =` makes it a clock of
+its own, like the real chip: it counts seconds evenly from then on and knows nothing of daylight
+saving or time zones, so a time set at 00:59:59 as the PC's clocks go forward does not jump an hour.
+What it keeps in the `--flash` file is the time as an offset from the PC's UTC clock, so it goes on
+counting while the emulator is closed, as the chip does on its battery. Delete the file, or the
+chip's state in it, to get back to the PC's time. Without `--flash` the time you set is lost at the
+end of the run. With the option off the firmware uses the STM32's RTC as before and never talks to
+the chip. The time zone is read from the system once, when the chip is first asked the time, so a zone
+changed while the emulator runs (a new `TZ`, a move to another zone) shows from the next run; the
+zone's daylight saving rules are applied at each time. If the PC's clock is stepped (by NTP, or by
+hand) while the emulator runs, a chip you have never set follows the step, and one you have set
+follows it in UTC; the real chip would not see it, but it only matters while the emulator runs.
+See [docs/ds3231.md](docs/ds3231.md).
+
+The chip's state is added to the file only once you have set its time or cleared its status
+flags. A file whose chip was never set is 917,512 bytes, which builds from before the chip was
+modelled read too. After a run that set the time the file is 917,522 bytes: the ten more bytes are
+the offset (milliseconds, an i64), whether the time was set, and the chip's status register. A build
+from before the chip was modelled refuses a file of that size ("the saved flash and clock are 917512
+bytes ..."), so if you go back to such a build, delete the file or truncate it to its first
+917,512 bytes (you then lose the time you set). Files of 917,520 bytes, which an earlier
+version of this build wrote (the offset in seconds from the host's local time), still load, with the
+same time, and are written back in the new form.
 
 The address 0x08120000, where the user flash starts and the firmware ends, is only known to me
 for MMBasic 7.00.00b5 (its image ends 216 bytes below it); I have not checked it against another

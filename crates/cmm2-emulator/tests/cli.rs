@@ -934,7 +934,8 @@ fn a_run_without_a_reset_says_nothing_on_stderr() {
 }
 
 // The flash file is the last 0xE0000 bytes of the flash, the saved options in its last sector,
-// then the clock's time and date, a word each.
+// then the clock's time and date, a word each. The DS3231's state comes after them once the
+// guest has set its time, which these programs do not.
 const FLASH_FILE_SIZE: usize = 0xE_0008;
 const OPTIONS_AT: usize = 0xC_0000;
 // Adds one to the word at 0x081E_0000, the start of the saved options (the literal is at +14),
@@ -1091,8 +1092,10 @@ fn a_flash_file_of_the_wrong_size_is_an_error_and_is_left_alone() {
     assert_eq!(
         stderr(&output),
         format!(
-            "cmm2-emulator: {}: the saved flash and clock are {FLASH_FILE_SIZE} bytes, not 3\n",
-            flash.display()
+            "cmm2-emulator: {}: the saved flash and clock are {FLASH_FILE_SIZE} bytes, or {} with the DS3231's state ({} from the first version that had it), not 3\n",
+            flash.display(),
+            FLASH_FILE_SIZE + 10,
+            FLASH_FILE_SIZE + 8
         )
     );
     assert_eq!(std::fs::read(&flash).unwrap(), [1, 2, 3]);

@@ -1,6 +1,7 @@
 //! The GPIO ports. Each port has its own reset values, and the input data register is worked
 //! out from the pin configuration and the levels the real board has on its pins.
 
+use crate::ds3231::Ds3231Slot;
 use crate::peripheral::ResetCause;
 use crate::registers::{Registers, WordAccess};
 use crate::sd_slot::SdSlot;
@@ -31,6 +32,10 @@ const SD_MOSI: u32 = 12;
 const SD_CS: u32 = 2;
 const SD_DETECT: u32 = 3;
 const SD_PROTECT: u32 = 12;
+
+// The DS3231's wires, on port D. The board pulls both up to 3V3 with 10K resistors.
+const RTC_SDA: u32 = 4;
+const RTC_SCL: u32 = 5;
 
 // Reset values per port (MODER, OSPEEDR, PUPDR), A to K. They follow RM0433. The SVD gives
 // GPIOA's values to every port, which is wrong for B to K.
@@ -77,10 +82,11 @@ pub struct GpioRegisters {
     held_low: u16,
     af_high: u16,
     sd: SdSlot,
+    rtc: Ds3231Slot,
 }
 
 impl GpioRegisters {
-    fn new(port: usize, sd: SdSlot) -> GpioRegisters {
+    fn new(port: usize, sd: SdSlot, rtc: Ds3231Slot) -> GpioRegisters {
         let [moder, ospeedr, pupdr] = RESETS[port];
         GpioRegisters {
             port,
@@ -95,6 +101,7 @@ impl GpioRegisters {
             held_low: HELD_LOW[port],
             af_high: AF_HIGH[port],
             sd,
+            rtc,
         }
     }
 
@@ -102,25 +109,32 @@ impl GpioRegisters {
     // defined level; it reads low here.
     fn input_level(&self, pin: u32) -> bool {
         self.held_low >> pin & 1 == 0
-            && !self.card_pulls_low(pin)
-            && self.pupdr >> (2 * pin) & 3 == 0b01
+            && !self.board_pulls_low(pin)
+            && (self.pupdr >> (2 * pin) & 3 == 0b01 || self.board_pulls_up(pin))
+    }
+
+    // The board's own pull-ups, which hold a pin high whatever PUPDR says: the DS3231's wires.
+    fn board_pulls_up(&self, pin: u32) -> bool {
+        self.port == PORT_D && matches!(pin, RTC_SDA | RTC_SCL)
     }
 
     // The SD card holds its data-out wire low for a 0 bit, the card-detect switch closes when a
     // card is in, and the write-protect switch is open (the pin high, with its pull-up) only when
-    // the card is protected.
-    fn card_pulls_low(&self, pin: u32) -> bool {
+    // the card is protected. The DS3231 holds SDA low to acknowledge a byte and for a 0 bit it
+    // sends; it never drives SCL.
+    fn board_pulls_low(&self, pin: u32) -> bool {
         match (self.port, pin) {
             (PORT_C, SD_MISO) => !self.sd.miso(),
             (PORT_D, SD_DETECT) => self.sd.present(),
+            (PORT_D, RTC_SDA) => self.rtc.pulls_sda_low(),
             (PORT_H, SD_PROTECT) => !self.sd.write_protected(),
             _ => false,
         }
     }
 
-    // The level the SD card sees on one of its inputs: what this port drives, or `released`
-    // when the pin is not an output.
-    fn card_input(&self, pin: u32, released: bool) -> bool {
+    // The level a chip on the board sees on one of its inputs: what this port drives, or
+    // `released` when the pin is not an output.
+    fn wire_input(&self, pin: u32, released: bool) -> bool {
         if self.moder >> (2 * pin) & 3 == 0b01 {
             self.odr >> pin & 1 != 0
         } else {
@@ -128,15 +142,22 @@ impl GpioRegisters {
         }
     }
 
-    // Tells the SD slot the levels this port now drives onto its wires. Chip select is pulled
-    // up on the board, and the clock idles low in SPI mode 0.
-    fn drive_sd(&self) {
+    // Tells the chips on the board the levels this port now drives onto their wires. Chip
+    // select is pulled up on the board, and the clock idles low in SPI mode 0; the I2C bus
+    // idles high, both wires pulled up.
+    fn drive_wires(&self) {
         match self.port {
             PORT_C => self.sd.set_clock(
-                self.card_input(SD_SCK, false),
-                self.card_input(SD_MOSI, true),
+                self.wire_input(SD_SCK, false),
+                self.wire_input(SD_MOSI, true),
             ),
-            PORT_D => self.sd.set_chip_select(self.card_input(SD_CS, true)),
+            PORT_D => {
+                self.sd.set_chip_select(self.wire_input(SD_CS, true));
+                self.rtc.set_lines(
+                    self.wire_input(RTC_SDA, true),
+                    self.wire_input(RTC_SCL, true),
+                );
+            }
             _ => {}
         }
     }
@@ -181,7 +202,7 @@ impl Registers for GpioRegisters {
         match offset {
             MODER => {
                 store(&mut self.moder, value, mask);
-                self.drive_sd();
+                self.drive_wires();
             }
             OTYPER => store(&mut self.otyper, value, mask),
             OSPEEDR => store(&mut self.ospeedr, value, mask),
@@ -189,12 +210,12 @@ impl Registers for GpioRegisters {
             ODR => {
                 store(&mut self.odr, value, mask);
                 self.odr &= 0xFFFF;
-                self.drive_sd();
+                self.drive_wires();
             }
             BSRR => {
                 let value = value & mask;
                 self.odr = (self.odr & !(value >> 16) | value) & 0xFFFF;
-                self.drive_sd();
+                self.drive_wires();
             }
             LCKR => store(&mut self.lckr, value, mask),
             AFRL => store(&mut self.afrl, value, mask),
@@ -205,8 +226,11 @@ impl Registers for GpioRegisters {
 
     // A system reset puts the port back to its reset values.
     fn reset(&mut self, _cause: ResetCause) {
-        *self = GpioRegisters::new(self.port, self.sd.clone());
-        self.drive_sd();
+        *self = GpioRegisters::new(self.port, self.sd.clone(), self.rtc.clone());
+        if self.port == PORT_D {
+            self.rtc.release_bus();
+        }
+        self.drive_wires();
     }
 }
 
@@ -214,9 +238,9 @@ pub type Gpio = WordAccess<GpioRegisters>;
 
 impl Gpio {
     /// `port` is 0 for GPIOA. `sd` is the socket whose wires pass through the ports that carry
-    /// them (C and D) and whose switches are read from D3.
-    pub fn new(port: usize, sd: SdSlot) -> Gpio {
-        WordAccess::wrap(GpioRegisters::new(port, sd))
+    /// them (C and D) and whose switches are read from D3. `rtc` is the DS3231, on PD4 and PD5.
+    pub fn new(port: usize, sd: SdSlot, rtc: Ds3231Slot) -> Gpio {
+        WordAccess::wrap(GpioRegisters::new(port, sd, rtc))
     }
 }
 
@@ -224,7 +248,7 @@ impl Gpio {
 mod tests {
     use super::*;
     use crate::svd::Svd;
-    use crate::{MemoryMap, ResetCause};
+    use crate::{FixedClock, HostTime, MemoryMap, ResetCause};
 
     const GPIOA: u32 = GPIO_BASE;
     const GPIOB: u32 = GPIO_BASE + GPIO_PORT_SIZE;
@@ -236,12 +260,16 @@ mod tests {
     const GPIOK: u32 = GPIO_BASE + 10 * GPIO_PORT_SIZE;
 
     fn machine_with(sd: &SdSlot) -> MemoryMap {
+        machine_on(sd, &Ds3231Slot::default())
+    }
+
+    fn machine_on(sd: &SdSlot, rtc: &Ds3231Slot) -> MemoryMap {
         let mut m = MemoryMap::new();
         for i in 0..GPIO_PORTS {
             m.map_peripheral(
                 GPIO_BASE + i as u32 * GPIO_PORT_SIZE,
                 GPIO_PORT_SIZE,
-                Box::new(Gpio::new(i, sd.clone())),
+                Box::new(Gpio::new(i, sd.clone(), rtc.clone())),
             )
             .unwrap();
         }
@@ -619,6 +647,192 @@ mod tests {
     fn miso_is_the_pull_up_with_no_card() {
         let mut m = socket_wired(&SdSlot::new());
         assert_eq!(pin(&mut m, GPIOC, SD_MISO), 1);
+    }
+
+    // The DS3231 on PD4 (SDA) and PD5 (SCL), clocked the way the firmware's bit-bang does it:
+    // push-pull outputs written through BSRR, SDA switched to an input to read the answer.
+    const SDA: u32 = 4;
+    const SCL: u32 = 5;
+    const ADDRESS: u8 = 0x68;
+
+    // A chip on a fixed clock (Thursday 2026-12-24 13:45:56) and the board's port D wired to it,
+    // with both pins outputs and high, as the firmware leaves the bus.
+    fn clocked() -> (MemoryMap, Ds3231Slot) {
+        let rtc = Ds3231Slot::new(Box::new(FixedClock::new(HostTime::new(
+            2026, 12, 24, 13, 45, 56,
+        ))));
+        let mut m = machine_on(&SdSlot::new(), &rtc);
+        m.write32(GPIOD + BSRR, 1 << SDA | 1 << SCL);
+        configure(&mut m, GPIOD, SDA, 1, 0);
+        configure(&mut m, GPIOD, SCL, 1, 0);
+        (m, rtc)
+    }
+
+    fn drive(m: &mut MemoryMap, pin: u32, high: bool) {
+        let shift = if high { pin } else { pin + 16 };
+        m.write32(GPIOD + BSRR, 1 << shift);
+    }
+
+    fn i2c_start(m: &mut MemoryMap) {
+        drive(m, SDA, true);
+        drive(m, SCL, true);
+        drive(m, SDA, false);
+        drive(m, SCL, false);
+    }
+
+    fn i2c_stop(m: &mut MemoryMap) {
+        drive(m, SDA, false);
+        drive(m, SCL, true);
+        drive(m, SDA, true);
+    }
+
+    // True if the chip acknowledged. SDA is an input for the ninth pulse.
+    fn i2c_send(m: &mut MemoryMap, byte: u8) -> bool {
+        for bit in (0..8).rev() {
+            drive(m, SDA, byte >> bit & 1 != 0);
+            drive(m, SCL, true);
+            drive(m, SCL, false);
+        }
+        configure(m, GPIOD, SDA, 0, 0);
+        drive(m, SCL, true);
+        let acknowledged = pin(m, GPIOD, SDA) == 0;
+        drive(m, SCL, false);
+        configure(m, GPIOD, SDA, 1, 0);
+        acknowledged
+    }
+
+    fn i2c_receive(m: &mut MemoryMap, acknowledge: bool) -> u8 {
+        configure(m, GPIOD, SDA, 0, 0);
+        let mut byte = 0;
+        for _ in 0..8 {
+            drive(m, SCL, true);
+            byte = byte << 1 | pin(m, GPIOD, SDA) as u8;
+            drive(m, SCL, false);
+        }
+        drive(m, SDA, !acknowledge);
+        configure(m, GPIOD, SDA, 1, 0);
+        drive(m, SCL, true);
+        drive(m, SCL, false);
+        byte
+    }
+
+    // The firmware's read of `count` registers from `register`.
+    fn i2c_read(m: &mut MemoryMap, register: u8, count: usize) -> Vec<u8> {
+        i2c_start(m);
+        assert!(i2c_send(m, ADDRESS << 1));
+        assert!(i2c_send(m, register));
+        i2c_stop(m);
+        i2c_start(m);
+        assert!(i2c_send(m, ADDRESS << 1 | 1));
+        let bytes = (0..count).map(|i| i2c_receive(m, i + 1 < count)).collect();
+        i2c_stop(m);
+        bytes
+    }
+
+    #[test]
+    fn the_bus_idles_high_whatever_the_pull_registers_say() {
+        let (mut m, _) = clocked();
+        for pull in [0, 1, 2] {
+            configure(&mut m, GPIOD, SDA, 0, pull);
+            configure(&mut m, GPIOD, SCL, 0, pull);
+            assert_eq!(pin(&mut m, GPIOD, SDA), 1, "SDA pull {pull}");
+            assert_eq!(pin(&mut m, GPIOD, SCL), 1, "SCL pull {pull}");
+        }
+    }
+
+    #[test]
+    fn sda_reads_low_only_while_the_chip_acknowledges() {
+        let (mut m, _) = clocked();
+        i2c_start(&mut m);
+        for bit in (0..8).rev() {
+            drive(&mut m, SDA, ADDRESS << 1 >> bit & 1 != 0);
+            drive(&mut m, SCL, true);
+            drive(&mut m, SCL, false);
+        }
+        configure(&mut m, GPIOD, SDA, 0, 0);
+        assert_eq!(pin(&mut m, GPIOD, SDA), 0);
+        drive(&mut m, SCL, true);
+        assert_eq!(pin(&mut m, GPIOD, SDA), 0);
+        drive(&mut m, SCL, false);
+        assert_eq!(pin(&mut m, GPIOD, SDA), 1);
+    }
+
+    #[test]
+    fn a_read_clocked_through_the_pins_gives_the_hosts_time() {
+        let (mut m, _) = clocked();
+        assert_eq!(
+            i2c_read(&mut m, 0, 7),
+            [0x56, 0x45, 0x13, 0x04, 0x24, 0x12, 0x26]
+        );
+    }
+
+    #[test]
+    fn a_write_clocked_through_the_pins_sets_the_time() {
+        let (mut m, rtc) = clocked();
+        i2c_start(&mut m);
+        for byte in [ADDRESS << 1, 0, 0x30, 0x20, 0x10] {
+            assert!(i2c_send(&mut m, byte));
+        }
+        i2c_stop(&mut m);
+        assert_eq!(i2c_read(&mut m, 0, 3), [0x30, 0x20, 0x10]);
+        assert_eq!(rtc.offset_millis(), Some(-(3 * 3600 + 25 * 60 + 26) * 1000));
+    }
+
+    #[test]
+    fn another_address_is_not_acknowledged_through_the_pins() {
+        let (mut m, _) = clocked();
+        i2c_start(&mut m);
+        assert!(!i2c_send(&mut m, 0x69 << 1));
+    }
+
+    #[test]
+    fn the_pins_of_other_ports_do_not_reach_the_chip() {
+        // The same wiggling on port C's pins 4 and 5 does not wake it, and port C's pin 4
+        // has no pull-up from the board.
+        let (mut m, _) = clocked();
+        m.write32(GPIOC + BSRR, 1 << 4 | 1 << 5);
+        configure(&mut m, GPIOC, 4, 1, 0);
+        configure(&mut m, GPIOC, 5, 1, 0);
+        m.write32(GPIOC + BSRR, 1 << 20);
+        m.write32(GPIOC + BSRR, 1 << 21);
+        configure(&mut m, GPIOC, 4, 0, 0);
+        assert_eq!(pin(&mut m, GPIOC, 4), 0);
+        assert_eq!(i2c_read(&mut m, 0, 1), [0x56]);
+    }
+
+    #[test]
+    fn a_released_scl_is_a_high_clock() {
+        // With SCL an input the pull-up holds it high, so SDA falling is a START.
+        let (mut m, _) = clocked();
+        drive(&mut m, SDA, true);
+        drive(&mut m, SCL, true);
+        configure(&mut m, GPIOD, SCL, 0, 0);
+        drive(&mut m, SDA, false);
+        // Taking the clock back as an output, low, is its falling edge.
+        drive(&mut m, SCL, false);
+        configure(&mut m, GPIOD, SCL, 1, 0);
+        assert!(i2c_send(&mut m, ADDRESS << 1));
+    }
+
+    #[test]
+    fn a_reset_releases_the_bus() {
+        let (mut m, _) = clocked();
+        i2c_start(&mut m);
+        // Eight clocks of the address, and the chip is now acknowledging.
+        for bit in (0..8).rev() {
+            drive(&mut m, SDA, ADDRESS << 1 >> bit & 1 != 0);
+            drive(&mut m, SCL, true);
+            drive(&mut m, SCL, false);
+        }
+        configure(&mut m, GPIOD, SDA, 0, 0);
+        assert_eq!(pin(&mut m, GPIOD, SDA), 0);
+        m.reset_peripherals(ResetCause::Software);
+        configure(&mut m, GPIOD, SDA, 0, 0);
+        assert_eq!(pin(&mut m, GPIOD, SDA), 1);
+        // And the chip answers a new transaction after it.
+        configure(&mut m, GPIOD, SDA, 1, 0);
+        configure(&mut m, GPIOD, SCL, 1, 0);
+        assert_eq!(i2c_read(&mut m, 0, 1), [0x56]);
     }
 
     #[test]
