@@ -10,7 +10,7 @@ use crate::{
     semihosting::{decode_semihostcmd, semihost_return},
 };
 
-use super::{EXCEPTION_ENTRY_CYCLES, ExecuteResult};
+use super::ExecuteResult;
 
 const DFSR_BKPT: u32 = 1 << 1;
 #[cfg(not(feature = "armv6m"))]
@@ -46,7 +46,7 @@ impl IsaException for Processor {
             // a failing entry (stacking, vector) is a derived exception, handled by the entry
             self.exception_entry(Exception::SVCall, return_address)?;
             return Ok(ExecuteSuccess::Branched {
-                cycles: EXCEPTION_ENTRY_CYCLES,
+                cycles: self.entry_cycles(false),
             });
         }
         Ok(ExecuteSuccess::NotTaken)
@@ -92,7 +92,7 @@ impl IsaException for Processor {
                 let return_address = self.get_pc();
                 self.exception_entry(Exception::DebugMonitor, return_address)?;
                 return Ok(ExecuteSuccess::Branched {
-                    cycles: EXCEPTION_ENTRY_CYCLES,
+                    cycles: self.entry_cycles(false),
                 });
             }
         }

@@ -148,6 +148,8 @@ pub struct Processor {
     pub(crate) debugger_attached: bool,
     /// A BKPT halted into the attached debugger and the debugger has not been told yet.
     pub(crate) debug_halt: bool,
+    /// The core is locked up (B1.5.15): nothing executes, and only an NMI or a reset leaves it.
+    pub(crate) locked_up: bool,
     /// An exception return was made in the current step: an exception taken at its end is
     /// tail-chained.
     pub(crate) exception_returned: bool,
@@ -368,6 +370,7 @@ impl Processor {
             sleeping: false,
             debugger_attached: false,
             debug_halt: false,
+            locked_up: false,
             exception_returned: false,
             running: true,
             exit_code: 0,
@@ -485,6 +488,12 @@ impl Processor {
     #[cfg(test)]
     pub(crate) fn set_pending_fault_trap_for_test(&mut self, context: FaultContext) {
         self.pending_fault_trap = Some(context);
+    }
+
+    /// Whether the core is locked up (B1.5.15). It does not run, and only an NMI or a reset
+    /// leaves the lockup.
+    pub fn is_locked_up(&self) -> bool {
+        self.locked_up
     }
 
     /// Take the currently pending fault trap, if any.

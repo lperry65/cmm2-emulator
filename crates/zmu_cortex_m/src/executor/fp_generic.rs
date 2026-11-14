@@ -924,22 +924,15 @@ impl FloatingPointChecks for Processor {
         }
 
         match cp10 {
-            0b00 => {
-                self.cfsr.set_bit(19, true);
-                Err(Fault::Nocp)
-            }
+            0b00 => Err(Fault::Nocp),
             0b01 => {
                 if self.current_mode_is_privileged() {
                     Ok(())
                 } else {
-                    self.cfsr.set_bit(19, true);
                     Err(Fault::Nocp)
                 }
             }
-            0b10 => {
-                self.cfsr.set_bit(19, true);
-                Err(Fault::Nocp)
-            }
+            0b10 => Err(Fault::Nocp),
             // 0b11, the last value of the two bit field: full access
             _ => Ok(()),
         }
@@ -1820,12 +1813,9 @@ mod tests {
     }
 
     #[test]
-    fn test_check_vfp_enabled_sets_nocp_when_vfp_disabled() {
+    fn test_check_vfp_enabled_gives_nocp_when_vfp_disabled() {
         let mut processor = Processor::new();
-        processor.cfsr = 0;
-
         assert_eq!(processor.check_vfp_enabled(), Err(Fault::Nocp));
-        assert!(processor.cfsr.get_bit(19));
     }
 
     #[test]
@@ -1835,7 +1825,6 @@ mod tests {
         processor.control.n_priv = true;
 
         assert_eq!(processor.check_vfp_enabled(), Err(Fault::Nocp));
-        assert!(processor.cfsr.get_bit(19));
     }
 
     #[test]
@@ -1852,7 +1841,6 @@ mod tests {
         processor.cpacr = 0x00a0_0000;
 
         assert_eq!(processor.check_vfp_enabled(), Err(Fault::Nocp));
-        assert!(processor.cfsr.get_bit(19));
     }
 
     #[test]

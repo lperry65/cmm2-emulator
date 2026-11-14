@@ -1300,3 +1300,44 @@ fn queued_flash_ops_and_raised_interrupts_are_dropped_by_a_reset() {
     assert_eq!(cpu.read32(FLASH_WORD), 1);
     assert_eq!(cpu.processor.nvic_read_ispr(0), 0);
 }
+
+// The core locks up when the HardFault handler itself faults (B1.5.15). Once it has, a run must
+// return and say so, not spin: a locked step executes nothing, so the instruction count stands
+// still. The Cpu is built inside the thread (it is not Send) and the test waits with a timeout.
+#[test]
+fn a_run_after_a_lockup_returns_and_reports_it() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // udf at the reset handler, and udf as the HardFault handler (vector 3)
+        let mut words = vec![0u32; 64];
+        words[0] = SP;
+        words[1] = CODE | 1;
+        words[3] = (CODE + 2) | 1;
+        let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        bytes.extend([0xDE00_u16, 0xDE00].iter().flat_map(|h| h.to_le_bytes()));
+        let image = Firmware::from_bytes(bytes).unwrap();
+        let mut cpu = Cpu::new(&image, MemoryMap::new(), Irqs::new()).unwrap();
+        let mut stops = Vec::new();
+        for _ in 0..4 {
+            stops.push(cpu.run(1_000_000));
+        }
+        let locked = cpu.is_locked_up();
+        let _ = sender.send((stops, locked));
+    });
+    let (stops, locked) = receiver
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("a run after a lockup must return");
+    assert!(locked);
+    assert!(
+        stops.iter().all(|stop| matches!(stop, Stop::Fault(_))),
+        "{stops:?}"
+    );
+    let Stop::Fault(last) = stops.last().unwrap() else {
+        unreachable!()
+    };
+    assert!(
+        last.description.contains("locked up"),
+        "{}",
+        last.description
+    );
+}

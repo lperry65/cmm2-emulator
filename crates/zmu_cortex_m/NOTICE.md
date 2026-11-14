@@ -289,10 +289,31 @@ The firmware needs a few things zmu does not do, so I changed the following.
     and M4 (their TRMs and the Generic User Guides); I have not found an authoritative figure for
     the Cortex-M7 and do not have its TRM, so it is the M3/M4 one, unverified for the M7. The
     emulator still does the unstacking and stacking, only the count is the tail-chain's. A lockup
-    and a failed reset enter nothing and count the one cycle of the step, not an entry.
-  - the HardFault-vector-fails-too branch is reached only with a vector table that is unmapped as
-    a whole (the table is contiguous: a lower vector cannot fail while a higher one is read); the
-    test `test_an_original_and_a_hardfault_with_unreadable_vectors_lock_up` puts VTOR below SRAM.
+    enters nothing, and is a state of the core (`Processor::locked_up`, `is_locked_up()`, set by
+    `lock_up()`; it is not inferred from `running`, which a semihosting exit also clears). On every
+    path that finds one (a fault, the entry of an SVC or BKPT, and an exception taken after an
+    instruction, from sleep, after a halt or after an exception return, where it is not a
+    tail-chain either) the step counts the one cycle of the fetch of the lockup address (B1.5.15)
+    and the core stops, with the priority of the lockup (-1 at least). While it is locked up
+    `step()` executes nothing and takes no exception except an NMI, or a pending reset (B1-555):
+    each further step counts the 1 cycle, and re-queues no trap; an NMI whose entry works leaves
+    the lockup (this was broken before: an NMI in a HardFault lockup was never taken) and counts
+    a full entry. A lockup from a failed stacking or vector read sets PC = 0xFFFFFFFE, the
+    lockup address of B1-556; one from an instruction keeps the PC of that instruction. A pending
+    Reset whose initial SP and PC cannot be read is a lockup at priority -1 at that address
+    (B1-556), reported as one, with HFSR.VECTTBL and no FORCED, and counts 1. (`Processor::
+    entry_cycles` is the one place that decides what a step counts.) cmm2-core's `run_loop` stops with a fault ("core locked up") when `is_locked_up()`,
+    instead of stepping a core that executes nothing, so for it only a reset leaves a lockup. On silicon the stacking writes that came before a failed vector read did
+    happen and are not charged here. `reset()` keeps VTOR where TakeReset's ResetSCSRegs would
+    clear it (TBLOFF resets to zero): cmm2-core sets VTOR to the flash base before the first
+    reset to boot from it, so VTOR is kept.
+    The GDB simulation steps a core with running and sleeping both set (what a WFI leaves, as in
+    `system/simulation.rs`) with `step_sleep`; it used to run its instructions.
+  - the HardFault-vector-fails-too branch is reached when the vector words of the exception to take
+    and of HardFault are both unreadable; the memory between them may be mapped (with VTOR at
+    0x1fff_ff80, vectors 3 and 11, at 0x1fff_ff8c and 0x1fff_ffac, are unmapped, and vector 32 at
+    0x2000_0000 is not). The test `test_an_original_and_a_hardfault_with_unreadable_vectors_lock_up`
+    does that.
     The `is_lockup(HardFault)` test next to it is the manual's rule (B1.5.15), but no exception
     but NMI can be taken at a priority below 0, and NMI is handled by the first part of the
     condition, so no test reaches it.
@@ -300,7 +321,10 @@ The firmware needs a few things zmu does not do, so I changed the following.
     (issue 67; the UFSR bits of B3.2.15), also when UsageFault is disabled and the fault is
     escalated to HardFault (FORCED): B1.5.14 (p. B1-551) has the status bit set in every case.
     DIVBYZERO is raised by SDIV and UDIV with CCR.DIV_0_TRP and NOCP by an FP instruction with
-    the coprocessors off. The core never raises UNALIGNED: it checks no alignment (above), so the
+    the coprocessors off. The bits are set in that one place, from the fault: `check_vfp_enabled`
+    used to set NOCP itself as well, and does not now; every FP instruction that raises
+    `Fault::Nocp` (the VLDM and VSTM forms too, and those entered from exception entry and
+    return) reaches it through the fault. The core never raises UNALIGNED: it checks no alignment (above), so the
     CCR.UNALIGN_TRP trap and the instructions that always fault on an unaligned address (LDM, STM,
     LDRD, STRD, exclusives, VLDM, VSTM) do not fault. The bit is recorded when a fault is raised.
   - with FPCA set, a failed stacking leaves an extended frame whose FP registers, and

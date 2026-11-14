@@ -306,6 +306,13 @@ impl Cpu {
         let limit = self.instruction_count().saturating_add(max_instructions);
         while self.instruction_count() < limit {
             let pc = self.pc();
+            // A locked-up core executes nothing, so the count would never reach the limit.
+            if self.is_locked_up() {
+                return Stop::Fault(Fault {
+                    pc,
+                    description: format!("core locked up (B1.5.15), fetching {pc:#010x}"),
+                });
+            }
             if stop_at.is_some_and(|addr| addr & !1 == pc & !1) {
                 return Stop::Address(pc);
             }
@@ -326,6 +333,12 @@ impl Cpu {
             Ok(code) => self.processor.decode(code).to_string(),
             Err(_) => "fetch fault".to_string(),
         }
+    }
+
+    /// Whether the core is locked up (B1.5.15): it executes nothing, and a run stops at once with
+    /// a fault. Only a reset leaves it (an NMI too, if the core is stepped).
+    pub fn is_locked_up(&self) -> bool {
+        self.processor.is_locked_up()
     }
 
     /// The address of the next instruction.

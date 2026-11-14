@@ -72,6 +72,8 @@ impl Reset for Processor {
         //self.event_reg.clear();
 
         self.itstate = 0;
+        // a reset leaves a lockup (B1-555)
+        self.locked_up = false;
         self.execution_priority = self.get_execution_priority();
 
         let reset_vector = self
@@ -237,5 +239,14 @@ mod tests {
         assert_eq!(processor.instruction_count, 567);
         assert_eq!(processor.dwt_cyccnt, 89);
         assert_eq!(processor.vtor, 0);
+    }
+
+    #[test]
+    fn a_reset_leaves_a_lockup() {
+        let mut processor = booted();
+        processor.lock_up();
+        assert!(processor.is_locked_up());
+        assert_eq!(processor.reset(), Ok(()));
+        assert!(!processor.is_locked_up());
     }
 }

@@ -416,7 +416,10 @@ impl Processor {
                 // `is_lockup` is the manual's rule (B1.5.15) for a HardFault at a priority below 0;
                 // an exception other than NMI cannot be taken from there, so it only matters if
                 // that changes, and no test reaches it. The inner branch below (the HardFault's
-                // own vector cannot be read) is reached with a table that is unmapped as a whole.
+                // own vector cannot be read) is reached when both vector words are unreadable: the
+                // memory between them may be mapped (with VTOR at 0x1fff_ff80, vector 3 at
+                // 0x1fff_ff8c and vector 11 at 0x1fff_ffac are unmapped, and vector 32 at
+                // 0x2000_0000 is not).
                 if matches!(taken, Exception::HardFault | Exception::NMI)
                     || self.is_lockup(Exception::HardFault)
                 {
@@ -431,8 +434,9 @@ impl Processor {
             }
         }
         if entry.lockup {
-            self.running = false;
-            self.sleeping = false;
+            self.lock_up();
+            // the lockup address of a failed stacking or vector read is 0xFFFFFFFE (B1-556)
+            self.set_pc(0xffff_fffe);
         }
         EntryOutcome::Derived(entry)
     }
@@ -541,17 +545,15 @@ impl Processor {
         }
     }
 
-    /// Enter an exception. `refused` is set by the fault of an exception return that was refused.
+    /// Enter an exception, which is not Reset (that is `reset()`, the only entry that can fail with
+    /// a `Fault`). `refused` is set by the fault of an exception return that was refused.
     pub(crate) fn enter_exception(
         &mut self,
         exception: Exception,
         return_address: u32,
         refused: Option<RefusedReturn>,
         source: EntrySource,
-    ) -> Result<EntryOutcome, Fault> {
-        if exception == Exception::Reset {
-            return self.reset().map(|()| EntryOutcome::Entered);
-        }
+    ) -> EntryOutcome {
         if let Exception::Interrupt { n } = exception {
             self.nvic_unpend_interrupt(n);
         }
@@ -560,23 +562,21 @@ impl Processor {
             if let Err(fault) = self.push_stack(return_address, refused) {
                 // The stacking failed: DerivedLateArrival(), which reuses this PushStack
                 let lr_override = refused.map(|refused| refused.handler_lr);
-                return Ok(self.derived_exception_on_entry(
+                return self.derived_exception_on_entry(
                     exception,
                     fault.on_exception_entry_stack(),
                     source,
                     lr_override,
                     true,
-                ));
+                );
             }
         } else if let Some(refused) = refused {
             self.lr = refused.handler_lr;
         }
         match self.exception_taken(exception) {
-            Ok(()) => Ok(EntryOutcome::Entered),
+            Ok(()) => EntryOutcome::Entered,
             // the vector of the original could not be read: a derived HardFault on the same frame
-            Err(fault) => {
-                Ok(self.derived_exception_on_entry(exception, fault, source, None, false))
-            }
+            Err(fault) => self.derived_exception_on_entry(exception, fault, source, None, false),
         }
     }
 
@@ -1032,8 +1032,11 @@ impl ExceptionHandling for Processor {
     }
 
     fn exception_entry(&mut self, exception: Exception, return_address: u32) -> Result<(), Fault> {
+        if exception == Exception::Reset {
+            return self.reset();
+        }
         let pc = self.get_pc();
-        match self.enter_exception(exception, return_address, None, EntrySource::Synchronous)? {
+        match self.enter_exception(exception, return_address, None, EntrySource::Synchronous) {
             EntryOutcome::Entered => {}
             EntryOutcome::Derived(entry) => self.queue_derived_traps(&entry, None, pc),
         }
@@ -1110,21 +1113,27 @@ impl ExceptionHandling for Processor {
             self.sleeping = false;
             self.clear_pending_exception(exception);
             let pc = self.get_pc();
-            match self.enter_exception(exception, pc, None, EntrySource::Pending) {
-                Ok(EntryOutcome::Entered) => {}
-                Ok(EntryOutcome::Derived(entry)) => self.queue_derived_traps(&entry, None, pc),
-                Err(fault) => {
-                    // only a failing reset gets here
+            if exception == Exception::Reset {
+                // a pending Reset: it can fail reading the initial SP and PC, which is a lockup
+                // at priority -1 with the lockup address 0xFFFFFFFE (B1-556), and no entry
+                if let Err(fault) = self.reset() {
                     let active_exception = self.active_exception();
                     self.record_fault_status(fault, FaultStatusContext::default());
-                    self.set_hfsr_forced();
                     self.queue_fault_trap(
                         fault,
                         Exception::HardFault,
                         pc,
                         active_exception,
-                        crate::core::fault::FaultTrapReason::Fault,
+                        crate::core::fault::FaultTrapReason::Lockup,
                     );
+                    self.execution_priority = -1;
+                    self.lock_up();
+                    self.set_pc(0xffff_fffe);
+                }
+            } else {
+                match self.enter_exception(exception, pc, None, EntrySource::Pending) {
+                    EntryOutcome::Entered => {}
+                    EntryOutcome::Derived(entry) => self.queue_derived_traps(&entry, None, pc),
                 }
             }
             true
@@ -3213,14 +3222,12 @@ mod tests {
             handler_lr: 0xffff_fff0,
             frame_xpsr: None,
         };
-        processor
-            .enter_exception(
-                Exception::UsageFault,
-                0x100,
-                Some(refused),
-                EntrySource::Synchronous,
-            )
-            .unwrap();
+        processor.enter_exception(
+            Exception::UsageFault,
+            0x100,
+            Some(refused),
+            EntrySource::Synchronous,
+        );
         assert_eq!(processor.get_r(Reg::LR), 0xffff_fff0);
     }
 
@@ -3575,5 +3582,86 @@ mod tests {
         let mut processor = Processor::new();
         processor.record_fault_status(Fault::Unaligned, FaultStatusContext::default());
         assert_eq!(processor.cfsr & (1 << 24), 1 << 24);
+    }
+
+    // A lockup found while entering an exception from an SVC counts the one cycle too, whatever
+    // the path (B1.5.15: the core fetches the lockup address from then on).
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_an_svc_that_locks_up_counts_one_cycle() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor.write32(0xE000_ED08, 0x1fff_ff80).unwrap();
+        processor.set_msp(0x2002_0004);
+        processor.set_pc(0x100);
+        let cycles = processor.execute(&decode_16(0xdf00), 2);
+        assert!(!processor.running);
+        assert_eq!(cycles, 1);
+    }
+
+    // CFSR.NOCP is recorded from the fault, in one place, whichever instruction raises it.
+    #[test]
+    #[cfg(feature = "has-fp")]
+    fn test_every_fp_instruction_with_cpacr_off_sets_nocp_through_the_fault() {
+        let mut failed = Vec::new();
+        for opcode in [
+            0xec90_0a01_u32, // vldmia r0, {s0}
+            0xed80_0a00,     // vstr s0, [r0]
+            0xeef1_0a10,     // vmrs r0, fpscr
+        ] {
+            let mut processor = Processor::new();
+            processor.write32(0xE000_ED24, 1 << 18).unwrap();
+            processor.set_msp(0x2000_0200);
+            processor.set_r(Reg::R0, 0x2000_0100);
+            processor.execute(&crate::decoder::decode_32(opcode), 4);
+            if processor.cfsr & (1 << 19) == 0 || processor.psr.get_isr_number() != 6 {
+                failed.push(format!("{opcode:#010x}"));
+            }
+        }
+        assert!(failed.is_empty(), "no NOCP from {failed:?}");
+    }
+
+    // NOCP from the exception entry: an SVC with FPCA set, no lazy stacking and the FPU off cannot
+    // stack the FP registers (CFSR bit 19).
+    #[test]
+    #[cfg(feature = "has-fp")]
+    fn test_an_exception_entry_that_stacks_fp_state_with_cpacr_off_sets_nocp() {
+        let mut processor = Processor::new();
+        processor.write32(0xE000_EF34, 0).unwrap(); // FPCCR: LSPEN = 0
+        processor.control.fpca = true;
+        processor.set_msp(0x2000_0200);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xdf00), 2);
+        assert_eq!(processor.cfsr & (1 << 19), 1 << 19);
+    }
+
+    // NOCP from the exception return: an extended frame (EXC_RETURN bit 4 clear) with the FP
+    // registers to unstack and the FPU off.
+    #[test]
+    #[cfg(feature = "has-fp")]
+    fn test_an_exception_return_that_unstacks_fp_state_with_cpacr_off_sets_nocp() {
+        const FRAMEPTR: u32 = 0x2000_0100;
+        let mut processor = Processor::new();
+        processor.set_msp(FRAMEPTR);
+        processor.write32(FRAMEPTR + 0x18, 0x0800_0001).unwrap();
+        processor.write32(FRAMEPTR + 0x1c, 1 << 24).unwrap();
+        set_active_exception(&mut processor, Exception::SysTick);
+        processor.set_r(Reg::LR, 0xffff_ffe9); // Thread, main stack, extended frame
+        processor.execute(&decode_16(0x4770), 2); // bx lr
+        assert_eq!(processor.cfsr & (1 << 19), 1 << 19);
+    }
+
+    // A BKPT that takes the DebugMonitor counts the cycles of an entry.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_bkpt_that_takes_the_debug_monitor_counts_the_entry_cycles() {
+        let mut processor = Processor::new();
+        processor.write32(0xE000_EDFC, 1 << 16).unwrap();
+        processor.set_msp(0x2000_0200);
+        processor.execution_priority = processor.get_execution_priority();
+        processor.set_pc(0x100);
+        let cycles = processor.execute(&decode_16(0xbe00), 2);
+        assert_eq!(processor.psr.get_isr_number(), 12);
+        assert_eq!(cycles, 12);
     }
 }

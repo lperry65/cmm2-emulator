@@ -102,8 +102,10 @@ pub trait Executor {
 /// Cortex-M7 with zero-wait-state memory (as for the M3 and M4). Every path that actually enters
 /// an exception counts them: SVC, BKPT, a fault, an exception taken after an instruction or from
 /// sleep, and the entry that starts the debugger's step after a halt; one taken straight after an
-/// exception return counts the tail-chain cycles instead. A lockup, and a failed reset, enter
-/// nothing and count the one cycle of the step.
+/// exception return counts the tail-chain cycles instead (`Processor::entry_cycles`). A lockup, on
+/// any path, and a failed reset enter nothing: the step counts the one cycle of the fetch of the
+/// lockup address (B1.5.15), and the core stops. (On silicon the stacking writes that came before
+/// a failed vector read did happen; the emulator does not charge for them.)
 pub(crate) const EXCEPTION_ENTRY_CYCLES: u32 = 12;
 
 /// The cycles of an exception taken straight after an exception return: tail-chaining, which
@@ -183,6 +185,43 @@ fn conditional_setflags(setflags: SetFlags, in_it_block: bool) -> bool {
 }
 
 impl Processor {
+    /// Lock the core up (B1.5.15): it stops executing and keeps fetching the lockup address, at the
+    /// priority of the lockup (at least -1). Only an NMI (from a `HardFault` lockup) or a reset
+    /// leaves it (B1-555, `step_locked_up`).
+    pub(crate) fn lock_up(&mut self) {
+        self.locked_up = true;
+        self.running = false;
+        self.sleeping = false;
+        self.execution_priority = self.execution_priority.min(-1);
+    }
+
+    /// One step of a locked-up core: nothing executes. An exception that can preempt the lockup
+    /// (NMI, or a reset) is entered, and leaves the lockup if its entry works; otherwise the step
+    /// is the one cycle of the fetch.
+    fn step_locked_up(&mut self) {
+        self.locked_up = false;
+        self.running = true;
+        if !self.check_exceptions() {
+            self.locked_up = true;
+            self.running = false;
+        }
+        let cycles = self.entry_cycles(false);
+        self.account_cycles(cycles);
+    }
+
+    /// The cycles to charge for an exception entry that has just been made: 1 if it locked up the
+    /// core (nothing was entered), else the tail-chain cycles or the entry cycles.
+    #[inline(always)]
+    pub(crate) fn entry_cycles(&self, tail_chain: bool) -> u32 {
+        if self.locked_up {
+            1
+        } else if tail_chain {
+            EXCEPTION_TAIL_CHAIN_CYCLES
+        } else {
+            EXCEPTION_ENTRY_CYCLES
+        }
+    }
+
     /// Count `count` cycles: the cycle counter, DWT and `SysTick`.
     #[inline(always)]
     pub(crate) fn account_cycles(&mut self, count: u32) {
@@ -261,8 +300,7 @@ impl Processor {
                 active_exception,
                 FaultTrapReason::Lockup,
             );
-            self.running = false;
-            self.sleeping = false;
+            self.lock_up();
             // a lockup enters no exception: the step takes the one cycle of the fetch
             return 1;
         }
@@ -276,7 +314,7 @@ impl Processor {
             status.refused_return,
             crate::core::exception::EntrySource::Synchronous,
         ) {
-            Ok(crate::core::exception::EntryOutcome::Entered) => {
+            crate::core::exception::EntryOutcome::Entered => {
                 if self.get_fault_trap_mode().should_trap(exception) {
                     self.queue_fault_trap(
                         fault,
@@ -287,35 +325,12 @@ impl Processor {
                     );
                 }
             }
-            Ok(crate::core::exception::EntryOutcome::Derived(entry)) => {
+            crate::core::exception::EntryOutcome::Derived(entry) => {
                 self.queue_derived_traps(&entry, Some(fault), fault_pc);
-            }
-            Err(entry_fault) => {
-                // Only the entry of Reset fails this way (it reads the initial SP and PC); a
-                // failing stacking or vector read is a derived exception, handled inside the entry.
-                self.record_fault_status(entry_fault, FaultStatusContext::default());
-                self.set_hfsr_forced();
-                let trap_reason =
-                    if exception == Exception::HardFault || self.is_lockup(Exception::HardFault) {
-                        FaultTrapReason::Lockup
-                    } else {
-                        FaultTrapReason::Fault
-                    };
-                self.queue_fault_trap(
-                    entry_fault,
-                    Exception::HardFault,
-                    fault_pc,
-                    active_exception,
-                    trap_reason,
-                );
-                self.running = false;
-                self.sleeping = false;
-                // nothing was entered: no entry cycles
-                return 1;
             }
         }
 
-        EXCEPTION_ENTRY_CYCLES
+        self.entry_cycles(false)
     }
 }
 
@@ -863,12 +878,17 @@ impl Executor for Processor {
             self.dwt_tick(1);
         }
         if entered {
-            self.account_cycles(EXCEPTION_ENTRY_CYCLES);
+            let cycles = self.entry_cycles(false);
+            self.account_cycles(cycles);
         }
     }
 
     #[inline(always)]
     fn step(&mut self) {
+        if self.locked_up {
+            self.step_locked_up();
+            return;
+        }
         self.exception_returned = false;
         let pc = self.get_pc();
         let mapped_pc = (self.map_address(pc).wrapping_sub(self.code.base()) >> 1) as usize;
@@ -892,14 +912,12 @@ impl Executor for Processor {
         // a halt into a debugger takes no exception in the same step
         if (self.pending_exception_count != 0 || self.sleeping)
             && !self.debug_halt
+            && !self.locked_up
             && self.check_exceptions()
         {
             // straight after an exception return it is tail-chained
-            self.account_cycles(if self.exception_returned {
-                EXCEPTION_TAIL_CHAIN_CYCLES
-            } else {
-                EXCEPTION_ENTRY_CYCLES
-            });
+            let cycles = self.entry_cycles(self.exception_returned);
+            self.account_cycles(cycles);
         }
     }
 
@@ -1677,5 +1695,31 @@ mod tests {
         let cycles = core.handle_fault(Fault::UndefInstr, 0x100);
         assert!(!core.running);
         assert_eq!(cycles, 1);
+    }
+
+    // A fault whose entry ends in a derived lockup (the vectors cannot be read) is not an entry
+    // either: it costs the one cycle.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_fault_that_ends_in_a_derived_lockup_costs_one_cycle() {
+        let mut core = Processor::new();
+        core.write32(0xE000_ED08, 0x1fff_ff80).unwrap(); // no vector can be read
+        core.write32(0xE000_ED24, 1 << 18).unwrap(); // UsageFault enabled
+        core.set_msp(0x2000_0200);
+        let cycles = core.handle_fault(Fault::UndefInstr, 0x100);
+        assert!(core.is_locked_up());
+        assert_eq!(cycles, 1);
+    }
+
+    // The lockup address of a derived lockup (a failed stacking or vector read) is 0xFFFFFFFE.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_derived_lockup_sets_the_pc_to_the_lockup_address() {
+        let mut core = Processor::new();
+        core.write32(0xE000_ED08, 0x1fff_ff80).unwrap();
+        core.write32(0xE000_ED24, 1 << 18).unwrap();
+        core.set_msp(0x2000_0200);
+        core.handle_fault(Fault::UndefInstr, 0x100);
+        assert_eq!(core.get_pc(), 0xffff_fffe);
     }
 }

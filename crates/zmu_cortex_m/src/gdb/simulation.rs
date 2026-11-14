@@ -13,8 +13,6 @@ use crate::executor::Executor;
 use crate::semihosting::SemihostingCommand;
 use crate::semihosting::SemihostingResponse;
 
-use crate::executor::EXCEPTION_ENTRY_CYCLES;
-
 ///
 /// Cortex System simulation framework
 ///
@@ -187,17 +185,21 @@ impl Simulation {
         // Halting debug stepping (C1.5, p. C1-695): leaving Debug state takes a pending exception
         // of sufficient priority instead of executing the next instruction
         let mut entered = false;
-        if std::mem::take(&mut self.after_halt) {
+        if std::mem::take(&mut self.after_halt) && !self.processor.is_locked_up() {
             // an exception that was selected counts, whether its entry worked or failed: only one
             // exception entry is taken in a step
             entered = self.processor.check_exceptions();
         }
         if entered {
             // what an exception entry takes (`handle_fault` counts the same)
-            self.processor.account_cycles(EXCEPTION_ENTRY_CYCLES);
-        } else if self.processor.running {
+            let cycles = self.processor.entry_cycles(false);
+            self.processor.account_cycles(cycles);
+        } else if self.processor.is_locked_up()
+            || (self.processor.running && !self.processor.sleeping)
+        {
             self.processor.step();
-        } else if self.processor.sleeping {
+        } else if self.processor.running {
+            // asleep: a WFI leaves running and sleeping both set (as `system/simulation.rs` has it)
             self.processor.step_sleep();
         }
         // a BKPT in the guest halts into the debugger; the halt is consumed here
@@ -218,7 +220,7 @@ impl Simulation {
             self.after_halt = true;
             return SimulationEvent::WatchRead(self.processor.get_pc());
         }
-        if !self.processor.running && !self.processor.sleeping {
+        if !self.processor.running && !self.processor.sleeping && !self.processor.is_locked_up() {
             SimulationEvent::Finalized(self.processor.exit_code)
         } else {
             SimulationEvent::DoneStep
@@ -316,7 +318,8 @@ mod tests {
         assert!(!simulation.processor.debug_halt);
     }
 
-    // vector table with PendSV, then `bkpt`, `cpsid i`, `nop` at 0x40 and the handler at 0x4c
+    // Vector table with HardFault, PendSV and SysTick (all to 0x4c), then `bkpt`, `cpsid i`, `nop`,
+    // `svc #0` and `udf #0` at 0x40, and `bx lr` at 0x4c as the handler.
     fn simulation_with_a_pendsv_handler() -> Simulation {
         let mut code = vec![0_u8; 0x50];
         code[0..4].copy_from_slice(&0x2000_0100_u32.to_le_bytes());
@@ -325,6 +328,7 @@ mod tests {
         code[0x0c..0x10].copy_from_slice(&0x0000_004d_u32.to_le_bytes());
         code[0x40..0x46].copy_from_slice(&[0x00, 0xbe, 0x72, 0xb6, 0x00, 0xbf]);
         code[0x3c..0x40].copy_from_slice(&0x0000_004d_u32.to_le_bytes());
+        code[0x46..0x4a].copy_from_slice(&[0x00, 0xdf, 0x00, 0xde]); // svc #0, udf #0
         code[0x4c..0x4e].copy_from_slice(&[0x70, 0x47]); // bx lr
         let mut processor = Processor::new();
         processor.flash_memory(code.len(), &code);
@@ -424,7 +428,7 @@ mod tests {
     #[test]
     fn test_an_exception_taken_from_sleep_counts_its_entry_cycles() {
         let mut simulation = simulation_with_a_pendsv_handler();
-        simulation.processor.running = false;
+        // what a WFI leaves: sleeping, and still running
         simulation.processor.sleeping = true;
         simulation
             .processor
@@ -471,5 +475,204 @@ mod tests {
         let (chained, isr) = cycles_of_a_return_from_pendsv(true);
         assert_eq!(isr, 15, "SysTick is tail-chained");
         assert_eq!(chained - plain, 6);
+    }
+
+    // The tail-chain flag is per step: a return in one step does not make the exception taken
+    // after a later instruction a tail-chain.
+    #[test]
+    fn test_an_exception_after_a_later_instruction_is_not_tail_chained() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.set_pc(0x44);
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        simulation.step(); // entered
+        simulation.step(); // bx lr: back in Thread mode, nothing pending
+        assert_eq!(simulation.processor.psr.get_isr_number(), 0);
+        simulation.processor.set_pc(0x44);
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        let cycles = simulation.processor.cycle_count;
+        simulation.step(); // the nop, and PendSV after it
+        assert_eq!(simulation.processor.psr.get_isr_number(), 14);
+        assert_eq!(simulation.processor.cycle_count, cycles + 1 + 12);
+    }
+
+    // A lockup is not an entry, on any path: the step counts the one cycle of the fetch, and the
+    // core stops. Here VTOR is below SRAM, so no vector can be read.
+    #[test]
+    fn test_a_lockup_after_an_instruction_counts_one_cycle_and_no_entry() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.vtor = 0x1fff_ff80;
+        simulation.processor.set_pc(0x44);
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        let cycles = simulation.processor.cycle_count;
+        simulation.step();
+        assert!(!simulation.processor.running);
+        assert_eq!(simulation.processor.cycle_count, cycles + 1 + 1);
+    }
+
+    // A tail-chain that locks up counts the one cycle too, not the tail-chain's six.
+    #[test]
+    fn test_a_lockup_after_an_exception_return_counts_one_cycle() {
+        let (plain, _) = cycles_of_a_return_from_pendsv(false);
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation
+            .processor
+            .set_exception_priority(Exception::SysTick, 0x40);
+        simulation.processor.set_pc(0x44);
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        simulation.step();
+        simulation.processor.vtor = 0x1fff_ff80;
+        simulation
+            .processor
+            .set_exception_pending(Exception::SysTick);
+        let cycles = simulation.processor.cycle_count;
+        simulation.step();
+        assert!(!simulation.processor.running);
+        assert_eq!(simulation.processor.cycle_count - cycles, plain + 1);
+    }
+
+    // A pending Reset whose vectors cannot be read is a lockup at priority -1 with the lockup
+    // address 0xFFFFFFFE (B1-556), with VECTTBL and without FORCED, and no entry. (Our `reset()`
+    // keeps VTOR, where TakeReset's ResetSCSRegs would clear it: the embedder sets VTOR before the
+    // first reset to boot from the flash base, so VTOR is kept.)
+    #[test]
+    fn test_a_failed_reset_is_a_lockup_at_the_lockup_address() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.vtor = 0x1fff_ff80;
+        simulation.processor.set_pc(0x44);
+        simulation.processor.set_exception_pending(Exception::Reset);
+        let cycles = simulation.processor.cycle_count;
+        let event = simulation.step();
+        let SimulationEvent::FaultTrap(trap) = event else {
+            panic!("a lockup trap expected");
+        };
+        assert_eq!(
+            trap.trap_reason,
+            crate::core::fault::FaultTrapReason::Lockup
+        );
+        assert_eq!(trap.fault, crate::core::fault::Fault::VectorTable);
+        assert!(simulation.processor.is_locked_up());
+        assert!(!simulation.processor.running);
+        assert_eq!(simulation.processor.get_pc(), 0xffff_fffe);
+        assert_eq!(simulation.processor.hfsr & (1 << 30), 0, "no FORCED");
+        assert_eq!(simulation.processor.hfsr & (1 << 1), 1 << 1, "VECTTBL");
+        assert_eq!(simulation.processor.cycle_count, cycles + 1 + 1);
+    }
+
+    // ---- lockup through `step()` ---------------------------------------------------------------
+
+    // The lockup of an instruction (SVC or UDF with the vectors unreadable) leaves its exception
+    // pending, but the step does not retry the entry: one cycle for the step that found it, then
+    // one per step of the fetch of the lockup address, and the trap once.
+    #[test]
+    fn test_a_lockup_through_step_is_counted_and_trapped_once() {
+        for (pc, name) in [(0x46_u32, "svc"), (0x48, "udf")] {
+            let mut simulation = simulation_with_a_pendsv_handler();
+            simulation.processor.vtor = 0x1fff_ff80;
+            simulation.processor.write32(0xE000_ED24, 1 << 18).unwrap();
+            simulation.processor.set_pc(pc);
+            let cycles = simulation.processor.cycle_count;
+            assert!(
+                matches!(simulation.step(), SimulationEvent::FaultTrap(_)),
+                "{name}"
+            );
+            assert_eq!(simulation.processor.cycle_count, cycles + 1, "{name}");
+            assert!(simulation.processor.is_locked_up(), "{name}");
+            for _ in 0..3 {
+                let cycles = simulation.processor.cycle_count;
+                assert!(
+                    matches!(simulation.step(), SimulationEvent::DoneStep),
+                    "{name}: no new trap"
+                );
+                assert_eq!(simulation.processor.cycle_count, cycles + 1, "{name}");
+                assert!(simulation.processor.is_locked_up(), "{name}");
+            }
+        }
+    }
+
+    // An NMI leaves the lockup of a HardFault handler (B1-555): the udf in the handler locks up,
+    // and the next step takes the NMI, with a full entry, and the core runs again.
+    #[test]
+    fn test_an_nmi_leaves_a_hardfault_lockup() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation
+            .processor
+            .test_set_active_exception(Exception::HardFault);
+        simulation.processor.execution_priority = simulation.processor.get_execution_priority();
+        simulation.processor.set_pc(0x48); // udf
+        simulation.processor.set_exception_pending(Exception::NMI);
+        let cycles = simulation.processor.cycle_count;
+        simulation.step();
+        assert!(simulation.processor.is_locked_up());
+        assert_eq!(simulation.processor.cycle_count, cycles + 1);
+        let cycles = simulation.processor.cycle_count;
+        simulation.step();
+        assert!(!simulation.processor.is_locked_up());
+        assert!(simulation.processor.running);
+        assert_eq!(simulation.processor.psr.get_isr_number(), 2);
+        assert_eq!(simulation.processor.cycle_count, cycles + 12);
+    }
+
+    // A lockup found while the core sleeps (WFI leaves running and sleeping both set) counts one.
+    #[test]
+    fn test_a_lockup_from_sleep_counts_one_cycle() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.vtor = 0x1fff_ff80;
+        simulation.processor.sleeping = true;
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        let cycles = simulation.processor.cycle_count;
+        simulation.step();
+        assert!(simulation.processor.is_locked_up());
+        assert_eq!(simulation.processor.cycle_count, cycles + 1);
+    }
+
+    // A lockup on the entry that starts the step after a halt counts one.
+    #[test]
+    fn test_a_lockup_after_a_halt_counts_one_cycle() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        assert!(matches!(simulation.step(), SimulationEvent::Break));
+        simulation.processor.vtor = 0x1fff_ff80;
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        let cycles = simulation.processor.cycle_count;
+        simulation.step();
+        assert!(simulation.processor.is_locked_up());
+        assert_eq!(simulation.processor.cycle_count, cycles + 1);
+    }
+
+    // A locked-up core after a halt goes through the lockup step, not the after-halt entry: an NMI
+    // leaves the lockup properly.
+    #[test]
+    fn test_a_lockup_after_a_halt_is_left_by_an_nmi_through_the_lockup_step() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        assert!(matches!(simulation.step(), SimulationEvent::Break));
+        simulation.processor.lock_up();
+        simulation.processor.set_exception_pending(Exception::NMI);
+        simulation.step();
+        assert!(!simulation.processor.is_locked_up());
+        assert!(simulation.processor.running);
+        assert_eq!(simulation.processor.psr.get_isr_number(), 2);
+    }
+
+    // Lock-ups that are not found by `step`: what the entry cycles are decided by is the lockup, not
+    // `running`, which a semihosting exit clears too.
+    #[test]
+    fn test_the_entry_cycles_follow_the_lockup_and_not_running() {
+        let mut processor = Processor::new();
+        processor.running = false; // as after a semihosting exit
+        assert_eq!(processor.entry_cycles(false), 12);
+        assert_eq!(processor.entry_cycles(true), 6);
+        processor.lock_up();
+        assert_eq!(processor.entry_cycles(false), 1);
     }
 }
