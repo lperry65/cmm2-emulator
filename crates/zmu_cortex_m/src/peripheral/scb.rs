@@ -556,7 +556,8 @@ impl SystemControlBlock for Processor {
     }
 
     fn write_vtor(&mut self, value: u32) {
-        self.vtor = value;
+        // TBLOFF is bits 31:7; bits 6:0 are reserved (B3.2.5)
+        self.vtor = value & !0x7f;
     }
 
     #[cfg(any(feature = "armv7m", feature = "armv7em"))]

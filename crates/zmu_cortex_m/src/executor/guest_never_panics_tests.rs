@@ -282,11 +282,31 @@ fn test_exception_returns_with_forged_frames_never_panic_the_host() {
     }
 }
 
+// the stack pointer that an entry uses now, and the size of the frame it pushes
+#[cfg(not(feature = "armv6m"))]
+fn uses_psp(core: &Processor) -> bool {
+    core.control.sp_sel && core.mode == ProcessorMode::ThreadMode
+}
+#[cfg(not(feature = "armv6m"))]
+fn sp_of(core: &Processor, psp: bool) -> u32 {
+    if psp { core.get_psp() } else { core.get_msp() }
+}
+#[cfg(not(feature = "armv6m"))]
+fn frame_bound(core: &Processor) -> u32 {
+    #[cfg(feature = "has-fp")]
+    if core.control.fpca {
+        return 0x68 + 4;
+    }
+    let _ = core;
+    0x20 + 4
+}
+
 // Exception entries on stacks that fail and vector tables that cannot be read: random stack
-// pointers near the end of SRAM, random VTOR, priorities, fault enables, PRIGROUP and pending
-// exceptions, entered by SVC, BKPT, UDF and from the pending ones. Nothing panics, and an entry
-// lowers the stack pointer by at most one frame (B1.5.11: a derived exception reuses the one
-// PushStack), whatever fails.
+// pointers (MSP and PSP, SPSEL, FPCA) near the end of SRAM, vector tables of random length in
+// flash and at an aligned VTOR (VTOR<31:7>, B1-533), priorities, fault enables, PRIGROUP and
+// pending exceptions, entered by SVC, BKPT, UDF and from the pending ones. Nothing panics, and an
+// entry lowers the stack pointer by at most one frame (B1.5.11: a derived exception reuses the
+// one PushStack), whatever fails: 0x20 plus the 4 of the alignment, or 0x68 plus 4 with FPCA.
 #[cfg(not(feature = "armv6m"))]
 #[test]
 fn test_failing_stacks_and_unreadable_vectors_never_panic_and_lower_sp_by_one_frame() {
@@ -312,14 +332,8 @@ fn test_failing_stacks_and_unreadable_vectors_never_panic_and_lower_sp_by_one_fr
         0x0000_0010,
         0xffff_fff0,
     ];
-    let vtors = [
-        0_u32,
-        0x2001_ffe0,
-        0x2001_fffc,
-        0x2001_ffc0,
-        0xffff_fff0,
-        0x2002_0000,
-    ];
+    let vtors = [0_u32, 0x2001_ff80, 0x2001_ff00, 0xffff_ff80, 0x2002_0000];
+    let table_sizes = [0x4_usize, 0x8, 0xc, 0x10, 0x20, 0x40, 0x100];
     let priorities = [0_u8, 0x20, 0x40, 0x80];
     let faults = [
         Exception::MemoryManagementFault,
@@ -334,6 +348,9 @@ fn test_failing_stacks_and_unreadable_vectors_never_panic_and_lower_sp_by_one_fr
 
     for _ in 0..count {
         let mut core = processor();
+        let size = table_sizes[rng.next() as usize % table_sizes.len()];
+        core.flash_memory(size, &vec![0; size]);
+        core.cache_instructions();
         core.ccr = rng.next() & 0x201;
         core.write32(0xE000_ED24, (rng.next() & 7) << 16).unwrap();
         core.write32(0xE000_ED0C, 0x05fa_0000 | ((rng.next() % 8) << 8))
@@ -342,8 +359,16 @@ fn test_failing_stacks_and_unreadable_vectors_never_panic_and_lower_sp_by_one_fr
             core.set_exception_priority(exception, priorities[rng.next() as usize % 4]);
         }
         core.write32(0xE000_EDFC, (rng.next() & 3) << 16).unwrap();
-        core.vtor = vtors[rng.next() as usize % vtors.len()];
+        core.write32(0xE000_ED08, vtors[rng.next() as usize % vtors.len()])
+            .unwrap();
         core.set_msp(stacks[rng.next() as usize % stacks.len()]);
+        core.set_psp(stacks[rng.next() as usize % stacks.len()]);
+        core.control.sp_sel = rng.next().is_multiple_of(2);
+        #[cfg(feature = "has-fp")]
+        {
+            core.control.fpca = rng.next().is_multiple_of(2);
+            core.fpccr = (rng.next() & 3) << 30;
+        }
         core.execution_priority = core.get_execution_priority();
         for _ in 0..(rng.next() % 3) {
             core.set_exception_pending(faults[rng.next() as usize % faults.len()]);
@@ -355,21 +380,25 @@ fn test_failing_stacks_and_unreadable_vectors_never_panic_and_lower_sp_by_one_fr
         core.set_pc(START);
         let action = actions[rng.next() as usize % actions.len()];
 
-        let before = core.get_msp();
+        let psp = uses_psp(&core);
+        let before = sp_of(&core, psp);
+        let bound = frame_bound(&core);
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             core.execute(&decode_16(action), 2);
-            let lowered = before.wrapping_sub(core.get_msp());
+            let lowered = before.wrapping_sub(sp_of(&core, psp));
             assert!(
-                lowered <= 0x6c || lowered > 0xffff_ff00,
-                "the action lowered SP by {lowered:#x}"
+                lowered <= bound || lowered > 0xffff_ff00,
+                "the action lowered SP by {lowered:#x}, the frame is {bound:#x}"
             );
             for _ in 0..3 {
-                let sp = core.get_msp();
+                let psp = uses_psp(&core);
+                let sp = sp_of(&core, psp);
+                let bound = frame_bound(&core);
                 core.check_exceptions();
-                let lowered = sp.wrapping_sub(core.get_msp());
+                let lowered = sp.wrapping_sub(sp_of(&core, psp));
                 assert!(
-                    lowered <= 0x6c || lowered > 0xffff_ff00,
-                    "an entry lowered SP by {lowered:#x}"
+                    lowered <= bound || lowered > 0xffff_ff00,
+                    "an entry lowered SP by {lowered:#x}, the frame is {bound:#x}"
                 );
             }
         }));
@@ -380,7 +409,7 @@ fn test_failing_stacks_and_unreadable_vectors_never_panic_and_lower_sp_by_one_fr
                 .or_else(|| panic.downcast_ref::<&str>().map(ToString::to_string))
                 .unwrap_or_default();
             panic!(
-                "action {action:#x}, SP {before:#x}, VTOR {:#x} panicked: {message}",
+                "action {action:#x}, SP {before:#x}, VTOR {:#x}, table {size:#x} panicked: {message}",
                 core.vtor
             );
         }

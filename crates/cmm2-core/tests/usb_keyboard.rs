@@ -107,8 +107,10 @@ fn run_line_with_keys(boot: &mut UsbBoot, line: &str, events: &[(u64, [u8; 8])])
 fn real_firmware_enumerates_a_usb_keyboard() {
     let boot = boot_with_usb_keyboard();
     // Measured: the first boot's questions end with the UK keyboard, so the message says UK.
-    assert_eq!(
-        boot.connect_output, "UK USB Keyboard Connected on channel 1\r\n",
+    // Whether the next prompt has arrived yet depends on the exact timing, so it is not asserted.
+    assert!(
+        boot.connect_output
+            .contains("UK USB Keyboard Connected on channel 1\r\n"),
         "{:?}",
         boot.connect_output
     );

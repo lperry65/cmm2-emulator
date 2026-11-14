@@ -13,8 +13,7 @@ use crate::executor::Executor;
 use crate::semihosting::SemihostingCommand;
 use crate::semihosting::SemihostingResponse;
 
-/// Cycles of an exception entry, as `handle_fault` counts them.
-const EXCEPTION_ENTRY_CYCLES: u32 = 12;
+use crate::executor::EXCEPTION_ENTRY_CYCLES;
 
 ///
 /// Cortex System simulation framework
@@ -403,5 +402,20 @@ mod tests {
         let frame = simulation.processor.get_msp();
         assert_eq!(simulation.processor.read32(frame + 0x18), Ok(0x46));
         assert_eq!(simulation.processor.cycle_count, cycles + 12);
+    }
+
+    // An exception taken at the end of an ordinary step costs the cycles of an exception entry
+    // too, like on the path after a halt.
+    #[test]
+    fn test_an_exception_taken_after_an_instruction_counts_its_entry_cycles() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.set_pc(0x44); // the nop
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        let cycles = simulation.processor.cycle_count;
+        simulation.step();
+        assert_eq!(simulation.processor.psr.get_isr_number(), 14);
+        assert_eq!(simulation.processor.cycle_count, cycles + 1 + 12);
     }
 }

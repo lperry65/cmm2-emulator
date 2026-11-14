@@ -259,12 +259,18 @@ The firmware needs a few things zmu does not do, so I changed the following.
     DebugMonitor (a watchpoint) does not arise, there are no watchpoints.
   - a derived HardFault at an execution priority below 0 is a lockup (B1.5.15, p. B1-556): the
     core stops with a Lockup trap.
-  - a vector read error for the original (B1-547: always a HardFault; B1-556: a lockup for NMI and
-    HardFault) is the same thing on the same frame, with the fault VectorTable (HFSR.VECTTBL):
-    the HardFault is taken and the original stays pending by the rules above; if the HardFault's
-    vector cannot be read either (the table is read upwards, so it is that of NMI or HardFault
-    that fails together with it), or taking the exception fails, the core locks up. Before, the
-    frame was pushed and the exception cleared and never taken, or a second frame was pushed.
+  - a vector read error (of the original, or of the derived exception that is taken) is always a
+    HardFault (B1-547), on the same frame, with the fault VectorTable (HFSR.VECTTBL, also when the
+    core locks up: B1-555 has the Fault Status Registers consistent with the fault that caused
+    the lockup). The exception whose vector failed is left pending by the rules above. It is a
+    lockup only where the manual has one: for NMI and HardFault (B1-556), when the execution
+    priority is below 0 (B1.5.15), or when the HardFault's own vector cannot be read either; the
+    lockup trap names the vector read (fault VectorTable). The NMI and HardFault cases come out
+    of the priority rule and are not special-cased: the derived HardFault (-1) is not higher than
+    the original (-2, -1), so the original is taken first and its vector fails, and the HardFault
+    is left pending at the lockup. (An earlier version made every vector failure after a stacking
+    failure a lockup.) Before, the frame was pushed and the exception cleared and never taken, or a
+    second frame was pushed.
   - the trap is for the exception that was taken, by the fault trap mode, with the fault that
     made it (the original's, or the stacking fault when the derived one is taken), or else for the
     derived one by the mode. It reports the PC of the faulting instruction (the SVC itself for an
@@ -273,11 +279,26 @@ The firmware needs a few things zmu does not do, so I changed the following.
   - an exception selected by `check_exceptions` counts as that step's exception entry, whether the
     entry worked or failed; the GDB step after a halt (a BKPT, or a breakpoint or watchpoint from
     the debugger's list: C1-695 applies whenever the core leaves Debug state) takes it instead of
-    an instruction and counts 12 cycles for it, like `handle_fault`, in the cycle counter, DWT and
-    SysTick.
+    an instruction. Every path that enters an exception counts the 12 cycles of an entry
+    (`EXCEPTION_ENTRY_CYCLES`) in the cycle counter, DWT and SysTick: SVC and faults as before,
+    and now an exception taken after an instruction or from sleep (it counted 0), and the
+    after-halt entry. 12 is the interrupt latency ARM gives for the Cortex-M7 with zero-wait-state
+    memory (the same as the Cortex-M3 and M4); wait states in the real memories add to it.
+  - with FPCA set, a failed stacking leaves an extended frame whose FP registers, and
+    FPCCR.LSPACT, were never written. The manual allows the stacking to be abandoned (the note to
+    PushStack, p. B1-532), and the contents of what was not stacked are UNKNOWN; the handler does
+    not get them from the emulator either.
+  - under `FaultTrapMode::none()` a failed entry no longer reports a trap, as it used to
+    (always, and it stopped the core): the core carries on in the derived handler, and a trap is
+    queued only by the mode, or for a lockup, like any other fault.
+  - VTOR keeps bits 31:7 (TBLOFF, B3.2.5), and the vector table address is VTOR<31:7>:'0000000'
+    (B1.5.6, p. B1-533): a write masks the low seven bits. The tests that used unaligned VTORs use
+    a short vector table in flash instead, so that the wanted vectors cannot be read.
   - the test `test_failing_stacks_and_unreadable_vectors_never_panic_and_lower_sp_by_one_frame`
-    runs random stacks near the end of SRAM, VTORs, priorities, PRIGROUP, fault enables and
-    pending exceptions, and checks that no entry lowers SP by more than one frame.
+    runs random stacks (MSP, PSP, SPSEL, FPCA) near the end of SRAM, vector tables of random
+    length, aligned VTORs, priorities, PRIGROUP, fault enables and pending exceptions, and
+    checks that no entry lowers the stack it uses by more than its own frame (0x24, or 0x6c with
+    FPCA).
   BKPT with no
   semihosting host is a debug event (C1.5, p. C1-694; B1.5.14, HardFault on breakpoint
   escalation): DFSR.BKPT is set, the DebugMonitor is taken if DEMCR.MON_EN is set and its group

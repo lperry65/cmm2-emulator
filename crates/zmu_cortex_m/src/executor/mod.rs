@@ -98,6 +98,12 @@ pub trait Executor {
     fn execute(&mut self, instruction: &Instruction, instruction_size: usize) -> u32;
 }
 
+/// The cycles of an exception entry: the 12 cycles of interrupt latency ARM gives for the
+/// Cortex-M7 with zero-wait-state memory (as for the M3 and M4). Every path that
+/// enters an exception counts them: SVC, a fault, an exception taken after an instruction or from
+/// sleep, and the entry that starts the debugger's step after a halt.
+pub(crate) const EXCEPTION_ENTRY_CYCLES: u32 = 12;
+
 type ExecuteResult = Result<ExecuteSuccess, Fault>;
 #[derive(PartialEq, Debug, Copy, Clone)]
 /// Succesfull execution  an instruction
@@ -277,6 +283,8 @@ impl Processor {
                 self.queue_derived_traps(&entry, Some(fault), fault_pc);
             }
             Err(entry_fault) => {
+                // Only the entry of Reset fails this way (it reads the initial SP and PC); a
+                // failing stacking or vector read is a derived exception, handled inside the entry.
                 self.record_fault_status(entry_fault, FaultStatusContext::default());
                 self.set_hfsr_forced();
                 let trap_reason =
@@ -297,8 +305,7 @@ impl Processor {
             }
         }
 
-        // TODO: proper amount of cycles calculation
-        12
+        EXCEPTION_ENTRY_CYCLES
     }
 }
 
@@ -841,9 +848,12 @@ impl Executor for Processor {
         if (self.syst_csr & 1) != 0 {
             self.syst_step(1);
         }
-        self.check_exceptions();
+        let entered = self.check_exceptions();
         if (self.dwt_ctrl & 1) != 0 {
             self.dwt_tick(1);
+        }
+        if entered {
+            self.account_cycles(EXCEPTION_ENTRY_CYCLES);
         }
     }
 
@@ -869,11 +879,12 @@ impl Executor for Processor {
         };
         self.account_cycles(count);
         // a halt into a debugger takes no exception in the same step
-        if (self.pending_exception_count != 0 || self.sleeping) && !self.debug_halt {
-            self.check_exceptions();
+        if (self.pending_exception_count != 0 || self.sleeping)
+            && !self.debug_halt
+            && self.check_exceptions()
+        {
+            self.account_cycles(EXCEPTION_ENTRY_CYCLES);
         }
-        //TODO exception entry also burns cycles that should be accounted for
-        //DWT and SYST ticking
     }
 
     #[inline(always)]

@@ -101,18 +101,20 @@ mod tests {
     }
 
     #[test]
-    fn reset_with_the_vector_table_at_the_top_of_memory_wraps_to_the_bottom() {
+    fn reset_with_the_vector_table_at_the_top_of_memory_reads_it_there() {
         let mut processor = booted();
         processor.device(Some(Box::new(crate::memory::ram::RAM::new(
             0xffff_f000,
             0x1000,
         ))));
-        processor.write32(0xE000_ED08, 0xffff_fffc).unwrap();
-        processor.write32(0xffff_fffc, 0x2000_0100).unwrap();
+        // VTOR keeps bits 31:7 (B3.2.5), so the table is at 0xffff_ff80
+        processor.write32(0xE000_ED08, 0xffff_ffff).unwrap();
+        processor.write32(0xffff_ff80, 0x2000_0100).unwrap();
+        processor.write32(0xffff_ff84, 0x0800_0001).unwrap();
 
-        // the stack pointer comes from the last word, and the reset vector is past it, at address 0
         assert_eq!(processor.reset(), Ok(()));
-        assert_eq!(processor.get_pc(), 0x2000_0100 & !1);
+        assert_eq!(processor.get_pc(), 0x0800_0000);
+        assert_eq!(processor.get_msp(), 0x2000_0100);
     }
 
     #[test]

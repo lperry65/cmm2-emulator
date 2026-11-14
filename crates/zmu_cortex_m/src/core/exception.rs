@@ -361,11 +361,13 @@ impl Processor {
     /// second frame is pushed. If the derived exception is escalated to `HardFault`, or its group
     /// priority is higher than the original's, it is taken and the original is left pending;
     /// otherwise the original is taken and the derived one is left pending. A `HardFault` at an
-    /// execution priority below 0 is a lockup (B1.5.15), and so is a vector read error for NMI
-    /// and `HardFault` (p. B1-556): the vector of the derived `HardFault` is read after theirs
-    /// (a higher address), so it cannot be read either, and taking it fails. An exception that came from `check_exceptions` is always left
-    /// pending, as the manual has it; a synchronous one entered now is only left pending when it
-    /// returns to the next instruction, since a fault or BKPT runs again.
+    /// execution priority below 0 is a lockup (B1.5.15). A vector read error is always a
+    /// `HardFault` (B1-547), on the same frame; it is a lockup for NMI and `HardFault` (B1-556),
+    /// which is what happens when the original is one of them: the derived `HardFault` (-1) is not
+    /// higher than the original (-2, -1), so the original is taken first and its vector fails,
+    /// and the `HardFault` is left pending. An exception that came from `check_exceptions` is
+    /// always left pending, as the manual has it; a synchronous one entered now is only left
+    /// pending when it returns to the next instruction, since a fault or BKPT runs again.
     fn derived_exception_on_entry(
         &mut self,
         original: Exception,
@@ -402,8 +404,26 @@ impl Processor {
             };
             entry.taken = taken;
             self.pend_after_failed_entry(pended, pended == derived, source);
-            if self.exception_taken(taken).is_err() {
-                entry.lockup = true;
+            if let Err(vector_fault) = self.exception_taken(taken) {
+                // The vector of the exception to take cannot be read: always a HardFault
+                // (B1-547), on the same frame, and the exception left pending. It is a lockup for
+                // NMI and HardFault (B1-556), and when the HardFault cannot be taken: at an
+                // execution priority below 0 (B1.5.15) or because its own vector cannot be read.
+                // The Fault Status Registers show the vector read in every case (B1-555).
+                self.record_fault_status(vector_fault, FaultStatusContext::default());
+                entry.fault = vector_fault;
+                entry.derived = Exception::HardFault;
+                if matches!(taken, Exception::HardFault | Exception::NMI)
+                    || self.is_lockup(Exception::HardFault)
+                {
+                    entry.lockup = true;
+                } else {
+                    self.pend_after_failed_entry(taken, taken == derived, source);
+                    entry.taken = Exception::HardFault;
+                    if self.exception_taken(Exception::HardFault).is_err() {
+                        entry.lockup = true;
+                    }
+                }
             }
         }
         if entry.lockup {
@@ -3269,6 +3289,11 @@ mod tests {
             .take_pending_fault_trap()
             .expect("a HardFault trap");
         assert_eq!(trap.exception, Exception::HardFault);
+        assert_eq!(
+            trap.fault,
+            Fault::UndefInstr,
+            "the fault of the exception taken"
+        );
         assert_eq!(trap.pc, 0x100);
     }
 
@@ -3311,18 +3336,26 @@ mod tests {
         assert!(processor.exception_pending(Exception::UsageFault));
     }
 
+    // A processor whose vector table (at 0, in flash) has `bytes` bytes: the vectors past it
+    // cannot be read, the ones before it can. SRAM ends at 0x2002_0000.
+    #[cfg(not(feature = "armv6m"))]
+    fn processor_with_a_vector_table_of(bytes: usize) -> Processor {
+        let mut processor = Processor::new();
+        processor.flash_memory(bytes, &vec![0; bytes]);
+        processor.cache_instructions();
+        processor.ccr = 0;
+        processor
+    }
+
     // A vector read error is a derived HardFault on the same frame (B1-547), and a lockup for NMI
-    // and HardFault (B1-556): the table ends at 0x2002_0000 here, so the vector of SysTick, 15, is
-    // past it and the vector of HardFault, 3, is not.
+    // and HardFault (B1-556). Here the table has the vectors 0 to 7.
     #[test]
     #[cfg(not(feature = "armv6m"))]
     fn test_an_unreadable_vector_is_a_derived_hardfault_on_the_same_frame() {
-        let mut processor = Processor::new();
-        processor.ccr = 0;
-        processor.vtor = 0x2001_FFE0;
+        let mut processor = processor_with_a_vector_table_of(0x20);
         processor.set_msp(0x2000_0200);
         processor.execution_priority = processor.get_execution_priority();
-        processor.set_exception_pending(Exception::SysTick);
+        processor.set_exception_pending(Exception::SysTick); // vector 15
         assert!(processor.check_exceptions());
         assert_eq!(processor.psr.get_isr_number(), 3);
         assert_eq!(processor.get_msp(), 0x2000_0200 - 0x20, "one frame");
@@ -3331,12 +3364,52 @@ mod tests {
         assert!(processor.running);
     }
 
+    // P1: the original SVCall (vector 11) is taken because the derived MemManage is of lower
+    // priority, and its vector cannot be read: a HardFault with VECTTBL, not a lockup, on the one
+    // frame, SVCall left pending.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_an_original_with_an_unreadable_vector_gives_a_hardfault_and_not_a_lockup() {
+        let mut processor = processor_with_a_vector_table_of(0x10);
+        processor.write32(0xE000_ED24, 1 << 16).unwrap();
+        processor.set_exception_priority(Exception::MemoryManagementFault, 0x40);
+        processor.set_exception_priority(Exception::SVCall, 0);
+        processor.set_msp(0x2002_0004);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xdf00), 2);
+        assert!(processor.running);
+        assert_eq!(processor.psr.get_isr_number(), 3);
+        assert_eq!(processor.hfsr & (1 << 1), 1 << 1, "VECTTBL");
+        assert_eq!(processor.get_msp(), 0x2002_0004 - 0x20, "one frame");
+        assert_eq!(processor.read32(processor.get_msp() + 0x18), Ok(0x102));
+        assert!(processor.exception_pending(Exception::SVCall));
+        let trap = processor.take_pending_fault_trap().expect("a trap");
+        assert_eq!(trap.trap_reason, FaultTrapReason::Fault);
+    }
+
+    // P2: the derived MemManage (vector 4) has the higher priority and is taken, and its vector
+    // cannot be read: the same.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_derived_exception_with_an_unreadable_vector_gives_a_hardfault() {
+        let mut processor = processor_with_a_vector_table_of(0x10);
+        processor.write32(0xE000_ED24, 1 << 16).unwrap();
+        processor.set_exception_priority(Exception::MemoryManagementFault, 0);
+        processor.set_exception_priority(Exception::SVCall, 0x40);
+        processor.set_msp(0x2002_0004);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xdf00), 2);
+        assert!(processor.running);
+        assert_eq!(processor.psr.get_isr_number(), 3);
+        assert_eq!(processor.hfsr & (1 << 1), 1 << 1, "VECTTBL");
+        assert!(processor.exception_pending(Exception::SVCall));
+        assert!(processor.exception_pending(Exception::MemoryManagementFault));
+    }
+
     #[test]
     #[cfg(not(feature = "armv6m"))]
     fn test_an_unreadable_vector_on_the_svc_path_pushes_one_frame() {
-        let mut processor = Processor::new();
-        processor.ccr = 0;
-        processor.vtor = 0x2001_FFE0; // vector 11 at 0x2002_000C: unreadable, 3 at 0x2001_FFEC
+        let mut processor = processor_with_a_vector_table_of(0x20); // vector 11 is past it
         processor.set_msp(0x2000_0200);
         processor.set_pc(0x100);
         processor.execute(&decode_16(0xdf00), 2);
@@ -3346,23 +3419,35 @@ mod tests {
         assert_eq!(processor.read32(0x2000_0200 - 0x20 + 0x18), Ok(0x102));
     }
 
+    // NMI and HardFault with an unreadable vector lock up (B1-556), with VECTTBL set and the trap
+    // naming the vector read. The derived HardFault (-1) is not higher than the original (-2, -1),
+    // so the original is taken first and fails; a HardFault is left pending.
     #[test]
     #[cfg(not(feature = "armv6m"))]
     fn test_an_unreadable_vector_for_nmi_or_hardfault_is_a_lockup() {
-        for (exception, vtor) in [
-            (Exception::NMI, 0x2001_FFFC_u32),
-            (Exception::HardFault, 0x2001_FFF8),
-        ] {
-            let mut processor = Processor::new();
-            processor.ccr = 0;
-            processor.vtor = vtor;
+        for (exception, bytes) in [(Exception::NMI, 8_usize), (Exception::HardFault, 0xc)] {
+            let mut processor = processor_with_a_vector_table_of(bytes);
             processor.set_msp(0x2000_0200);
             processor.exception_entry(exception, 0x100).unwrap();
             assert!(!processor.running, "{exception:?}");
             assert_eq!(processor.get_msp(), 0x2000_0200 - 0x20, "one frame");
+            assert_eq!(processor.hfsr & (1 << 1), 1 << 1, "VECTTBL");
+            assert!(processor.exception_pending(Exception::HardFault));
             let trap = processor.take_pending_fault_trap().expect("a trap");
             assert_eq!(trap.trap_reason, FaultTrapReason::Lockup);
+            assert_eq!(trap.fault, Fault::VectorTable);
         }
+    }
+
+    // VTOR holds TBLOFF, bits 31:7 (B3.2.5): the low seven bits are reserved and the vector table
+    // address is VTOR<31:7>:'0000000' (B1.5.6, p. B1-533).
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_vtor_ignores_its_reserved_low_bits() {
+        let mut processor = Processor::new();
+        processor.write32(0xE000_ED08, 0xffff_ffff).unwrap();
+        assert_eq!(processor.read32(0xE000_ED08), Ok(0xffff_ff80));
+        assert_eq!(processor.vtor, 0xffff_ff80);
     }
 
     // The trap of the derived exception, by the trap mode, when the original is the one taken: the

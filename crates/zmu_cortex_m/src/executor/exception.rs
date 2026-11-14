@@ -10,7 +10,7 @@ use crate::{
     semihosting::{decode_semihostcmd, semihost_return},
 };
 
-use super::ExecuteResult;
+use super::{EXCEPTION_ENTRY_CYCLES, ExecuteResult};
 
 const DFSR_BKPT: u32 = 1 << 1;
 #[cfg(not(feature = "armv6m"))]
@@ -43,16 +43,11 @@ impl IsaException for Processor {
                 return Err(Fault::Forced);
             }
             let return_address = self.get_pc().wrapping_add(2);
-            if let Err(fault) = self.exception_entry(Exception::SVCall, return_address) {
-                // only a vector read error gets here (a failed stacking is handled by
-                // DerivedLateArrival() in the entry): the return address stays SVCall's
-                self.pending_fault_status = Some(FaultStatusContext {
-                    return_address: Some(return_address),
-                    ..FaultStatusContext::default()
-                });
-                return Err(fault);
-            }
-            return Ok(ExecuteSuccess::Branched { cycles: 12 });
+            // a failing entry (stacking, vector) is a derived exception, handled by the entry
+            self.exception_entry(Exception::SVCall, return_address)?;
+            return Ok(ExecuteSuccess::Branched {
+                cycles: EXCEPTION_ENTRY_CYCLES,
+            });
         }
         Ok(ExecuteSuccess::NotTaken)
     }
@@ -96,7 +91,9 @@ impl IsaException for Processor {
                 // which is at once here
                 let return_address = self.get_pc();
                 self.exception_entry(Exception::DebugMonitor, return_address)?;
-                return Ok(ExecuteSuccess::Branched { cycles: 12 });
+                return Ok(ExecuteSuccess::Branched {
+                    cycles: EXCEPTION_ENTRY_CYCLES,
+                });
             }
         }
         Err(Fault::DebugEvt)
