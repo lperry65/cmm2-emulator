@@ -20,6 +20,10 @@ unsafe impl Sync for Saved {}
 static SAVED: Saved = Saved(UnsafeCell::new(MaybeUninit::uninit()));
 static SAVED_FD: AtomicI32 = AtomicI32::new(-1);
 static RAW: AtomicBool = AtomicBool::new(false);
+/// The process that made it raw. A child forked from it has a copy of `RAW` set, but the
+/// terminal is not its to put back: that would undo what its parent has on, and nothing else
+/// tells the two apart.
+static RAW_PID: AtomicI32 = AtomicI32::new(0);
 
 /// Puts the terminal back as it was when dropped.
 pub struct RawMode;
@@ -48,6 +52,8 @@ impl RawMode {
         // SAFETY: RAW is not set, so nothing reads SAVED, and this is the only writer.
         unsafe { (*SAVED.0.get()).write(saved) };
         SAVED_FD.store(fd, Ordering::Relaxed);
+        // SAFETY: getpid takes nothing and cannot fail.
+        RAW_PID.store(unsafe { libc::getpid() }, Ordering::Relaxed);
         RAW.store(true, Ordering::Release);
         // SAFETY: the pointer is to a live termios.
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
@@ -67,9 +73,11 @@ impl Drop for RawMode {
 /// Puts the terminal back if raw mode is on. Doing it twice is harmless. It takes no lock and
 /// calls only tcsetattr, so a signal handler can use it. `RAW` is cleared after the terminal is
 /// back, not before, so that a signal that comes in between still finds it set and puts the
-/// terminal back itself (setting it twice does no harm).
+/// terminal back itself (setting it twice does no harm). A forked child leaves it alone (see
+/// `RAW_PID`); getpid is async-signal-safe too.
 pub fn restore() {
-    if RAW.load(Ordering::Acquire) {
+    // SAFETY: getpid takes nothing and cannot fail.
+    if RAW.load(Ordering::Acquire) && RAW_PID.load(Ordering::Relaxed) == unsafe { libc::getpid() } {
         // SAFETY: RAW was set, so SAVED holds the termios that enable_on wrote, and nothing
         // writes it again while RAW is set. tcsetattr is async-signal-safe.
         unsafe {

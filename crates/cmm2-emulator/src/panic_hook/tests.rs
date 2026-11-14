@@ -247,6 +247,69 @@ fn a_panic_puts_the_terminal_back_on_the_main_thread_and_not_on_another() {
     }
 }
 
+// A child forked from a process that has raw mode on gets a copy of what says so. The signal
+// tests fork like this while other tests have a terminal raw, and a child that put that terminal
+// back would be undoing what is not its own.
+#[test]
+fn a_forked_child_does_not_put_the_terminal_back_that_its_parent_made_raw() {
+    let _turn = PANICS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty fills in two descriptors, which are closed below.
+    unsafe {
+        assert_eq!(
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null()
+            ),
+            0
+        );
+    }
+    let lflag = || {
+        // SAFETY: tcgetattr fills a plain termios.
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            libc::tcgetattr(slave, &mut termios);
+            termios.c_lflag
+        }
+    };
+    let raw = terminal::RawMode::enable_on(slave).unwrap();
+    let in_raw_mode = lflag();
+
+    // SAFETY: the child only calls `restore` (a lock-free tcsetattr) and `_exit`.
+    unsafe {
+        let pid = libc::fork();
+        if pid == 0 {
+            terminal::restore();
+            libc::_exit(0);
+        }
+        let mut status = 0;
+        libc::waitpid(pid, &mut status, 0);
+    }
+    assert_eq!(
+        lflag(),
+        in_raw_mode,
+        "put back by a child that did not make it raw"
+    );
+
+    // The process that made it raw still can.
+    drop(raw);
+    assert_ne!(
+        lflag(),
+        in_raw_mode,
+        "not put back by the process that made it raw"
+    );
+    // SAFETY: closing the two descriptors made above.
+    unsafe {
+        libc::close(master);
+        libc::close(slave);
+    }
+}
+
 // A panic in a `Drop` while a panic is being unwound, which aborts the process. The test
 // below runs this one in a process of its own (it is a test that does nothing without the
 // variable the other sets).
