@@ -20,6 +20,20 @@ use crate::{
     },
 };
 
+/// `CCR.UNALIGN_TRP`, bit 3 (B3.2.8).
+const CCR_UNALIGN_TRP: u32 = 1 << 3;
+
+/// An instruction that always faults on an address that is not aligned (`mask` is 3 for a word,
+/// 1 for a halfword): LDM, STM, PUSH, POP, LDRD, STRD, LDREX, STREX (LDREXH and STREXH on a
+/// halfword), VLDR, VSTR, VLDM, VSTM, VPUSH and VPOP (A3.2.1).
+#[inline(always)]
+pub(crate) fn require_aligned(address: u32, mask: u32) -> Result<(), Fault> {
+    if address & mask != 0 {
+        return Err(Fault::Unaligned);
+    }
+    Ok(())
+}
+
 impl Processor {
     /// The base register of an immediate-offset load. PC is the literal form, and its base is
     /// Align(PC, 4).
@@ -32,6 +46,17 @@ impl Processor {
         }
     }
 
+    /// The alignment faults of A3.2.1. An access that is not naturally aligned faults when
+    /// `CCR.UNALIGN_TRP` is set (the bit reads as one on ARMv6-M, which has no unaligned accesses); the
+    /// instructions that always need alignment check it with `require_aligned` first.
+    #[inline(always)]
+    pub(crate) fn trap_unaligned(&self, address: u32, mask: u32) -> Result<(), Fault> {
+        if address & mask != 0 && self.ccr & CCR_UNALIGN_TRP != 0 {
+            return Err(Fault::Unaligned);
+        }
+        Ok(())
+    }
+
     pub(crate) fn read8_data(&mut self, address: u32) -> Result<u8, Fault> {
         self.read8(address).map_err(|fault| {
             self.fault_with_status(fault, FaultStatusContext::with_fault_address(address))
@@ -39,12 +64,14 @@ impl Processor {
     }
 
     pub(crate) fn read16_data(&mut self, address: u32) -> Result<u16, Fault> {
+        self.trap_unaligned(address, 1)?;
         self.read16(address).map_err(|fault| {
             self.fault_with_status(fault, FaultStatusContext::with_fault_address(address))
         })
     }
 
     pub(crate) fn read32_data(&mut self, address: u32) -> Result<u32, Fault> {
+        self.trap_unaligned(address, 3)?;
         self.read32(address).map_err(|fault| {
             self.fault_with_status(fault, FaultStatusContext::with_fault_address(address))
         })
@@ -57,12 +84,14 @@ impl Processor {
     }
 
     pub(crate) fn write16_data(&mut self, address: u32, value: u16) -> Result<(), Fault> {
+        self.trap_unaligned(address, 1)?;
         self.write16(address, value).map_err(|fault| {
             self.fault_with_status(fault, FaultStatusContext::with_fault_address(address))
         })
     }
 
     pub(crate) fn write32_data(&mut self, address: u32, value: u32) -> Result<(), Fault> {
+        self.trap_unaligned(address, 3)?;
         self.write32(address, value).map_err(|fault| {
             self.fault_with_status(fault, FaultStatusContext::with_fault_address(address))
         })
@@ -388,11 +417,11 @@ impl IsaLoadAndStore for Processor {
             let address = if params.index { offset_address } else { rn };
 
             let value = self.get_r(params.rt);
+            // the base is written back after the access: a fault is precise
+            self.write32_data(address, value)?;
             if params.wback {
                 self.set_r(params.rn, offset_address);
             }
-
-            self.write32_data(address, value)?;
 
             return Ok(ExecuteSuccess::Taken { cycles: 2 });
         }
@@ -408,11 +437,10 @@ impl IsaLoadAndStore for Processor {
             );
 
             let value = self.get_r(params.rt);
+            self.write8_data(address, value.get_bits(0..8) as u8)?;
             if params.wback {
                 self.set_r(params.rn, offset_address);
             }
-
-            self.write8_data(address, value.get_bits(0..8) as u8)?;
 
             return Ok(ExecuteSuccess::Taken { cycles: 2 });
         }
@@ -444,6 +472,8 @@ impl IsaLoadAndStore for Processor {
         if self.condition_passed() {
             let (address, _) = resolve_addressing(self.get_r(params.rn), params.imm32, true, true);
 
+            require_aligned(address, 3)?;
+
             self.set_exclusive_monitors(address, 4);
 
             let data = self.read32_data(address)?;
@@ -473,6 +503,8 @@ impl IsaLoadAndStore for Processor {
     fn exec_ldrexh(&mut self, params: Reg2RtRnParams) -> ExecuteResult {
         if self.condition_passed() {
             let address = self.get_r(params.rn);
+
+            require_aligned(address, 1)?;
             self.set_exclusive_monitors(address, 2);
 
             let data = self.read16_data(address)?;
@@ -489,6 +521,8 @@ impl IsaLoadAndStore for Processor {
     fn exec_strex(&mut self, params: Reg3RdRtRnImm32Params) -> ExecuteResult {
         if self.condition_passed() {
             let (address, _) = resolve_addressing(self.get_r(params.rn), params.imm32, true, true);
+
+            require_aligned(address, 3)?;
 
             if self.exclusive_monitors_pass(address, 4) {
                 self.write32_data(address, self.get_r(params.rt))?;
@@ -528,6 +562,8 @@ impl IsaLoadAndStore for Processor {
             }
             let address = self.get_r(params.rn);
 
+            require_aligned(address, 1)?;
+
             if self.exclusive_monitors_pass(address, 2) {
                 self.write16_data(address, self.get_r(params.rt) as u16)?;
                 self.set_r(params.rd, 0);
@@ -547,6 +583,8 @@ impl IsaLoadAndStore for Processor {
                 params.add,
                 params.index,
             );
+
+            require_aligned(address, 3)?;
 
             let data = self.read32_data(address)?;
             self.set_r(params.rt, data);
@@ -570,6 +608,8 @@ impl IsaLoadAndStore for Processor {
                 params.add,
                 params.index,
             );
+
+            require_aligned(address, 3)?;
 
             let value1 = self.get_r(params.rt);
             self.write32_data(address, value1)?;

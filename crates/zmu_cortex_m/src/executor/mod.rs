@@ -232,8 +232,14 @@ impl Processor {
     /// Count `count` cycles: the cycle counter, DWT and `SysTick`.
     #[inline(always)]
     pub(crate) fn account_cycles(&mut self, count: u32) {
+        self.account_cycles_with(count, true);
+    }
+
+    /// Count `count` cycles, in the DWT too only if `dwt` says so.
+    #[inline(always)]
+    pub(crate) fn account_cycles_with(&mut self, count: u32, dwt: bool) {
         self.cycle_count += u64::from(count);
-        if (self.dwt_ctrl & 1) != 0 {
+        if dwt && (self.dwt_ctrl & 1) != 0 {
             self.dwt_tick(count);
         }
         if (self.syst_csr & 1) != 0 {
@@ -718,8 +724,12 @@ impl ExecutorHelper for Processor {
             Instruction::STMDB { params } => self.exec_stmdb(params),
             Instruction::LDM { params, .. } => self.exec_ldm(params),
 
-            Instruction::PUSH { registers, .. } => self.exec_push(*registers),
-            Instruction::POP { registers, .. } => self.exec_pop(*registers),
+            Instruction::PUSH { registers, thumb32 } => {
+                self.exec_push(*registers, *thumb32 && registers.len() == 1)
+            }
+            Instruction::POP { registers, thumb32 } => {
+                self.exec_pop(*registers, *thumb32 && registers.len() == 1)
+            }
 
             // --------------------------------------------
             //
@@ -903,8 +913,9 @@ impl ExecutorHelper for Processor {
 impl Executor for Processor {
     #[inline(always)]
     fn step_sleep(&mut self) {
-        // the cycle of the sleeping step: the cycle counter, DWT and SysTick (NOTICE.md)
-        self.account_cycles(1);
+        // the cycle of the sleeping step: the cycle counter and SysTick; the DWT only if the
+        // embedder says its clock runs in sleep (`dwt_runs_in_sleep`, NOTICE.md)
+        self.account_cycles_with(1, self.dwt_runs_in_sleep);
         let entered = self.check_exceptions();
         if entered {
             let cycles = self.entry_cycles(false);
@@ -1750,5 +1761,262 @@ mod tests {
         core.set_msp(0x2000_0200);
         core.handle_fault(Fault::UndefInstr, 0x100);
         assert_eq!(core.get_pc(), 0xffff_fffe);
+    }
+
+    // ---- alignment faults (A3.2.1, B3.2.8) ---------------------------------------------------
+
+    #[cfg(not(feature = "armv6m"))]
+    enum Opcode {
+        Half(u16),
+        Wide(u32),
+    }
+
+    // Runs one instruction with the base register (or SP, for the stack ones) at `address`, with
+    // UsageFault enabled, and says whether it raised UNALIGNED (CFSR bit 24).
+    #[cfg(not(feature = "armv6m"))]
+    fn raises_unaligned(opcode: &Opcode, address: u32, unalign_trp: bool, stack: bool) -> bool {
+        use crate::core::instruction::instruction_size;
+        let mut core = Processor::new();
+        #[cfg(feature = "has-fp")]
+        {
+            core.cpacr = 0x00f0_0000;
+        }
+        core.write32(0xE000_ED24, 1 << 18).unwrap(); // USGFAULTENA
+        core.ccr = if unalign_trp { 1 << 3 } else { 0 };
+        core.set_msp(if stack { address } else { 0x2000_0400 });
+        core.set_r(Reg::R0, address);
+        core.set_r(Reg::R1, 1);
+        core.set_r(Reg::R2, 2);
+        core.set_pc(0x100);
+        let instruction = match opcode {
+            Opcode::Half(op) => crate::decoder::decode_16(*op),
+            Opcode::Wide(op) => crate::decoder::decode_32(*op),
+        };
+        core.execute(&instruction, instruction_size(&instruction));
+        let faulted = core.cfsr & (1 << 24) != 0;
+        if faulted {
+            assert_eq!(core.psr.get_isr_number(), 6, "UsageFault");
+        }
+        faulted
+    }
+
+    // The accesses that always fault on an address that is not word aligned, or halfword aligned
+    // for LDREXH and STREXH, whatever CCR.UNALIGN_TRP says; and work on an aligned one.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_the_always_aligned_accesses_fault_on_unaligned_addresses() {
+        use Opcode::{Half, Wide};
+        // (name, opcode, uses SP, offset from an aligned address that is not aligned enough)
+        #[cfg_attr(not(feature = "has-fp"), allow(unused_mut))]
+        let mut rows: Vec<(&str, Opcode, bool, u32)> = vec![
+            ("ldm.w", Wide(0xe890_0006), false, 2),
+            ("stm.w", Wide(0xe880_0006), false, 2),
+            ("stmdb", Wide(0xe900_0006), false, 2),
+            ("ldrd", Wide(0xe9d0_1200), false, 2),
+            ("strd", Wide(0xe9c0_1200), false, 2),
+            ("push {r1}", Half(0xb402), true, 2),
+            ("pop {r1}", Half(0xbc02), true, 2),
+            ("push", Half(0xb406), true, 2),
+            ("pop", Half(0xbc06), true, 2),
+            ("push.w", Wide(0xe92d_0006), true, 2),
+            ("pop.w", Wide(0xe8bd_0006), true, 2),
+            ("ldrex", Wide(0xe850_1f00), false, 2),
+            ("strex", Wide(0xe840_1200), false, 2),
+            ("ldrexh", Wide(0xe8d0_1f5f), false, 1),
+            ("strexh", Wide(0xe8c0_1f52), false, 1),
+        ];
+        #[cfg(feature = "has-fp")]
+        rows.extend(vec![
+            ("vldr d", Wide(0xed90_0b00), false, 2),
+            ("vldr s", Wide(0xed90_0a00), false, 2),
+            ("vstr s", Wide(0xed80_0a00), false, 2),
+            ("vldmia", Wide(0xec90_0b04), false, 2),
+            ("vstmia", Wide(0xec80_0a02), false, 2),
+            ("vldmia s", Wide(0xec90_0a02), false, 2),
+            ("vstmia d", Wide(0xec80_0b04), false, 2),
+            ("vpush", Wide(0xed2d_0a01), true, 2),
+            ("vpop", Wide(0xecbd_0a01), true, 2),
+        ]);
+        let mut wrong = Vec::new();
+        for (name, opcode, stack, offset) in &rows {
+            let base = 0x2000_0300;
+            for trp in [false, true] {
+                if raises_unaligned(opcode, base, trp, *stack) {
+                    wrong.push(format!("{name}: aligned faulted (trp {trp})"));
+                }
+                if !raises_unaligned(opcode, base + offset, trp, *stack) {
+                    wrong.push(format!(
+                        "{name}: unaligned at +{offset} did not fault (trp {trp})"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // LDR, STR, LDRH, LDRSH, STRH and TBH support unaligned addresses, and fault on them only
+    // when CCR.UNALIGN_TRP is set; the byte accesses and the single-register PUSH and POP forms of
+    // 32 bits (STR and LDR with write back) never do.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_the_other_accesses_fault_on_unaligned_addresses_only_with_unalign_trp() {
+        use Opcode::{Half, Wide};
+        // (name, opcode, stack, offset, faults with UNALIGN_TRP)
+        let rows: Vec<(&str, Opcode, bool, u32, bool)> = vec![
+            ("ldr", Half(0x6801), false, 2, true),
+            ("ldr.w", Wide(0xf8d0_1000), false, 1, true),
+            ("str", Half(0x6001), false, 2, true),
+            ("ldrh", Half(0x8801), false, 1, true),
+            ("strh", Half(0x8001), false, 1, true),
+            ("ldrsh.w", Wide(0xf9b0_1000), false, 1, true),
+            ("tbh", Wide(0xe8d0_f011), false, 1, true),
+            ("ldrb", Half(0x7801), false, 1, false),
+            ("strb", Half(0x7001), false, 1, false),
+            ("ldrex b", Wide(0xe8d0_1f4f), false, 1, false),
+            ("push {r1} (T3)", Wide(0xf84d_1d04), true, 2, true),
+            ("pop {r1} (T3)", Wide(0xf85d_1b04), true, 2, true),
+        ];
+        let mut wrong = Vec::new();
+        for (name, opcode, stack, offset, trapped) in &rows {
+            // TBH takes the table address from r0 + r1 * 2 with r1 = 1, so it starts 2 lower
+            // TBH takes the table address from r0 + r1 * 2 with r1 = 1, so r0 starts 2 lower
+            let base = 0x2000_0300
+                - if matches!(opcode, Wide(0xe8d0_f011)) {
+                    2
+                } else {
+                    0
+                };
+            if raises_unaligned(opcode, base + offset, false, *stack) {
+                wrong.push(format!("{name}: faulted without UNALIGN_TRP"));
+            }
+            if raises_unaligned(opcode, base + offset, true, *stack) != *trapped {
+                wrong.push(format!(
+                    "{name}: with UNALIGN_TRP, expected fault {trapped}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // The fault is recorded when UsageFault is disabled too: it is escalated to HardFault (FORCED),
+    // and the UFSR bit is set all the same (B1.5.14).
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_an_alignment_fault_is_escalated_with_usagefault_disabled() {
+        use crate::core::instruction::instruction_size;
+        let mut core = Processor::new();
+        core.set_msp(0x2000_0400);
+        core.set_r(Reg::R0, 0x2000_0302);
+        core.set_pc(0x100);
+        let instruction = crate::decoder::decode_32(0xe890_0006); // ldm.w r0, {r1, r2}
+        core.execute(&instruction, instruction_size(&instruction));
+        assert_eq!(core.psr.get_isr_number(), 3);
+        assert_eq!(core.cfsr & (1 << 24), 1 << 24);
+        assert_eq!(core.hfsr & (1 << 30), 1 << 30, "FORCED");
+        // nothing was loaded and the base was not written back
+        assert_eq!(core.get_r(Reg::R1), 0);
+    }
+
+    // The fault comes before any access or write back: an LDM that is refused loads nothing, and
+    // a POP leaves SP where it was.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_refused_access_changes_nothing() {
+        use crate::core::instruction::instruction_size;
+        let mut core = Processor::new();
+        core.write32(0xE000_ED24, 1 << 18).unwrap();
+        core.ccr = 0;
+        core.set_msp(0x2000_0302);
+        core.set_pc(0x100);
+        let instruction = crate::decoder::decode_16(0xbc06); // pop {r1, r2}
+        core.execute(&instruction, instruction_size(&instruction));
+        assert_eq!(core.cfsr & (1 << 24), 1 << 24);
+        // UsageFault entry stacked the frame on the same stack: SP is 0x20 below what it was
+        assert_eq!(core.get_msp(), 0x2000_0302 - 0x20);
+    }
+
+    // The fault is precise: the base register keeps its value for every form that writes it back,
+    // and SP for POP (T3 too, whose only check is the UNALIGN_TRP one).
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_faulting_access_leaves_the_base_register_alone() {
+        use crate::core::instruction::instruction_size;
+        let mut wrong = Vec::new();
+        // (name, opcode, base register value, UNALIGN_TRP)
+        for (name, opcode, base, trp) in [
+            ("str r1, [r0, #-4]!", 0xf840_1d04_u32, 0x2000_0301_u32, true),
+            ("str r1, [r0], #4", 0xf840_1b04, 0x2000_0301, true),
+            ("strh r1, [r0, #-2]!", 0xf820_1d02, 0x2000_0303, true),
+            ("ldr r1, [r0, #-4]!", 0xf850_1d04, 0x2000_0301, true),
+            ("ldrh r1, [r0], #2", 0xf830_1b02, 0x2000_0301, true),
+            ("strd r1, r2, [r0, #-8]!", 0xe960_1202, 0x2000_0302, false),
+            ("ldrd r1, r2, [r0], #8", 0xe8f0_1202, 0x2000_0302, false),
+            ("strb r1, [r0, #-4]!", 0xf800_1d04, 0x1fff_0004, false), // unmapped: a bus fault
+        ] {
+            let mut core = Processor::new();
+            core.write32(0xE000_ED24, (1 << 18) | (1 << 17)).unwrap();
+            core.ccr = if trp { 1 << 3 } else { 0 };
+            core.set_msp(0x2000_0400);
+            core.set_r(Reg::R0, base);
+            core.set_pc(0x100);
+            let instruction = crate::decoder::decode_32(opcode);
+            core.execute(&instruction, instruction_size(&instruction));
+            if core.get_r(Reg::R0) != base {
+                wrong.push(format!("{name}: r0 is {:#x}", core.get_r(Reg::R0)));
+            }
+        }
+        // POP T3 with UNALIGN_TRP
+        let mut core = Processor::new();
+        core.write32(0xE000_ED24, 1 << 18).unwrap();
+        core.ccr = 1 << 3;
+        core.set_msp(0x2000_0302);
+        core.set_pc(0x100);
+        let instruction = crate::decoder::decode_32(0xf85d_1b04); // pop {r1}
+        core.execute(&instruction, instruction_size(&instruction));
+        if core.cfsr & (1 << 24) == 0 {
+            wrong.push("pop {r1}: no fault".to_string());
+        }
+        // the entry lowered SP by the frame only
+        if core.get_msp() != 0x2000_0302 - 0x20 {
+            wrong.push(format!("pop {{r1}}: SP is {:#x}", core.get_msp()));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // LDREXH and STREXH need halfword alignment only.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_halfword_exclusives_accept_halfword_aligned_addresses() {
+        for opcode in [0xe8d0_1f5f_u32, 0xe8c0_1f52] {
+            let opcode = Opcode::Wide(opcode);
+            assert!(!raises_unaligned(&opcode, 0x2000_0302, false, false));
+            assert!(raises_unaligned(&opcode, 0x2000_0301, false, false));
+        }
+    }
+
+    // ARMv6-M has no unaligned accesses: they fault, to HardFault (there is no UsageFault), and
+    // the byte accesses do not; CCR reads UNALIGN_TRP and STKALIGN as one and ignores writes.
+    #[test]
+    #[cfg(feature = "armv6m")]
+    fn test_armv6m_unaligned_accesses_fault_to_hardfault() {
+        use crate::bus::Bus;
+        use crate::core::instruction::instruction_size;
+        for (name, opcode, faults) in [
+            ("ldr", 0x6801_u16, true),
+            ("ldrh", 0x8801, true),
+            ("ldm", 0xc806, true),
+            ("ldrb", 0x7801, false),
+        ] {
+            let mut core = Processor::new();
+            core.set_msp(0x2000_0400);
+            core.set_r(Reg::R0, 0x2000_0301);
+            core.set_pc(0x100);
+            let instruction = crate::decoder::decode_16(opcode);
+            core.execute(&instruction, instruction_size(&instruction));
+            assert_eq!(core.psr.get_isr_number() == 3, faults, "{name}");
+        }
+        let mut core = Processor::new();
+        core.write32(0xE000_ED14, 0).unwrap();
+        assert_eq!(core.read32(0xE000_ED14), Ok((1 << 3) | (1 << 9)));
     }
 }

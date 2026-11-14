@@ -4,6 +4,7 @@ use crate::core::instruction::{
 };
 
 use super::ExecuteResult;
+use super::load_and_store::require_aligned;
 use crate::core::{
     instruction::VLoadAndStoreParams,
     register::{BaseReg, ExtensionReg, ExtensionRegOperations, Reg},
@@ -38,6 +39,7 @@ impl IsaFloatingPointLoadAndStore for Processor {
             } else {
                 base.wrapping_sub(params.imm32)
             };
+            require_aligned(address, 3)?;
             match params.dd {
                 ExtensionReg::Single { reg } => {
                     let data = self.read32_data(address)?;
@@ -66,6 +68,7 @@ impl IsaFloatingPointLoadAndStore for Processor {
             } else {
                 base.wrapping_sub(params.imm32)
             };
+            require_aligned(address, 3)?;
             match params.dd {
                 ExtensionReg::Single { reg } => {
                     let value = self.get_sr(reg);
@@ -93,6 +96,7 @@ impl IsaFloatingPointLoadAndStore for Processor {
             } else {
                 base.wrapping_sub(params.imm32)
             };
+            require_aligned(address, 3)?;
 
             if params.write_back {
                 let write_back_value = if params.mode == AddressingMode::IncrementAfter {
@@ -129,6 +133,7 @@ impl IsaFloatingPointLoadAndStore for Processor {
             } else {
                 base.wrapping_sub(params.imm32)
             };
+            require_aligned(address, 3)?;
 
             if params.write_back {
                 let write_back_value = if params.mode == AddressingMode::IncrementAfter {
@@ -156,6 +161,7 @@ impl IsaFloatingPointLoadAndStore for Processor {
 
             let sp = self.get_r(Reg::SP);
             let mut address = sp.wrapping_sub(params.imm32);
+            require_aligned(address, 3)?;
             self.set_r(Reg::SP, address);
 
             if params.single_regs {
@@ -189,6 +195,7 @@ impl IsaFloatingPointLoadAndStore for Processor {
 
             let sp = self.get_r(Reg::SP);
             let mut address = sp;
+            require_aligned(address, 3)?;
             self.set_r(Reg::SP, sp.wrapping_add(params.imm32));
             if params.single_regs {
                 for reg in &params.single_precision_registers {
@@ -223,6 +230,7 @@ impl IsaFloatingPointLoadAndStore for Processor {
             } else {
                 self.get_r(params.rn).wrapping_sub(params.imm32)
             };
+            require_aligned(address, 3)?;
 
             if params.write_back {
                 let write_back_value = if params.mode == AddressingMode::IncrementAfter {
@@ -259,6 +267,7 @@ impl IsaFloatingPointLoadAndStore for Processor {
             } else {
                 self.get_r(params.rn).wrapping_sub(params.imm32)
             };
+            require_aligned(address, 3)?;
 
             if params.write_back {
                 let write_back_value = if params.mode == AddressingMode::IncrementAfter {

@@ -79,7 +79,7 @@ impl Processor {
         self.system_reset_requested = false;
         self.scr = 0;
         // STKALIGN resets to an IMPLEMENTATION DEFINED value, Arm recommends 1 (B3.2, p. B3-605)
-        self.ccr = if cfg!(feature = "armv7em") { 1 << 9 } else { 0 };
+        self.ccr = crate::CCR_RESET;
         self.dwt_ctrl = 0x4000_0000;
         self.exceptions_reset();
         self.reset_scb_fault_state();
@@ -88,6 +88,8 @@ impl Processor {
         //self.event_reg.clear();
 
         self.itstate = 0;
+        // a reset is no exception return: what is taken after it is no tail-chain
+        self.exception_returned = false;
         // a reset leaves a lockup (B1-555), and the core runs again
         if self.locked_up {
             self.locked_up = false;

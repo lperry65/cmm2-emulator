@@ -241,10 +241,13 @@ impl Bus for Processor {
             }
             0xE000_ED10 => self.write_scr(value),
             0xE000_ED14 => {
-                // ARMv6-M has no NONBASETHRDENA (bit 0)
+                // ARMv6-M's CCR is read-only (UNALIGN_TRP and STKALIGN read as one)
+                #[cfg(not(feature = "armv6m"))]
+                {
+                    self.ccr = value;
+                }
                 #[cfg(feature = "armv6m")]
-                let value = value & !1;
-                self.ccr = value;
+                let _ = value;
             }
             0xE000_ED24 => self.write_shcsr(value),
             #[cfg(not(feature = "armv6m"))]
@@ -716,8 +719,9 @@ mod tests {
         assert_eq!(processor.bfar, 0x2001_fffe);
     }
 
-    // Every kind of data access latches the address of a precise bus fault, and not only the
-    // single loads and stores: the multiple loads and stores, the FP ones and the table branches.
+    // Every kind of data access latches the address of its fault, and not only the single loads
+    // and stores: the multiple loads and stores, the FP ones (which need aligned addresses, so they
+    // run off the end of RAM) and the table branches (which can straddle it).
     #[test]
     #[cfg(not(feature = "armv6m"))]
     fn test_every_data_access_latches_bfar_on_a_precise_bus_fault() {
@@ -747,15 +751,19 @@ mod tests {
                 processor.cpacr = 0x00f0_0000;
             }
             processor.write32(0xE000_ED24, 1 << 17).unwrap(); // BUSFAULTENA
-            processor.set_r(Reg::R0, 0x2001_fffe);
+            // word aligned (these instructions fault on any other address, A3.2.1): the first
+            // word is in RAM and the second is past its end
+            processor.set_r(Reg::R0, 0x2001_fffc);
             processor.set_pc(0x100);
 
             let instruction = decode_32(opcode);
             processor.execute(&instruction, instruction_size(&instruction));
 
-            assert_eq!(processor.cfsr & (1 << 9), 1 << 9, "{name}: PRECISERR");
-            assert_eq!(processor.cfsr & (1 << 15), 1 << 15, "{name}: BFARVALID");
-            assert_eq!(processor.bfar, 0x2001_fffe, "{name}");
+            // an aligned word cannot straddle the end of RAM: the second word is past it, a
+            // data access violation whose address is latched in MMFAR
+            assert_eq!(processor.cfsr & (1 << 1), 1 << 1, "{name}: DACCVIOL");
+            assert_eq!(processor.cfsr & (1 << 7), 1 << 7, "{name}: MMARVALID");
+            assert_eq!(processor.mmfar, 0x2002_0000, "{name}");
         }
 
         // tbh [r0, r1, lsl #1]: the table halfword runs past the end

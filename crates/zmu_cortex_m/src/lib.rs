@@ -84,6 +84,16 @@ enum CachedInstruction {
         status: FaultStatusContext,
     },
 }
+/// CCR at reset: STKALIGN set on the Cortex-M7 build; on ARMv6-M `UNALIGN_TRP` and `STKALIGN` both
+/// read as one (and the register is read-only).
+pub(crate) const CCR_RESET: u32 = if cfg!(feature = "armv6m") {
+    (1 << 3) | (1 << 9)
+} else if cfg!(feature = "armv7em") {
+    1 << 9
+} else {
+    0
+};
+
 ///
 /// Representation of all Processor related data
 ///
@@ -156,6 +166,10 @@ pub struct Processor {
     /// The vector table address `reset()` loads into VTOR (the boot address, INITVTOR on the
     /// Cortex-M7; zero by default). The embedder sets it to boot from where the firmware is.
     pub boot_address: u32,
+    /// `DBGMCU_CR.DBGSLEEP_D1` on the STM32H7: whether the DWT cycle counter counts while the core
+    /// sleeps (WFI). Off by default, as on the chip, where the CPU clock that drives the DWT stops
+    /// in `CSleep` (RM0433 6.7.5, 8.5.12).
+    pub dwt_runs_in_sleep: bool,
     /// An exception return was made in the current step: an exception taken at its end is
     /// tail-chained.
     pub(crate) exception_returned: bool,
@@ -379,6 +393,7 @@ impl Processor {
             locked_up: false,
             exception_return_faulted: false,
             boot_address: 0,
+            dwt_runs_in_sleep: false,
             exception_returned: false,
             running: true,
             exit_code: 0,
@@ -394,7 +409,7 @@ impl Processor {
             aircr: 0xFA05_0000,
             system_reset_requested: false,
             scr: 0,
-            ccr: if cfg!(feature = "armv7em") { 1 << 9 } else { 0 },
+            ccr: CCR_RESET,
             shcsr: 0,
             cfsr: 0,
             dfsr: 0,

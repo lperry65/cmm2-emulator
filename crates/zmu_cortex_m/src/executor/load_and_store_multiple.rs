@@ -1,4 +1,5 @@
 use super::ExecuteResult;
+use super::load_and_store::require_aligned;
 use crate::Processor;
 use crate::executor::{ExecuteSuccess, ExecutorHelper};
 
@@ -13,8 +14,10 @@ pub trait IsaLoadAndStoreMultiple {
     fn exec_stm(&mut self, params: &LoadAndStoreMultipleParams) -> ExecuteResult;
     fn exec_stmdb(&mut self, params: &LoadAndStoreMultipleParams) -> ExecuteResult;
     fn exec_ldm(&mut self, params: &LoadAndStoreMultipleParams) -> ExecuteResult;
-    fn exec_push(&mut self, registers: EnumSet<Reg>) -> ExecuteResult;
-    fn exec_pop(&mut self, registers: EnumSet<Reg>) -> ExecuteResult;
+    /// `unaligned_allowed` is the single-register 32-bit form (STR/LDR with write back,
+    /// A7.7.99 T3, A7.7.101 T3); the others need a word-aligned stack (A3.2.1).
+    fn exec_push(&mut self, registers: EnumSet<Reg>, unaligned_allowed: bool) -> ExecuteResult;
+    fn exec_pop(&mut self, registers: EnumSet<Reg>, unaligned_allowed: bool) -> ExecuteResult;
 }
 
 impl IsaLoadAndStoreMultiple for Processor {
@@ -23,6 +26,8 @@ impl IsaLoadAndStoreMultiple for Processor {
             let regs_size = 4 * (params.registers.len() as u32);
 
             let mut address = self.get_r(params.rn);
+
+            require_aligned(address, 3)?;
 
             for reg in &params.registers {
                 let r = self.get_r(reg);
@@ -46,6 +51,8 @@ impl IsaLoadAndStoreMultiple for Processor {
 
             let mut address = self.get_r(params.rn).wrapping_sub(regs_size);
 
+            require_aligned(address, 3)?;
+
             for reg in &params.registers {
                 let r = self.get_r(reg);
                 self.write32_data(address, r)?;
@@ -67,6 +74,8 @@ impl IsaLoadAndStoreMultiple for Processor {
             let regs_size = 4 * (params.registers.len() as u32);
 
             let mut address = self.get_r(params.rn);
+
+            require_aligned(address, 3)?;
 
             let mut branched = false;
             for reg in &params.registers {
@@ -92,11 +101,14 @@ impl IsaLoadAndStoreMultiple for Processor {
         Ok(ExecuteSuccess::NotTaken)
     }
 
-    fn exec_push(&mut self, registers: EnumSet<Reg>) -> ExecuteResult {
+    fn exec_push(&mut self, registers: EnumSet<Reg>, unaligned_allowed: bool) -> ExecuteResult {
         if self.condition_passed() {
             let regs_size = 4 * (registers.len() as u32);
             let sp = self.get_r(Reg::SP);
             let mut address = sp.wrapping_sub(regs_size);
+            if !unaligned_allowed {
+                require_aligned(address, 3)?;
+            }
 
             for reg in &registers {
                 let value = self.get_r(reg);
@@ -112,16 +124,29 @@ impl IsaLoadAndStoreMultiple for Processor {
         Ok(ExecuteSuccess::NotTaken)
     }
 
-    fn exec_pop(&mut self, registers: EnumSet<Reg>) -> ExecuteResult {
+    fn exec_pop(&mut self, registers: EnumSet<Reg>, unaligned_allowed: bool) -> ExecuteResult {
         if self.condition_passed() {
             let regs_size = 4 * (registers.len() as u32);
             let sp = self.get_r(Reg::SP);
             let mut address = sp;
+            if unaligned_allowed {
+                // LDR with write back: only the UNALIGN_TRP rule, and before SP moves
+                self.trap_unaligned(address, 3)?;
+            } else {
+                require_aligned(address, 3)?;
+            }
 
             self.set_r(Reg::SP, sp.wrapping_add(regs_size));
 
             for reg in &registers {
-                let val = self.read32_data(address)?;
+                let val = match self.read32_data(address) {
+                    Ok(val) => val,
+                    Err(fault) => {
+                        // the fault is precise: SP is where it was
+                        self.set_r(Reg::SP, sp);
+                        return Err(fault);
+                    }
+                };
                 if reg == Reg::PC {
                     self.bx_write_pc(val)?;
                 } else {

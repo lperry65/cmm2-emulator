@@ -133,7 +133,9 @@ fn test_branches_wrap_the_target() {
     assert_eq!(core.get_pc(), 4u32.wrapping_sub(252));
 }
 
+// TBH at an odd address needs unaligned accesses, which an armv6m build (no TBH anyway) refuses
 #[test]
+#[cfg(not(feature = "armv6m"))]
 fn test_table_branches_wrap_the_table_address() {
     let mut core = processor();
 

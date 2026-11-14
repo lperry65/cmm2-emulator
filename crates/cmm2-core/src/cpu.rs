@@ -243,6 +243,8 @@ impl Cpu {
             self.memory.borrow_mut().tick();
         }
         self.processor.step();
+        // (A pending Reset exception would reset the core only, inside `step`, not the peripherals
+        // and interrupt lines that `reset()` below does; nothing pends one.)
         if self.processor.system_reset_requested {
             self.reset();
         }

@@ -432,19 +432,17 @@ impl Processor {
                     || self.is_lockup(Exception::HardFault)
                 {
                     entry.lockup = true;
-                    // a vector read error at NMI entry locks up at -2 whatever the running
-                    // priority, at HardFault entry at -1 (B1-556)
-                    lockup_priority = match taken {
-                        Exception::NMI => -2,
-                        Exception::HardFault => -1,
-                        _ => lockup_priority,
-                    };
+                    // A vector read error at NMI entry locks up at -2 whatever the running priority
+                    // (the default for an original NMI), at HardFault entry at -1 (B1-556): the
+                    // HardFault taken first for a failed NMI stacking is such a case.
+                    if taken == Exception::HardFault {
+                        lockup_priority = -1;
+                    }
                 } else {
                     self.pend_after_failed_entry(taken, taken == derived, source);
                     entry.taken = Exception::HardFault;
                     if self.exception_taken(Exception::HardFault).is_err() {
                         entry.lockup = true;
-                        lockup_priority = -1;
                     }
                 }
             }
@@ -1130,8 +1128,11 @@ impl ExceptionHandling for Processor {
             self.clear_pending_exception(exception);
             let pc = self.get_pc();
             if exception == Exception::Reset {
-                // a pending Reset: it can fail reading the initial SP and PC, which is a lockup
-                // at priority -1 with the lockup address 0xFFFFFFFE (B1-556), and no entry
+                // A pending Reset resets the core only, not the machine around it (an embedder's
+                // reset, such as cmm2's `Cpu::reset`, does the peripherals and the interrupt
+                // lines); nothing pends Reset today. It can fail reading the initial SP and PC,
+                // which is a lockup at priority -1 with the lockup address 0xFFFFFFFE (B1-556),
+                // and no entry.
                 if let Err(fault) = self.reset() {
                     // `reset()` has made the lockup; this only reports it
                     let active_exception = self.active_exception();
@@ -3587,8 +3588,8 @@ mod tests {
         assert_eq!(processor.psr.get_isr_number(), 6);
     }
 
-    // UFSR.UNALIGNED, bit 24. The core checks no alignment, so it never raises Fault::Unaligned
-    // itself (NOTICE.md); a fault that is raised is recorded.
+    // UFSR.UNALIGNED, bit 24. The alignment checks raise Fault::Unaligned (see the alignment
+    // tests in executor/mod.rs); a fault that is raised is recorded here too.
     #[test]
     #[cfg(not(feature = "armv6m"))]
     fn test_an_unaligned_fault_sets_unaligned() {
@@ -3691,5 +3692,19 @@ mod tests {
         processor.exception_entry(Exception::NMI, 0x100).unwrap();
         assert!(processor.is_locked_up());
         assert_eq!(processor.execution_priority, -2);
+    }
+
+    // A stacking failure on NMI entry from priority 0 or above: the escalated HardFault is taken
+    // first (it is derived and escalated), its vector cannot be read, and that is a lockup at -1
+    // (B1-556), not the -2 of an NMI.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_hardfault_vector_error_after_an_nmi_stacking_failure_locks_up_at_minus_one() {
+        let mut processor = processor_with_a_vector_table_of(0xc); // vectors 0 to 2: no HardFault
+        processor.set_msp(0x2002_0004);
+        processor.execution_priority = processor.get_execution_priority();
+        processor.exception_entry(Exception::NMI, 0x100).unwrap();
+        assert!(processor.is_locked_up());
+        assert_eq!(processor.execution_priority, -1);
     }
 }

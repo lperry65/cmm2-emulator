@@ -825,4 +825,117 @@ mod tests {
         assert!(!simulation.processor.running);
         assert_eq!(simulation.processor.get_pc(), 0xffff_fffe);
     }
+
+    // The DWT cycle counter stops while the core sleeps, as on the STM32H7 (the CPU clock stops in
+    // CSleep) unless DBGSLEEP_D1 is set; SysTick and the cycle count go on.
+    #[test]
+    fn test_the_dwt_does_not_count_in_sleep_unless_asked_to() {
+        for (runs_in_sleep, expected) in [(false, 0_u32), (true, 3)] {
+            let mut simulation = simulation_with_a_pendsv_handler();
+            simulation.processor.dwt_ctrl |= 1;
+            simulation.processor.dwt_runs_in_sleep = runs_in_sleep;
+            simulation.processor.sleeping = true;
+            let cycles = simulation.processor.cycle_count;
+            for _ in 0..3 {
+                simulation.step();
+            }
+            assert_eq!(simulation.processor.dwt_cyccnt, expected, "{runs_in_sleep}");
+            assert_eq!(simulation.processor.cycle_count, cycles + 3);
+        }
+    }
+
+    // SysTick counts in sleep: it has to wake the core.
+    #[test]
+    fn test_systick_counts_in_sleep() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.syst_csr = 1;
+        simulation.processor.syst_rvr = 100;
+        simulation.processor.syst_cvr = 50;
+        simulation.processor.sleeping = true;
+        simulation.step();
+        assert_eq!(simulation.processor.syst_cvr, 49);
+    }
+
+    // A pending Reset is no exception entry, so it is not a tail-chain either: after an exception
+    // return it costs the 12 cycles, not the 6.
+    #[test]
+    fn test_a_pending_reset_after_an_exception_return_costs_the_entry_cycles() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.set_pc(0x44);
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        simulation.step();
+        let (plain, _) = cycles_of_a_return_from_pendsv(false);
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.set_pc(0x44);
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        simulation.step();
+        simulation.processor.set_exception_pending(Exception::Reset);
+        let cycles = simulation.processor.cycle_count;
+        simulation.step();
+        assert_eq!(simulation.processor.cycle_count - cycles, plain + 12);
+    }
+
+    // The exception-return flag does not leak: a failed return that does not lock up (INVPC from
+    // PendSV, escalated to HardFault and entered), then a data fault in the HardFault handler that
+    // does lock up, reports the PC of the faulting instruction, not 0xFFFFFFFE.
+    #[test]
+    fn test_the_exception_return_flag_does_not_leak_into_a_later_lockup() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        // the HardFault handler is `ldr r0, [r1]` at 0x4e, with r1 unmapped
+        simulation.processor.write32(0x4c, 0x6808_4770).unwrap();
+        simulation.processor.write32(0x0c, 0x4f).unwrap();
+        simulation
+            .processor
+            .test_set_active_exception(Exception::PendSV);
+        simulation.processor.execution_priority = simulation.processor.get_execution_priority();
+        simulation.processor.set_r(Reg::LR, 0xffff_fff0); // not an EXC_RETURN: INVPC
+        simulation.processor.set_pc(0x4c); // bx lr
+        simulation.step();
+        assert_eq!(
+            simulation.processor.psr.get_isr_number(),
+            3,
+            "HardFault entered"
+        );
+        assert!(!simulation.processor.is_locked_up());
+        let _ = simulation.processor.take_pending_fault_trap();
+        simulation.processor.set_r(Reg::R1, 0x1fff_0000);
+        simulation.step();
+        assert!(simulation.processor.is_locked_up());
+        assert_eq!(simulation.processor.get_pc(), 0x4e);
+    }
+
+    // and the other way: a return that works (NMI back to the HardFault handler) leaves no flag
+    // for the data fault that then locks the handler up.
+    #[test]
+    fn test_a_successful_exception_return_leaves_no_flag_for_a_later_lockup() {
+        const FRAME: u32 = 0x2000_00e0;
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.write32(0x4c, 0x6808_4770).unwrap(); // bx lr; ldr r0, [r1] at 0x4e
+        simulation
+            .processor
+            .test_set_active_exception(Exception::HardFault);
+        simulation
+            .processor
+            .test_set_active_exception(Exception::NMI);
+        simulation.processor.execution_priority = simulation.processor.get_execution_priority();
+        simulation.processor.set_msp(FRAME);
+        simulation.processor.write32(FRAME + 0x18, 0x4e).unwrap();
+        simulation
+            .processor
+            .write32(FRAME + 0x1c, (1 << 24) | 3)
+            .unwrap();
+        simulation.processor.set_r(Reg::LR, 0xffff_fff1); // back to the HardFault handler
+        simulation.processor.set_pc(0x4c);
+        simulation.step();
+        assert_eq!(simulation.processor.get_pc(), 0x4e, "the return worked");
+        assert!(!simulation.processor.is_locked_up());
+        simulation.processor.set_r(Reg::R1, 0x1fff_0000);
+        simulation.step();
+        assert!(simulation.processor.is_locked_up());
+        assert_eq!(simulation.processor.get_pc(), 0x4e);
+    }
 }

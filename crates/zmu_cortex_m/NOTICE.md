@@ -108,8 +108,8 @@ The firmware needs a few things zmu does not do, so I changed the following.
     address too. A multi-byte access that starts in RAM or flash and runs past its end is a precise
     bus fault (PRECISERR, with BFAR holding the address; it used to slice out of range). Every data
     access sets BFAR this way, the multiple loads and stores, the FP ones and the table branches
-    too; they called the bus directly. A lazy FP state save is not one. The crate does not check
-    alignment anywhere, so an unaligned LDM or VLDR does not fault UNALIGNED first.
+    too; they called the bus directly. A lazy FP state save is not one. The alignment faults come
+    first (below).
   - An unknown semihosting operation, an open with a name that is not UTF-8, and a write or a file
     name of more than 1 MiB, set r0 to -1 and carry on; the callback is not called.
     `decode_semihostcmd` returns `Ok(None)` for them. With no callback set, BKPT #0xab does not read
@@ -157,16 +157,17 @@ The firmware needs a few things zmu does not do, so I changed the following.
       NestedActivation, counted before it, against 0, which can never be true).
   - A synchronous fault is taken as itself when it is enabled and its priority is higher than the
     execution priority (so PRIMASK, BASEPRI and FAULTMASK count), and is otherwise escalated to
-    HardFault. A HardFault at an execution priority below 0 (HardFault or NMI running, or
-    FAULTMASK) is a lockup. Checked against ExecutionPriority() (DDI0403E.e B1.5.4, pp. B1-528,
-    B1-529: PRIGROUP applied to the active exceptions and to BASEPRI, PRIMASK 0, FAULTMASK -1),
-    Priority escalation (p. B1-529: a synchronous fault or SVC whose group priority is not higher
-    than the execution priority, or a disabled configurable fault) and B1.5.15 (pp. B1-555,
-    B1-556: lockup is a fault at a priority below 0, HardFault, NMI or FAULTMASK); the code agrees
-    with them. A priority that is not a group priority compares the same, since the execution
-    priority is always a multiple of the group size. It used to be escalated only when disabled, and a lockup only when the IPSR said
-    HardFault or NMI. The exception reported as running is the one in the IPSR when it is active,
-    and otherwise the active one of the highest group priority, the lower number among equals.
+    HardFault. A HardFault at an execution priority below 0 (HardFault or NMI running, or FAULTMASK)
+    is a lockup. Checked against ExecutionPriority() (DDI0403E.e B1.5.4, pp. B1-528, B1-529:
+    PRIGROUP applied to the active exceptions and to BASEPRI, PRIMASK 0, FAULTMASK -1), Priority
+    escalation (p. B1-529: a synchronous fault or SVC whose group priority is not higher than the
+    execution priority, or a disabled configurable fault) and B1.5.15 (pp. B1-555, B1-556: lockup is
+    a fault at a priority below 0, HardFault, NMI or FAULTMASK); the code agrees with them. A
+    priority that is not a group priority compares the same, since the execution priority is always
+    a multiple of the group size. It used to be escalated only when disabled, and a lockup only when
+    the IPSR said HardFault or NMI. The exception reported as running is the one in the IPSR when it
+    is active, and otherwise the active one of the highest group priority, the lower number among
+    equals.
   - `decode_imm_shift` reads the two type bits (it read three and had a `todo!()`); no decoder
     passed a third bit.
   - A D register number above 15 is UNDEFINED, because the FPU has 16 doubles (FPv5-D16), and used
@@ -278,60 +279,63 @@ The firmware needs a few things zmu does not do, so I changed the following.
     returns how it ended.
   - an exception selected by `check_exceptions` counts as that step's exception entry, whether the
     entry worked or failed; the GDB step after a halt (a BKPT, or a breakpoint or watchpoint from
-    the debugger's list: C1-695 applies whenever the core leaves Debug state) takes it instead of
-    an instruction. Every path that enters an exception counts the 12 cycles of an entry
-    (`EXCEPTION_ENTRY_CYCLES`) in the cycle counter, DWT and SysTick: SVC and faults as before,
-    and now an exception taken after an instruction or from sleep (it counted 0), and the
-    after-halt entry. 12 is the interrupt latency ARM gives for the Cortex-M7 with zero-wait-state
-    memory (the same as the Cortex-M3 and M4); wait states in the real memories add to it.
-    An exception taken straight after an exception return in the same step is tail-chained and
-    counts 6 cycles (`EXCEPTION_TAIL_CHAIN_CYCLES`). 6 is the figure ARM gives for the Cortex-M3
-    and M4 (their TRMs and the Generic User Guides); I have not found an authoritative figure for
-    the Cortex-M7 and do not have its TRM, so it is the M3/M4 one, unverified for the M7. The
-    emulator still does the unstacking and stacking, only the count is the tail-chain's. A lockup
-    enters nothing, and is a state of the core (`Processor::locked_up`, `is_locked_up()`, set by
-    `lock_up()`; it is not inferred from `running`, which a semihosting exit also clears). On every
-    path that finds one (a fault, the entry of an SVC or BKPT, and an exception taken after an
-    instruction, from sleep, after a halt or after an exception return, where it is not a
-    tail-chain either) the step counts the one cycle of the fetch of the lockup address (B1.5.15)
-    and the core stops, with the priority of the lockup (-1 at least). While it is locked up
-    `step()` executes nothing and takes no exception except an NMI, or a pending reset (B1-555):
-    each further step counts the 1 cycle, and re-queues no trap; an NMI whose entry works leaves
-    the lockup (this was broken before: an NMI in a HardFault lockup was never taken) and counts
-    a full entry. A lockup from a failed stacking or vector read sets PC = 0xFFFFFFFE, the
-    lockup address of B1-556; one from an instruction keeps the PC of that instruction. A pending
-    Reset whose initial SP and PC cannot be read is a lockup at priority -1 at that address
-    (B1-556), reported as one, with HFSR.VECTTBL and no FORCED, and counts 1. (`Processor::
-    entry_cycles` is the one place that decides what a step counts.)
-    Lockup priorities follow B1-556 to B1-558: a vector read error at NMI entry locks up at -2
-    whatever the running priority, at HardFault entry and at reset at -1; INVPC on a return from
-    the NMI handler to an execution priority of -1 at -2; a stacking failure on NMI entry at -1 or
-    -2 (IMPLEMENTATION DEFINED, -2 here, so that the NMI is not entered again); the rest at the
-    priority the core runs at. `lock_up(priority)` sets it. What leaves a lockup is what can
-    preempt its priority: an NMI from one at -1 (B1-555 names the HardFault handler; FAULTMASK and
-    the reset handler are at -1 as well), a reset from either, nothing from one at -2 but a
-    reset (`lockup_can_end()` says so; cmm2-core's `run_loop` steps a lockup that can end and
-    stops with a fault ("core locked up") otherwise; the machine pends no NMI today). The lockup
-    address is 0xFFFFFFFE for a failed stacking or vector read, INVPC and a bus or MemManage
-    fault on unstacking (the PC is set to it: `bx lr` is where it was before), and the PC of the
-    instruction otherwise. A reset (`reset()`) leaves the lockup and sets `running` again, so the
-    GDB `monitor reset` recovers a locked core. A pending Reset taken from lockup (or at all) is
-    charged like an entry, 12 cycles: it is not an exception entry, and I have no figure for the
-    reset sequence, so this is an approximation.
-    VTOR is reset to `Processor::boot_address` (zero by default; INITVTOR on the Cortex-M7, set
-    from the BOOT_ADD pins on the STM32H7) by every `reset()`, as ResetSCSRegs resets it; cmm2-core
-    sets it to the flash base instead of writing VTOR before each reset. A reset that cannot read
-    its vectors has still reset the exceptions first (TakeReset reads them after), so nothing
-    stays active. A sleeping step counts its cycle in `cycle_count`, DWT and SysTick alike (before
-    it counted only the last two). That is not what the STM32H7 does for the DWT: its CPU clock
-    is stopped in CSleep (RM0433 §6.7.5) and rcc_c_ck, which clocks the DWT, runs only in CRun
-    (§8.5.12), so CYCCNT does not count through a WFI sleep unless DBGMCU_CR.DBGSLEEP_D1 is set.
-    SysTick keeps counting, since it has to wake the core. The ARMv7-M manual says nothing about
-    the cycle counter in sleep. The emulator's DWT still counts in sleep; that is to change.
-    A GDB `continue` on a locked core spins, stepping the 1-cycle fetch and
-    reporting nothing further, as the hardware core does; it used to report Finalized.
-    The GDB simulation steps a core with running and sleeping both set (what a WFI leaves, as in
-    `system/simulation.rs`) with `step_sleep`; it used to run its instructions.
+    the debugger's list: C1-695 applies whenever the core leaves Debug state) takes it instead of an
+    instruction. Every path that enters an exception counts the 12 cycles of an entry
+    (`EXCEPTION_ENTRY_CYCLES`) in the cycle counter, DWT and SysTick: SVC and faults as before, and
+    now an exception taken after an instruction or from sleep (it counted 0), and the after-halt
+    entry. 12 is the interrupt latency ARM gives for the Cortex-M7 with zero-wait-state memory (the
+    same as the Cortex-M3 and M4); wait states in the real memories add to it. An exception taken
+    straight after an exception return in the same step is tail-chained and counts 6 cycles
+    (`EXCEPTION_TAIL_CHAIN_CYCLES`). 6 is the figure ARM gives for the Cortex-M3 and M4 (their TRMs
+    and the Generic User Guides); I have not found an authoritative figure for the Cortex-M7 and do
+    not have its TRM, so it is the M3/M4 one, unverified for the M7. The emulator still does the
+    unstacking and stacking, only the count is the tail-chain's. A lockup enters nothing, and is a
+    state of the core (`Processor::locked_up`, `is_locked_up()`, set by `lock_up()`; it is not
+    inferred from `running`, which a semihosting exit also clears). On every path that finds one (a
+    fault, the entry of an SVC or BKPT, and an exception taken after an instruction, from sleep,
+    after a halt or after an exception return, where it is not a tail-chain either) the step counts
+    the one cycle of the fetch of the lockup address (B1.5.15) and the core stops, with the priority
+    of the lockup (-1 at least). While it is locked up `step()` executes nothing and takes no
+    exception except an NMI, or a pending reset (B1-555): each further step counts the 1 cycle, and
+    re-queues no trap; an NMI whose entry works leaves the lockup (this was broken before: an NMI in
+    a HardFault lockup was never taken) and counts a full entry. A lockup from a failed stacking or
+    vector read sets PC = 0xFFFFFFFE, the lockup address of B1-556; one from an instruction keeps
+    the PC of that instruction. A pending Reset whose initial SP and PC cannot be read is a lockup
+    at priority -1 at that address (B1-556), reported as one, with HFSR.VECTTBL and no FORCED, and
+    counts 1. (`Processor:: entry_cycles` is the one place that decides what a step counts.) Lockup
+    priorities follow B1-556 to B1-558: a vector read error at NMI entry locks up at -2 whatever the
+    running priority, at HardFault entry and at reset at -1; INVPC on a return from the NMI handler
+    to an execution priority of -1 at -2; a stacking failure on NMI entry at -1 or -2
+    (IMPLEMENTATION DEFINED, -2 here, so that the NMI is not entered again); the rest at the
+    priority the core runs at. `lock_up(priority)` sets it. What leaves a lockup is what can preempt
+    its priority: an NMI from one at -1 (B1-555 names the HardFault handler; FAULTMASK and the reset
+    handler are at -1 as well), a reset from either, nothing from one at -2 but a reset
+    (`lockup_can_end()` says so; that an NMI ends any lockup at -1 is my extrapolation from the
+    priorities: B1-555 itself names only the HardFault-handler case; cmm2-core's `run_loop` steps a
+    lockup that can end and stops with a fault ("core locked up") otherwise; the machine pends no
+    NMI today). The lockup address is 0xFFFFFFFE for a failed stacking or vector read, INVPC and a
+    bus or MemManage fault on unstacking (the PC is set to it: `bx lr` is where it was before), and
+    the PC of the instruction otherwise. A reset (`reset()`) leaves the lockup and sets `running`
+    again, so the GDB `monitor reset` recovers a locked core. A pending Reset taken from lockup (or
+    at all) is charged the 12 cycles of an entry, also straight after an exception return (a reset
+    clears the tail-chain flag): it is not an exception entry, and I have no figure for the reset
+    sequence, so this is an approximation. A pending Reset resets the core only, not the peripherals
+    and interrupt lines around it, which an embedder's reset (cmm2's `Cpu::reset`) does; nothing
+    pends Reset today. VTOR is reset to `Processor::boot_address` (zero by default; INITVTOR on the
+    Cortex-M7, set from the BOOT_ADD pins on the STM32H7) by every `reset()`, as ResetSCSRegs resets
+    it; cmm2-core sets it to the flash base instead of writing VTOR before each reset. A reset that
+    cannot read its vectors has still reset the exceptions first (TakeReset reads them after), so
+    nothing stays active. A sleeping step counts its cycle in `cycle_count` and SysTick (which has
+    to wake the core), and not in the DWT cycle counter unless `Processor::dwt_runs_in_sleep` is set
+    (default off): on the STM32H7 the CPU clock is stopped in CSleep (RM0433 6.7.5) and rcc_c_ck,
+    which clocks the DWT, runs only in CRun (8.5.12), so CYCCNT does not count through a WFI sleep
+    unless DBGMCU_CR.DBGSLEEP_D1 is set; the flag is that bit. The ARMv7-M manual says nothing about
+    the cycle counter in sleep. cmm2 does not call `step_sleep`: a WFI runs there as a 1-cycle
+    instruction (a separate issue), so this changes nothing for it. A GDB `continue` on a locked
+    core spins, stepping the 1-cycle fetch and reporting nothing further, as the hardware core does;
+    it used to report Finalized. The GDB simulation steps a core with running and sleeping both set
+    (what a WFI leaves, as in `system/simulation.rs`) with `step_sleep`; it used to run its
+    instructions.
   - the HardFault-vector-fails-too branch is reached when the vector words of the exception to take
     and of HardFault are both unreadable; the memory between them may be mapped (with VTOR at
     0x1fff_ff80, vectors 3 and 11, at 0x1fff_ff8c and 0x1fff_ffac, are unmapped, and vector 32 at
@@ -347,9 +351,7 @@ The firmware needs a few things zmu does not do, so I changed the following.
     the coprocessors off. The bits are set in that one place, from the fault: `check_vfp_enabled`
     used to set NOCP itself as well, and does not now; every FP instruction that raises
     `Fault::Nocp` (the VLDM and VSTM forms too, and those entered from exception entry and
-    return) reaches it through the fault. The core never raises UNALIGNED: it checks no alignment (above), so the
-    CCR.UNALIGN_TRP trap and the instructions that always fault on an unaligned address (LDM, STM,
-    LDRD, STRD, exclusives, VLDM, VSTM) do not fault. The bit is recorded when a fault is raised.
+    return) reaches it through the fault. UNALIGNED is raised by the alignment checks below.
   - with FPCA set, a failed stacking leaves an extended frame whose FP registers, and
     FPCCR.LSPACT, were never written. The manual allows the stacking to be abandoned (the note to
     PushStack, p. B1-532), and the contents of what was not stacked are UNKNOWN; the handler does
@@ -360,53 +362,53 @@ The firmware needs a few things zmu does not do, so I changed the following.
   - VTOR keeps bits 31:7 (TBLOFF, B3.2.5), and the vector table address is VTOR<31:7>:'0000000'
     (B1.5.6, p. B1-533): a write masks the low seven bits. The tests that used unaligned VTORs use
     a short vector table in flash instead, so that the wanted vectors cannot be read.
-  - the test `test_failing_stacks_and_unreadable_vectors_never_panic_and_lower_sp_by_one_frame`
-    runs random stacks (MSP, PSP, SPSEL, FPCA) near the end of SRAM, vector tables of random
-    length, aligned VTORs, priorities, PRIGROUP, fault enables and pending exceptions, and
-    checks that no entry lowers the stack it uses by more than its own frame (0x24, or 0x6c with
-    FPCA).
-  BKPT with no
-  semihosting host is a debug event (C1.5, p. C1-694; B1.5.14, HardFault on breakpoint
-  escalation): DFSR.BKPT is set, the DebugMonitor is taken if DEMCR.MON_EN is set and its group
-  priority is higher than the execution priority, and otherwise it is a HardFault with HFSR.DEBUGEVT, a lockup
-  below priority 0. A debug event that generates the DebugMonitor sets DEMCR.MON_PEND (C1-694),
-  and MON_PEND stays set until the exception is taken or a write clears it (C1-689); the BKPT takes
-  the DebugMonitor at once, so the code does not set the bit for it and it reads 0 afterwards.
-  A software write of MON_PEND = 1 to DEMCR pends the DebugMonitor whatever MON_EN is (C1-689):
-  it is taken by the usual priority rules, taking it clears MON_PEND and the pending state (also when a BKPT takes it directly), and a write
-  of 0 removes the pending exception. Whether a write pends is decided by the pending state of the
-  exception, not by the stored bit. The return
-  address is the BKPT itself for both (ReturnAddress(), synchronous). DFSR bits are set when the event halts or
-  generates an exception (C1-694), so DFSR.BKPT is set on the HardFault path too; only whether
-  they are set for an event that is ignored or causes lockup is IMPLEMENTATION DEFINED. BKPT #0xab with no host is the same.
-  ARMv6-M has no DebugMonitor (exception 12) and no DEMCR, but the core stores every bit of DEMCR,
-  so on an armv6m build BKPT never enters exception 12 now, and a MON_PEND write pends nothing. With a GDB server attached, a BKPT
-  (not #0xab when a semihosting function is installed, which it is for the servers built by
-  `GdbServer::new`; with none, #0xab halts too) halts into the debugger: the simulation reports a breakpoint
-  stop and DFSR.BKPT is set, and the PC stays on the BKPT, as it does when silicon halts in Debug
-  state. A plain continue or step from there hits the same BKPT again, as it does on hardware;
-  the debugger has to move the PC past it (GDB's `set $pc += 2`, which the server supports as a
-  register write), and then continue and step go on. A BKPT that halts does not advance the IT
-  state, as it does not move the PC, and takes no pending exception in that step (the debugger
-  sees the PC on the BKPT; the exception stays pending). The halt is consumed when the simulation
-  reports it. The step after a halt starts by taking a pending exception of sufficient priority,
-  and does not execute an instruction in that step (Halting debug stepping, C1.5, p. C1-695), so
-  a continue with the PC still on the BKPT takes it instead of halting again, and with PendSV
-  pending the step after `set $pc` takes it before the next instruction runs. It used to be a HardFault under the server. A stacking failure on the
-  entry of an exception is a derived exception (above), a lockup when the execution priority is
-  below 0, not by the IPSR. The xPSR that a refused return stacks holds only the fields the xPSR has (reserved
-  bits 23:20, and GE without the DSP extension, are zero).
+  - the test `test_failing_stacks_and_unreadable_vectors_never_panic_and_lower_sp_by_one_frame` runs
+    random stacks (MSP, PSP, SPSEL, FPCA) near the end of SRAM, vector tables of random length,
+    aligned VTORs, priorities, PRIGROUP, fault enables and pending exceptions, and checks that no
+    entry lowers the stack it uses by more than its own frame (0x24, or 0x6c with FPCA). BKPT with
+    no semihosting host is a debug event (C1.5, p. C1-694; B1.5.14, HardFault on breakpoint
+    escalation): DFSR.BKPT is set, the DebugMonitor is taken if DEMCR.MON_EN is set and its group
+    priority is higher than the execution priority, and otherwise it is a HardFault with
+    HFSR.DEBUGEVT, a lockup below priority 0. A debug event that generates the DebugMonitor sets
+    DEMCR.MON_PEND (C1-694), and MON_PEND stays set until the exception is taken or a write clears
+    it (C1-689); the BKPT takes the DebugMonitor at once, so the code does not set the bit for it
+    and it reads 0 afterwards. A software write of MON_PEND = 1 to DEMCR pends the DebugMonitor
+    whatever MON_EN is (C1-689): it is taken by the usual priority rules, taking it clears MON_PEND
+    and the pending state (also when a BKPT takes it directly), and a write of 0 removes the pending
+    exception. Whether a write pends is decided by the pending state of the exception, not by the
+    stored bit. The return address is the BKPT itself for both (ReturnAddress(), synchronous). DFSR
+    bits are set when the event halts or generates an exception (C1-694), so DFSR.BKPT is set on the
+    HardFault path too; only whether they are set for an event that is ignored or causes lockup is
+    IMPLEMENTATION DEFINED. BKPT #0xab with no host is the same. ARMv6-M has no DebugMonitor
+    (exception 12) and no DEMCR, but the core stores every bit of DEMCR, so on an armv6m build BKPT
+    never enters exception 12 now, and a MON_PEND write pends nothing. With a GDB server attached, a
+    BKPT (not #0xab when a semihosting function is installed, which it is for the servers built by
+    `GdbServer::new`; with none, #0xab halts too) halts into the debugger: the simulation reports a
+    breakpoint stop and DFSR.BKPT is set, and the PC stays on the BKPT, as it does when silicon
+    halts in Debug state. A plain continue or step from there hits the same BKPT again, as it does
+    on hardware; the debugger has to move the PC past it (GDB's `set $pc += 2`, which the server
+    supports as a register write), and then continue and step go on. A BKPT that halts does not
+    advance the IT state, as it does not move the PC, and takes no pending exception in that step
+    (the debugger sees the PC on the BKPT; the exception stays pending). The halt is consumed when
+    the simulation reports it. The step after a halt starts by taking a pending exception of
+    sufficient priority, and does not execute an instruction in that step (Halting debug stepping,
+    C1.5, p. C1-695), so a continue with the PC still on the BKPT takes it instead of halting again,
+    and with PendSV pending the step after `set $pc` takes it before the next instruction runs. It
+    used to be a HardFault under the server. A stacking failure on the entry of an exception is a
+    derived exception (above), a lockup when the execution priority is below 0, not by the IPSR. The
+    xPSR that a refused return stacks holds only the fields the xPSR has (reserved bits 23:20, and
+    GE without the DSP extension, are zero).
 - CCR.STKALIGN (B3.2, p. B3-605; B1.5.7, p. B1-535): whether the bit is RW or RO (RAO) and its reset
   value are IMPLEMENTATION DEFINED, and Arm recommends a reset of 1. On the armv7em build (the
   Cortex-M7) the CCR now resets with STKALIGN = 1; it stays writable. That the real M7 resets it
   to 1 (and whether it is RW or RAO) is from my memory of the Cortex-M7 TRM, which I do not have:
   unverified. Other builds still reset the CCR to 0.
-- The 16-bit STM decoded only seven bits of its register list (`0b111_1111`), dropping r7 from
-  every `stmia Rn!, {..., r7}` (`{r4-r7}` stored three words and wrote back 12). A7.7.159 T1 (p.
-  A7-383) has an 8-bit list; fixed. The other list decoders (LDM T1, PUSH T1 with LR, POP T1 with
-  PC, the 32-bit forms) were checked and are right. LDM.W with fewer than two registers, or with
-  write back and the base in the list (A7.7.41 T2), is UDF in `decode_LDM_t2`, and has a test. STM.W and STMDB cannot have SP or PC in the
-  list (the decode patterns have 0 in bits 15 and 13).
+- The 16-bit STM decoded only seven bits of its register list (`0b111_1111`), dropping r7 from every
+  `stmia Rn!, {..., r7}` (`{r4-r7}` stored three words and wrote back 12). A7.7.159 T1 (p. A7-383)
+  has an 8-bit list; fixed. The other list decoders (LDM T1, PUSH T1 with LR, POP T1 with PC, the
+  32-bit forms) were checked and are right. LDM.W with fewer than two registers, or with write back
+  and the base in the list (A7.7.41 T2), is UDF in `decode_LDM_t2`, and has a test. STM.W and STMDB
+  cannot have SP or PC in the list (the decode patterns have 0 in bits 15 and 13).
 - VCVT between floating-point and fixed-point: checked against A7.7.229 (p. A7-463, A7-464) and
   FixedToFP() (A2.5, FP conversions, pp. A2-58, A2-59): fixed to float rounds to nearest whatever
   the FPSCR says (`round_nearest = TRUE`), float to fixed rounds towards zero; the integer VCVT
@@ -442,6 +444,27 @@ The firmware needs a few things zmu does not do, so I changed the following.
 
 The armv7m build needs `--no-default-features --features armv7m`: with the default features
 also on, `build.rs` stops.
+
+- Alignment faults (issue 68; A3.2.1, B3.2.8, B2.3.5, B1.5.14): the core did not check alignment at
+  all. The data accesses that always fault on an address that is not aligned, whatever
+  CCR.UNALIGN_TRP says, now do: LDM, STM and STMDB, PUSH and POP (except the single-register 32-bit
+  forms, which are STR and LDR with write back, A7.7.99 T3 and A7.7.101 T3), LDRD, STRD, LDREX and
+  STREX (word), LDREXH and STREXH (halfword), VLDR, VSTR, VLDM, VSTM, VPUSH and VPOP (word). LDR,
+  STR, LDRH, LDRSH, STRH and TBH fault only with CCR.UNALIGN_TRP set (bit 3; always on an armv6m
+  build, which has no unaligned accesses); the byte accesses never do. The fault is a UsageFault
+  with UFSR.UNALIGNED, raised before any access or write back (a refused POP leaves SP alone), and
+  escalated to HardFault (FORCED) when UsageFault is disabled, the status bit being set either
+  way. The check is in `read16_data`, `read32_data`, `write16_data` and `write32_data` (the
+  UNALIGN_TRP rule: one AND and a branch on the address) and, for the always-aligned instructions,
+  `require_aligned` at the start of each. The unprivileged forms (LDRT, STRT and so on) are decoded
+  as the plain ones here and follow the same rules. Accesses to Device and Strongly-ordered memory
+  must be aligned, and are UNPREDICTABLE otherwise (A3.2.1, A3-83); the core has no memory types
+  (no MPU attributes), so that is not modelled. The test that checks BFAR for every kind of data
+  access now runs the aligned-only instructions off the end of RAM (a MemManage fault, MMFAR)
+  instead of straddling it, which an aligned word cannot do. Cost: the real firmware's 50
+  million instruction BASIC run took 17.8 s with the checks and 17.3 s without (three runs each,
+  ±1 s of noise), so none that shows. The real-firmware tests all pass: nothing in the firmware
+  faults on alignment.
 
 `cargo clippy -p zmu_cortex_m --all-targets -- -D warnings` is clean (the crate denies
 `clippy::pedantic`; the test code had unseparated long literals, `assert!` with `==`, and a few
