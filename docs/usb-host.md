@@ -635,28 +635,44 @@ the report without it, as on hardware. What cannot share a report waits for the 
  - a seventh key at once (taps over six in one go are six and then the rest, in order);
  - everything after the first of these that waits, so the order is kept.
 A modifier pressed after a waiting key is held back from the report with it, and appears in the next.
+A modifier that was tapped before a key, and was up again before that key went down, is sent in a
+report of its own ahead of it, and the key follows without it: the two were never held together,
+and `KEYDOWN(7)` must not say they were while the key is held. A modifier tapped while a key is
+held is in the report with it, as it was.
 A key that is down when there are more than six is the rollover error, as before, and the keys
-are counted as told of.
+that were down in it are counted as told of. A key that was waiting and was let go before then was
+not in that report, so it is not counted: it waits for its turn like any other tap. (This is a key
+that went down with fewer than six others down. A key that goes down with six already down has no
+slot, and is dealt with below.)
 
 So typing faster than one key per poll can put two different keys in one report. They are both typed,
 in the order they were pressed, as the firmware types every key that is in a report and was not in
 the one before in slot order. Nothing a user types is lost this way. What can be lost: a key
 pressed and let go while the firmware is not polling is kept and typed late, six at a time, when it
 does (there is no bound on how many are kept; the firmware does not stop polling short of a reset,
-which drops them); a seventh key pressed while six are held (the rollover error, as on a keyboard);
-and a modifier that is tapped on its own and held back stays until the key before it has gone.
+which drops them); and a modifier that is tapped on its own and held back stays until the key before it
+has gone. A key that goes down while six others are down is lost, as on a real keyboard, which sends
+the rollover error (`0x01` in every slot) for as long as a seventh key is down and never the key.
+The emulator is polled more slowly than real time, so a tap made and over between two polls is
+counted as down until the firmware has been sent the error once, and then it is gone: the firmware
+sees the error, then the six keys again, as it would from the keyboard. Nothing is left waiting, so
+the window's lock following (below) is not held up by it. A key that was already waiting when the
+seven were down, because it was tapped before the seventh key went down, was seen by the keyboard
+alone and is not lost: it is typed once there is room.
 
 Property tested (`usb_keys.rs`, 3000 random sequences of presses and releases of three keys and three
 modifiers, with the firmware polling at random in between, and no more than one key going down
 between two polls): a model of the firmware types exactly the keys that were pressed, in order, each
 with the modifiers that were down when it was pressed. On the real firmware: a held `a` is
 `KEYDOWN(1)` = 97 in every one of the readings 20 ms apart after the first (none lost in 40); a key
-held at the prompt for 2 s of machine time typed 21 characters (the firmware's own repeat: with a first
-delay of about half a second that is a repeat about every 75 ms, which I worked out from the count and
-did not measure directly); a quick Shift and a
+held at the prompt for 2 s of machine time typed 21 characters (the firmware's own repeat, with
+MMBasic's defaults of a first delay of 500 ms and a repeat every 75 ms: 1 + (2000 - 500) / 75 = 21,
+and the test asserts 19 to 22 so that the edges of the 2 s do not matter); a quick Shift and a
 letter types the capital, Ctrl-C stops a program (also behind 40 taps), and `PRINT 1+2` is typed.
 
-The speed, measured on the real firmware (release build) with everything pressed at once:
+The speed, measured on the real firmware (release build) with everything pressed at once. The
+machine times do not depend on the host, but the host times do: they were measured on an idle
+machine, and a loaded one is slower:
 
 | Burst | Polls | Machine time | Host time, unpaced |
 |---|---|---|---|

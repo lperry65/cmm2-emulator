@@ -195,17 +195,37 @@ fn century(year: i32) -> i32 {
     (year - 2000).div_euclid(100)
 }
 
-/// The seven calendar registers for `seconds` of wall-clock time: always 24-hour mode, the
-/// weekday 1 (Monday) to 7 (Sunday).
-fn calendar_registers(seconds: i64) -> [u8; CALENDAR] {
-    let time = HostTime::from_seconds(seconds);
+/// The day of the week of a day counted from 1970-01-01, 0 (Monday) to 6 (Sunday).
+fn civil_weekday(days: i64) -> i64 {
     // 1970-01-01 was a Thursday.
-    let weekday = (seconds.div_euclid(86_400) + 3).rem_euclid(7) as u32 + 1;
+    (days + 3).rem_euclid(7)
+}
+
+/// The hours register for `hour` (0 to 23): in 12-hour form it is bit 6, bit 5 for PM and the
+/// hour from 1 to 12 (12 AM is midnight).
+fn hour_register(hour: u32, hour12: bool) -> u8 {
+    if !hour12 {
+        return bcd(hour);
+    }
+    let on_the_clock = if hour.is_multiple_of(12) {
+        12
+    } else {
+        hour % 12
+    };
+    let pm = if hour >= 12 { 0x20 } else { 0 };
+    0x40 | bcd(on_the_clock) | pm
+}
+
+/// The seven calendar registers for `seconds` of wall-clock time. The weekday is 1 to 7, as the
+/// chip counts it from the one it was given: `weekday_skew` days on from Monday as 1.
+fn calendar_registers(seconds: i64, weekday_skew: u8, hour12: bool) -> [u8; CALENDAR] {
+    let time = HostTime::from_seconds(seconds);
+    let weekday = (civil_weekday(seconds.div_euclid(86_400)) + i64::from(weekday_skew)) % 7 + 1;
     [
         bcd(time.second),
         bcd(time.minute),
-        bcd(time.hour),
-        bcd(weekday),
+        hour_register(time.hour, hour12),
+        bcd(weekday as u32),
         bcd(time.day),
         bcd(time.month) | ((century(time.year) & 1) as u8 * 0x80),
         bcd((time.year - 2000).rem_euclid(100) as u32),
@@ -277,6 +297,12 @@ struct Chip {
     offset: Option<i64>,
     /// Registers 0x07 to 0x12 as the chip holds them. The calendar ones are worked out.
     stored: [u8; REGISTERS],
+    /// The weekday register is a count the chip keeps: it goes on a day at midnight from the
+    /// value it was given, whatever the date. This is how many days that value is on from the
+    /// day the date says it is (Monday is 1), 0 to 6.
+    weekday_skew: u8,
+    /// The hours register was last written in 12-hour form (bit 6), and is read in it.
+    hour12: bool,
     /// The registers as a transaction reads them: the calendar is taken at START, and again
     /// when the pointer wraps round to 0, so that a read that runs over a second boundary is
     /// still consistent.
@@ -316,6 +342,8 @@ impl Chip {
             clock,
             offset: None,
             stored,
+            weekday_skew: 0,
+            hour12: false,
             registers: stored,
             date_written: [None; 3],
             pointer: 0,
@@ -327,6 +355,22 @@ impl Chip {
             scl: true,
             pulling_low: false,
         }
+    }
+
+    /// Whether the chip is as it was made, with nothing for the coin cell to have kept.
+    fn is_as_made(&self) -> bool {
+        self.offset.is_none()
+            && self.stored[STATUS] == STATUS_AT_POWER_UP
+            && self.weekday_skew == 0
+            && !self.hour12
+    }
+
+    /// Puts what the coin cell keeps back as it was made.
+    fn make_new(&mut self) {
+        self.offset = None;
+        self.stored[STATUS] = STATUS_AT_POWER_UP;
+        self.weekday_skew = 0;
+        self.hour12 = false;
     }
 
     /// The chip's wall-clock time in milliseconds, as if it were UTC.
@@ -387,7 +431,7 @@ impl Chip {
 
     fn refresh_calendar(&mut self) {
         let wall = self.wall_millis(&self.clock.now());
-        let calendar = calendar_registers(wall.div_euclid(1000));
+        let calendar = calendar_registers(wall.div_euclid(1000), self.weekday_skew, self.hour12);
         self.registers[..CALENDAR].copy_from_slice(&calendar);
     }
 
@@ -485,12 +529,27 @@ impl Chip {
         }
     }
 
+    /// The weekday the chip shows on the day `days` (counted from 1970-01-01), 0 to 6.
+    fn weekday_on(&self, days: i64) -> i64 {
+        (civil_weekday(days) + i64::from(self.weekday_skew)) % 7
+    }
+
+    /// Makes the weekday on the day `days` be `weekday` (0 to 6): the chip counts on from there.
+    fn set_weekday(&mut self, days: i64, weekday: i64) {
+        self.weekday_skew = (weekday - civil_weekday(days)).rem_euclid(7) as u8;
+    }
+
     /// Writes one field of the time. The other fields go on as they were counting: only the
     /// seconds register restarts the counting of the second, as it does on the chip, and a
-    /// write to it begins a new second now. The chip is then a clock of its own.
+    /// write to it begins a new second now. The chip is then a clock of its own, except for a
+    /// write of the weekday, which is only the chip's count of the days of the week.
     fn write_calendar(&mut self, register: usize, byte: u8) {
         let now = self.clock.now();
         let wall = self.wall_millis(&now);
+        let today = wall.div_euclid(1000).div_euclid(86_400);
+        // The weekday as it is before this write: only a write of its own changes it, and one
+        // that moves the date leaves it as it was.
+        let weekday = self.weekday_on(today);
         let mut time = HostTime::from_seconds(wall.div_euclid(1000));
         let mut millis = wall.rem_euclid(1000);
         match register {
@@ -499,28 +558,49 @@ impl Chip {
                 millis = 0;
             }
             1 => time.minute = unbcd(byte & 0x7F).min(59),
-            2 => time.hour = register_hour(byte),
-            // The date says what day of the week it is.
-            3 => return,
+            2 => {
+                time.hour = register_hour(byte);
+                self.hour12 = byte & 0x40 != 0;
+            }
+            3 => {
+                // Three bits, and 1 to 7: the datasheet leaves anything else undefined, and here
+                // 0 is 1.
+                self.set_weekday(today, i64::from((byte & 0x07).max(1)) - 1);
+                return;
+            }
             _ => self.date_written[register - 4] = Some(byte),
         }
         let [day, month, year] = self.date_written;
+        // The century bit goes with the month, and says which hundred years the year is in: the
+        // 2000s with 0 and the 2100s with 1, as the chip's own is 1 after its first rollover.
+        // Without a month written the chip stays in the hundred years it is in.
+        let century = month.map_or(century(time.year), |m| i32::from(m >> 7));
         let month = month.map_or(time.month, |m| unbcd(m & 0x1F).clamp(1, 12));
-        // The century bit is not written: the chip stays in the hundred years it is in.
-        let year = year.map_or(time.year, |y| {
-            2000 + 100 * century(time.year) + unbcd(y).min(99) as i32
+        let digits = year.map_or((time.year - 2000).rem_euclid(100), |y| {
+            unbcd(y).min(99) as i32
         });
+        let year = 2000 + 100 * century + digits;
         let day = day.map_or(time.day, |d| unbcd(d & 0x3F).max(1));
         time.month = month;
         time.year = year;
+        // A month that does not have the day is not a date. The datasheet leaves what the chip
+        // does then undefined, and this one takes the last day of the month.
         time.day = day.min(days_in_month(year, month));
         let target = time.seconds() * 1000 + millis;
-        self.offset = Some(target.saturating_sub(now.utc_millis));
+        self.set_weekday(target.div_euclid(86_400_000), weekday);
+        // The chip must stay as far from the host as a saved offset may be, or it could not be
+        // loaded again.
+        let offset = target.saturating_sub(now.utc_millis);
+        self.offset = Some(offset.clamp(-MAX_OFFSET_MILLIS, MAX_OFFSET_MILLIS));
     }
 }
 
 /// How many bytes `Ds3231Slot::saved` gives.
 pub const STATE_SIZE: usize = 10;
+/// Where the weekday count and the 12-hour form are in the flags byte of the saved state, whose
+/// bit 0 says the time has been set.
+const FLAGS_WEEKDAY: u32 = 1;
+const FLAGS_HOUR12: u32 = 4;
 
 #[derive(Clone, Debug, Default)]
 pub struct Ds3231Slot(Rc<RefCell<Chip>>);
@@ -554,17 +634,21 @@ impl Ds3231Slot {
         HostTime::from_seconds(chip.wall_millis(&chip.clock.now()).div_euclid(1000))
     }
 
-    /// What the chip keeps with the power off, which is the offset and the status register, for
-    /// the front end to save. `None` for a chip as it was made (time never set, oscillator
-    /// stopped flag still set), as there is nothing to keep then.
+    /// What the chip keeps with the power off, for the front end to save: the offset, the status
+    /// register, and the weekday and 12-hour form the guest has set, which are in the flags byte
+    /// (bit 0 says the time has been set, bits 1 to 3 are the weekday count, bit 4 the 12-hour
+    /// form). `None` for a chip as it was made (time never set, oscillator stopped flag still
+    /// set, weekday and form as at power-up), as there is nothing to keep then.
     pub fn saved(&self) -> Option<[u8; STATE_SIZE]> {
         let chip = self.0.borrow();
-        if chip.offset.is_none() && chip.stored[STATUS] == STATUS_AT_POWER_UP {
+        if chip.is_as_made() {
             return None;
         }
         let mut bytes = [0; STATE_SIZE];
         bytes[..8].copy_from_slice(&chip.offset.unwrap_or(0).to_le_bytes());
-        bytes[8] = u8::from(chip.offset.is_some());
+        bytes[8] = u8::from(chip.offset.is_some())
+            | chip.weekday_skew << FLAGS_WEEKDAY
+            | u8::from(chip.hour12) << FLAGS_HOUR12;
         bytes[9] = chip.stored[STATUS];
         Some(bytes)
     }
@@ -577,27 +661,31 @@ impl Ds3231Slot {
         chip.offset = offset;
         // BSY is the chip's own and is never set.
         chip.stored[STATUS] = bytes[9] & (STATUS_FLAGS | EN32KHZ);
+        chip.weekday_skew = (bytes[8] >> FLAGS_WEEKDAY & 7) % 7;
+        chip.hour12 = bytes[8] >> FLAGS_HOUR12 & 1 != 0;
         Ok(())
     }
 
     /// Puts the chip back as it was made, as for a front end with nothing saved.
     pub fn load_new(&self) {
-        let mut chip = self.0.borrow_mut();
-        chip.offset = None;
-        chip.stored[STATUS] = STATUS_AT_POWER_UP;
+        self.0.borrow_mut().make_new();
     }
 
     /// Takes the offset an earlier version saved: whole seconds from the host's local time, 0 for
     /// a chip never set. The time it meant is kept, now as an offset from UTC.
     pub fn load_v1(&self, seconds: i64) -> Result<(), OffsetError> {
-        let offset = checked(Some(seconds.saturating_mul(1000)))?;
-        self.load_new();
-        if seconds != 0 {
-            let mut chip = self.0.borrow_mut();
+        let millis = checked(Some(seconds.saturating_mul(1000)))?;
+        let mut chip = self.0.borrow_mut();
+        // Both checks are made before anything of the chip is changed.
+        let offset = if seconds == 0 {
+            None
+        } else {
             let now = chip.clock.now();
             let zone = now.local.seconds() - now.utc_millis.div_euclid(1000);
-            chip.offset = checked(offset.map(|millis| millis + zone * 1000))?;
-        }
+            checked(millis.map(|millis| millis.saturating_add(zone * 1000)))?
+        };
+        chip.make_new();
+        chip.offset = offset;
         Ok(())
     }
 
@@ -1068,7 +1156,8 @@ mod tests {
         let bus = Bus::at(december());
         // 31 April, 25:61:61.
         bus.write(0, &[0x61, 0x61, 0x25, 1, 0x31, 0x04, 0x26]);
-        assert_eq!(bus.read(0, 7), [0x59, 0x59, 0x23, 4, 0x30, 0x04, 0x26]);
+        // The weekday is the one written, which has nothing to do with the date.
+        assert_eq!(bus.read(0, 7), [0x59, 0x59, 0x23, 1, 0x30, 0x04, 0x26]);
     }
 
     #[test]
@@ -1079,29 +1168,173 @@ mod tests {
     }
 
     #[test]
-    fn the_century_bit_is_ignored_on_a_write() {
+    fn the_century_bit_is_written_with_the_month() {
+        // Set, it is the 2100s (the bit is 1 for them as the year rolls over from 99 to 00).
         let bus = Bus::at(december());
-        bus.write(0, &[0x30, 0x20, 0x10, 1, 0x05, 0x91, 0x27]);
-        assert_eq!(bus.read(0, 7), [0x30, 0x20, 0x10, 0x05, 0x05, 0x11, 0x27]);
+        bus.write(0, &[0x30, 0x20, 0x10, 5, 0x05, 0x91, 0x27]);
+        assert_eq!(bus.read(0, 7), [0x30, 0x20, 0x10, 5, 0x05, 0x91, 0x27]);
+        assert_eq!(bus.chip.time(), HostTime::new(2127, 11, 5, 10, 20, 30));
+        // And clear, the 2000s again, whatever hundred years the chip was in.
+        bus.write(4, &[0x05, 0x11, 0x27]);
+        assert_eq!(bus.read(5, 2), [0x11, 0x27]);
+        assert_eq!(bus.chip.time().year, 2027);
+    }
+
+    #[test]
+    fn the_century_bit_goes_with_the_year_whichever_is_written_first() {
+        let bus = Bus::at(december());
+        bus.start();
+        bus.send(ADDRESS << 1);
+        bus.send(6);
+        bus.send(0x27);
+        bus.stop();
+        assert_eq!(bus.chip.time().year, 2027);
+        bus.write(5, &[0x95]);
+        assert_eq!(bus.chip.time().year, 2127);
+        // A year on its own stays in the hundred years the chip is in.
+        bus.write(6, &[0x30]);
+        assert_eq!(bus.chip.time().year, 2130);
     }
 
     #[test]
     fn the_hours_are_taken_in_12_hour_form_when_bit_6_is_set() {
-        // 12-hour mode: bit 5 is PM, and the hour is 1 to 12. The chip reads 24-hour.
+        // 12-hour mode: bit 5 is PM, and the hour is 1 to 12.
         let bus = Bus::at(december());
         for (written, hour) in [
-            (0x41, 0x01),
-            (0x49, 0x09),
-            (0x52, 0x00),
-            (0x61, 0x13),
-            (0x71, 0x23),
-            (0x72, 0x12),
+            (0x41, 1),
+            (0x49, 9),
+            (0x52, 0),
+            (0x61, 13),
+            (0x71, 23),
+            (0x72, 12),
             // Without bit 6, bit 5 is the twenties.
-            (0x21, 0x21),
+            (0x21, 21),
         ] {
             bus.write(2, &[written]);
-            assert_eq!(bus.read(2, 1), [hour], "{written:#x}");
+            assert_eq!(bus.chip.time().hour, hour, "{written:#x}");
         }
+    }
+
+    #[test]
+    fn a_chip_written_in_12_hour_form_is_read_in_it_until_written_in_24_hour_form() {
+        let bus = Bus::at(december());
+        // As the chip powers up: 24-hour mode.
+        assert_eq!(bus.read(2, 1), [0x13]);
+        // Written in 12-hour form, 1 PM reads back as it was written, and keeps counting so.
+        bus.write(2, &[0x61]);
+        assert_eq!(bus.read(2, 1), [0x61]);
+        bus.clock.advance(3600 * 10);
+        assert_eq!(bus.read(2, 1), [0x71]);
+        bus.clock.advance(3600);
+        assert_eq!(bus.read(2, 1), [0x52], "midnight is 12 AM");
+        bus.clock.advance(3600 * 12);
+        assert_eq!(bus.read(2, 1), [0x72], "noon is 12 PM");
+        bus.clock.advance(3600);
+        assert_eq!(bus.read(2, 1), [0x61]);
+        bus.clock.advance(3600 * 11);
+        // The minutes and the other registers do not change the format.
+        bus.write(1, &[0x30]);
+        assert_eq!(bus.read(2, 1), [0x52]);
+        // Written in 24-hour form it goes back.
+        bus.write(2, &[0x13]);
+        assert_eq!(bus.read(2, 1), [0x13]);
+    }
+
+    #[test]
+    fn the_12_hour_form_is_kept_with_the_saved_state() {
+        let bus = Bus::at(december());
+        bus.write(2, &[0x61]);
+        let saved = bus.chip.saved().unwrap();
+        let again = Bus::at(december());
+        again.chip.load(saved).unwrap();
+        assert_eq!(again.read(2, 1), [0x61]);
+        // A chip never set but written in 12-hour form is not one as it was made.
+        let bus = Bus::at(december());
+        bus.chip.0.borrow_mut().hour12 = true;
+        assert!(bus.chip.saved().is_some());
+        bus.chip.load_new();
+        assert_eq!(bus.read(2, 1), [0x13]);
+        assert_eq!(bus.chip.saved(), None);
+    }
+
+    #[test]
+    fn the_weekday_is_the_one_written_and_the_chip_counts_it_on_at_midnight() {
+        // Thursday, which the chip has not been told: it shows the day the date says.
+        let bus = Bus::at(december());
+        assert_eq!(bus.read(3, 1), [4]);
+        // Told it is 3 (the numbers mean what the user decided, as long as they go in order).
+        bus.write(3, &[3]);
+        assert_eq!(bus.read(3, 1), [3]);
+        // Writing it is not setting the time.
+        assert_eq!(bus.chip.offset_millis(), None);
+        // The next midnight makes it 4, and 7 goes round to 1.
+        bus.clock.advance(10 * 3600 + 14 * 60 + 4);
+        assert_eq!(bus.read(0, 4), [0, 0, 0, 4]);
+        bus.write(3, &[7]);
+        bus.clock.advance(86_400);
+        assert_eq!(bus.read(3, 1), [1]);
+    }
+
+    #[test]
+    fn writing_the_date_or_the_time_does_not_change_the_weekday() {
+        let bus = Bus::at(december());
+        bus.write(3, &[2]);
+        // Time of day, and then a date: neither is a weekday.
+        bus.write(0, &[0x30, 0x20, 0x10]);
+        assert_eq!(bus.read(3, 1), [2]);
+        bus.write(4, &[0x05, 0x11, 0x27]);
+        assert_eq!(bus.read(3, 1), [2]);
+        // With the weekday, it is the one that is written, and the date after it does not move it.
+        bus.write(3, &[6, 0x01, 0x03, 0x28]);
+        assert_eq!(bus.read(3, 4), [6, 0x01, 0x03, 0x28]);
+        // A date in the order the registers are in, with the weekday last of all.
+        bus.write(4, &[0x02, 0x03, 0x28]);
+        bus.write(3, &[5]);
+        assert_eq!(bus.read(3, 4), [5, 0x02, 0x03, 0x28]);
+    }
+
+    #[test]
+    fn the_weekday_of_a_chip_never_set_follows_the_hosts_days_and_the_chip_can_be_told_it() {
+        let bus = Bus::at(december());
+        bus.write(3, &[1]);
+        bus.clock.advance(86_400);
+        assert_eq!(bus.read(3, 1), [2]);
+        assert_eq!(bus.chip.offset_millis(), None);
+    }
+
+    #[test]
+    fn only_three_bits_of_the_weekday_are_taken_and_0_is_1() {
+        let bus = Bus::at(december());
+        bus.write(3, &[0xFA]);
+        assert_eq!(bus.read(3, 1), [2]);
+        bus.write(3, &[0]);
+        assert_eq!(bus.read(3, 1), [1]);
+    }
+
+    #[test]
+    fn the_weekday_is_kept_with_the_saved_state() {
+        let bus = Bus::at(december());
+        bus.write(3, &[2]);
+        let saved = bus
+            .chip
+            .saved()
+            .expect("a chip with a weekday is not as it was made");
+        let again = Bus::at(december());
+        again.chip.load(saved).unwrap();
+        assert_eq!(again.read(3, 1), [2]);
+        again.clock.advance(86_400);
+        assert_eq!(again.read(3, 1), [3]);
+        again.chip.load_new();
+        assert_eq!(again.read(3, 1), [5]);
+    }
+
+    #[test]
+    fn a_month_that_does_not_have_the_day_gives_the_last_day_of_it() {
+        // 31 January and then the month 2: the datasheet says that is undefined. The chip here
+        // takes the last day of the month, so that it always shows a date there is.
+        let bus = Bus::at(HostTime::new(2027, 1, 31, 12, 0, 0));
+        bus.write(5, &[0x02]);
+        assert_eq!(bus.read(4, 3), [0x28, 0x02, 0x27]);
     }
 
     #[test]
@@ -1249,11 +1482,14 @@ mod tests {
 
     #[test]
     fn a_write_keeps_the_chip_in_the_hundred_years_it_is_in() {
+        // The time of day and the year register do not say which hundred years it is.
         let bus = Bus::at(HostTime::new(2100, 6, 15, 12, 0, 0));
         bus.write(0, &[0x30, 0x20, 0x10]);
         assert_eq!(bus.read(4, 3), [0x15, 0x86, 0x00]);
         assert_eq!(bus.chip.time(), HostTime::new(2100, 6, 15, 10, 20, 30));
-        bus.write(3, &[1, 0x01, 0x02, 0x30]);
+        bus.write(6, &[0x30]);
+        assert_eq!(bus.chip.time(), HostTime::new(2130, 6, 15, 10, 20, 30));
+        bus.write(4, &[0x01, 0x82, 0x30]);
         assert_eq!(bus.chip.time(), HostTime::new(2130, 2, 1, 10, 20, 30));
         let bus = Bus::at(HostTime::new(1999, 6, 15, 12, 0, 0));
         bus.write(6, &[0x98]);
@@ -1366,6 +1602,45 @@ mod tests {
             .to_string()
             .contains("200 years")
         );
+    }
+
+    #[test]
+    fn an_offset_of_an_earlier_version_that_the_zone_takes_over_the_cap_changes_nothing() {
+        // The seconds are within the cap, and with the host's two hours added they are not.
+        let bus = Bus::at(december());
+        bus.write(0, &[0x30, 0x20, 0x10]);
+        bus.write(0x0F, &[0]);
+        bus.clock.set_zone(2 * 3600);
+        let before = (bus.chip.saved(), bus.chip.offset_millis());
+        let seconds = MAX_OFFSET_MILLIS / 1000 - 3600;
+        assert!(bus.chip.load_v1(seconds).is_err());
+        assert_eq!((bus.chip.saved(), bus.chip.offset_millis()), before);
+        // And the status flags it would have reset are as they were.
+        assert_eq!(bus.read(0x0F, 1), [0]);
+    }
+
+    #[test]
+    fn a_write_cannot_take_the_clock_further_from_the_host_than_the_cap() {
+        // The chip is in the 2220s, as far as it may go, and the year goes to 2299.
+        let bus = Bus::at(december());
+        bus.chip
+            .set_offset_millis(Some(MAX_OFFSET_MILLIS - 1000))
+            .unwrap();
+        assert_eq!(bus.chip.time().year / 100, 22);
+        bus.write(6, &[0x99]);
+        assert_eq!(bus.chip.offset_millis(), Some(MAX_OFFSET_MILLIS));
+        // What it saves is what it can load.
+        let saved = bus.chip.saved().unwrap();
+        Bus::at(december()).chip.load(saved).unwrap();
+        // The same the other way, in the 1820s.
+        bus.chip
+            .set_offset_millis(Some(-MAX_OFFSET_MILLIS + 1000))
+            .unwrap();
+        assert_eq!(bus.chip.time().year / 100, 18);
+        bus.write(6, &[0x00]);
+        assert_eq!(bus.chip.offset_millis(), Some(-MAX_OFFSET_MILLIS));
+        let saved = bus.chip.saved().unwrap();
+        Bus::at(december()).chip.load(saved).unwrap();
     }
 
     #[test]

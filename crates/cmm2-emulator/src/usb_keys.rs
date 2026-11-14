@@ -60,6 +60,9 @@ struct Key {
     shown: bool,
     /// The firmware has been sent a report with it in.
     sent: bool,
+    /// It went down while six other keys were down, so the keyboard has no slot for it: it is
+    /// the rollover error until the firmware has been sent that, and is never typed.
+    overflow: bool,
 }
 
 /// The keys held and the report they make. A cheap handle on the keyboard's `KeyReport`, which
@@ -141,12 +144,20 @@ impl UsbKeys {
             self.keys.pop();
         }
         if (is_modifier(usage) || self.active()) && !self.is_down(usage) {
+            let overflow = !is_modifier(usage)
+                && self
+                    .keys
+                    .iter()
+                    .filter(|key| key.down && !is_modifier(key.usage))
+                    .count()
+                    >= SLOTS;
             self.keys.push(Key {
                 usage,
                 down: true,
                 modifiers: self.modifiers_down(),
                 shown: false,
                 sent: false,
+                overflow,
             });
             if usage == CAPS_LOCK || usage == NUM_LOCK {
                 let report = &self.report;
@@ -303,16 +314,34 @@ impl UsbKeys {
     // with the others that have not: it is not one that was in the last report sent (that
     // report has to be sent without it first, or the firmware would see no key up and down
     // again), is not in the report already, went down with the same modifiers as they did, and
-    // there is room. The first that does not go in holds back the ones after it, so that they
-    // are sent in the order they were pressed. The modifiers are those of the first key that has
+    // there is room (the keys that are held have their slots whatever came before them). The first
+    // that does not go in holds back the ones after it, so that they are sent in the order they
+    // were pressed, and so does a modifier that was tapped and over before a key went down, which
+    // goes in a report of its own first. The modifiers are those of the first key that has
     // not been sent, which are the ones it went down with and not the ones that have been
     // pressed since, or, with none, the ones that are down.
     fn build(&mut self) -> [u8; 8] {
         let mut in_report: Vec<usize> = Vec::new();
         let mut modifiers = None;
         let mut held_back = false;
+        // The keys that are held are in the report whatever came before them in the order, so
+        // a key waiting for its turn has only the slots they leave.
+        let held = self
+            .keys
+            .iter()
+            .filter(|key| key.sent && !is_modifier(key.usage))
+            .count();
+        let mut waiting_in_report = 0;
         for (at, key) in self.keys.iter().enumerate() {
             if is_modifier(key.usage) {
+                // A tap of a modifier that came before a key and was over before it went down
+                // is sent ahead of that key and not with it, or the firmware would see the key
+                // held with a modifier it never had.
+                let bit = 1 << (key.usage - FIRST_MODIFIER);
+                let before_a_key = self.keys[at + 1..].iter().any(|later| {
+                    !later.sent && !is_modifier(later.usage) && later.modifiers & bit == 0
+                });
+                held_back |= !key.sent && before_a_key;
                 continue;
             }
             if key.sent {
@@ -325,7 +354,7 @@ impl UsbKeys {
                     .any(|&other| self.keys[other].usage == usage)
             };
             let clashes = held_back
-                || in_report.len() >= SLOTS
+                || waiting_in_report + held >= SLOTS
                 || self.reported[2..].contains(&key.usage)
                 || taken(key.usage)
                 || modifiers.is_some_and(|bits| bits != key.modifiers);
@@ -333,6 +362,7 @@ impl UsbKeys {
                 held_back = true;
             } else {
                 modifiers = Some(key.modifiers);
+                waiting_in_report += 1;
                 in_report.push(at);
             }
         }
@@ -352,11 +382,14 @@ impl UsbKeys {
             count += 1;
         }
         // More keys down than there are slots is the rollover error, which reports no key: the
-        // firmware is told of all of them, and a real keyboard does no better.
+        // firmware is told only that there are too many, as by a real keyboard, and a key
+        // that went down with no slot for it is lost.
+        // A key that went down with no slot for it counts until the firmware has been sent the
+        // error, though it is let go before then.
         let rollover = self
             .keys
             .iter()
-            .filter(|key| key.down && !is_modifier(key.usage))
+            .filter(|key| !is_modifier(key.usage) && (key.down || (key.overflow && !key.sent)))
             .count()
             > SLOTS;
         if rollover || count > SLOTS {
@@ -366,7 +399,13 @@ impl UsbKeys {
             key.shown = if is_modifier(key.usage) {
                 modifiers >> (key.usage - FIRST_MODIFIER) & 1 != 0
             } else {
-                rollover || in_report.contains(&at)
+                // The error report shows no key, but the firmware has had it with every key that
+                // is down in it. A key that is let go before then has not been seen, and waits.
+                if rollover {
+                    key.down || key.overflow
+                } else {
+                    in_report.contains(&at)
+                }
             };
         }
         report
@@ -746,6 +785,87 @@ mod tests {
     }
 
     #[test]
+    fn a_shift_tapped_just_before_a_key_is_not_held_with_it() {
+        let (mut keys, mut keyboard, report) = polled();
+        keys.press(LEFT_SHIFT);
+        keys.release(LEFT_SHIFT);
+        keys.press(A);
+        // The Shift went before the key, so it is sent on its own first, and A is held after it
+        // without the Shift: KEYDOWN(7) must not see a Shift that was never held with it.
+        let mut reports = Vec::new();
+        for _ in 0..10 {
+            if let In::Data(sent) = poll(&mut keyboard) {
+                reports.push(sent);
+            }
+            keys.sync();
+        }
+        assert_eq!(
+            reports,
+            [vec![2, 0, 0, 0, 0, 0, 0, 0], vec![0, 0, A, 0, 0, 0, 0, 0]]
+        );
+        assert_eq!(report.get(), [0, 0, A, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_shift_tapped_while_a_key_is_held_is_held_with_it() {
+        let (mut keys, mut keyboard, _) = polled();
+        keys.press(A);
+        delivered(&mut keys, &mut keyboard);
+        keys.press(LEFT_SHIFT);
+        keys.release(LEFT_SHIFT);
+        assert_eq!(
+            delivered(&mut keys, &mut keyboard),
+            [[2, 0, A, 0, 0, 0, 0, 0], [0, 0, A, 0, 0, 0, 0, 0]]
+        );
+    }
+
+    #[test]
+    fn a_key_tapped_before_more_than_six_go_down_is_not_lost() {
+        let (mut keys, mut keyboard, _) = polled();
+        // The tap has not been polled when seven keys go down, and the firmware's next poll is
+        // of the error report, which has no key in it.
+        keys.press(0x20);
+        keys.release(0x20);
+        for usage in A..A + 7 {
+            keys.press(usage);
+        }
+        poll(&mut keyboard);
+        keys.sync();
+        assert_eq!(keys.report.get(), [0, 0, 1, 1, 1, 1, 1, 1]);
+        // Back to six keys the tap still has no slot, and with five it has.
+        keys.release(A + 6);
+        keys.release(A + 5);
+        let reports = delivered(&mut keys, &mut keyboard);
+        assert!(
+            reports.iter().any(|report| report[2..].contains(&0x20)),
+            "{reports:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_tapped_while_six_are_held_is_the_rollover_error_and_is_lost() {
+        // As on a real keyboard: a seventh key down is the error in every slot for as long as it
+        // is down, and it is never typed.
+        let (mut keys, mut keyboard, report) = polled();
+        for usage in A..A + 6 {
+            keys.press(usage);
+        }
+        delivered(&mut keys, &mut keyboard);
+        keys.press(0x20);
+        keys.release(0x20);
+        // The tap is over before the firmware polls, and it still sees the error once.
+        assert_eq!(report.get(), [0, 0, 1, 1, 1, 1, 1, 1]);
+        let reports = delivered(&mut keys, &mut keyboard);
+        assert_eq!(
+            reports,
+            [[0, 0, 1, 1, 1, 1, 1, 1], [0, 0, 4, 5, 6, 7, 8, 9]]
+        );
+        // Nothing is left waiting, so nothing holds up the locks.
+        assert!(!keys.pending());
+        assert!(!reports.iter().any(|report| report[2..].contains(&0x20)));
+    }
+
+    #[test]
     fn ctrl_and_c_tapped_between_two_polls_arrive_together() {
         let (mut keys, mut keyboard, _) = polled();
         keys.press(0xE0);
@@ -838,10 +958,13 @@ mod tests {
         keys.press(LEFT_SHIFT);
         keys.press(A);
         keys.release(A);
+        keys.press(B);
         keyboard.reset();
         keys.sync();
         assert_eq!(report.get(), [2, 0, 0, 0, 0, 0, 0, 0]);
-        assert!(!keys.pending() || keys.keys.iter().all(|key| is_modifier(key.usage)));
+        // Only the Shift is left: the A that was held and the one waiting are gone.
+        assert_eq!(keys.keys.len(), 1);
+        assert!(is_modifier(keys.keys[0].usage) && keys.keys[0].down);
         keys.release(LEFT_SHIFT);
         assert_eq!(report.get(), [0; 8]);
     }
@@ -1698,7 +1821,9 @@ mod real_firmware {
         output += &board.settle();
         let typed = output.matches('a').count();
         println!("a key held for 2 s typed {typed} characters");
-        assert!(typed >= 5, "{output:?}");
+        // The firmware types the key at once, then repeats it after MMBasic's default delay of
+        // 500 ms every 75 ms: 1 + (2000 - 500) / 75 = 21, give or take the edges of the 2 s.
+        assert!((19..=22).contains(&typed), "{output:?}");
         assert!(output.chars().all(|c| c == 'a'), "{output:?}");
         // And once it is let go it stops.
         let after = board.tick();

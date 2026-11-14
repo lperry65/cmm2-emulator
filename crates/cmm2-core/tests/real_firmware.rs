@@ -1305,3 +1305,22 @@ fn real_firmware_counts_evenly_through_a_clock_change_once_the_ds3231_is_set() {
     clock.set_zone(7200);
     assert_eq!(answer_to(&mut cpu, &console, "PRINT TIME$"), "10:00:02");
 }
+
+// The firmware writes a weekday of its own with every DATE$ (1 to 7, Sunday as 7), and the chip
+// keeps it as it is given. It must be the day the date says, as it is on the real chip, so the
+// weekday count that the saved state holds stays at 0.
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test --release -- --ignored"]
+fn real_firmware_writes_the_ds3231_the_weekday_the_date_says() {
+    let (mut cpu, console, _) = boot_from(state_with_the_ds3231_on(), &host_clock());
+    // A Friday, and a Sunday, which the firmware numbers 5 and 7.
+    for date in ["05/11/27", "07/11/27"] {
+        say_all(&mut cpu, &console, &[&format!("DATE$ = \"{date}\"")]);
+        let saved = cpu.memory().ds3231().saved().unwrap();
+        assert_eq!(
+            saved[8], 1,
+            "the weekday count and the 12-hour form are 0: {saved:?}"
+        );
+    }
+    assert_eq!(answer_to(&mut cpu, &console, "PRINT DATE$"), "07-11-2027");
+}
