@@ -232,15 +232,16 @@ impl UsbDevice for HidKeyboard {
 
     fn reset(&mut self) {
         // The firmware starts again: it has no report, has not polled and has set no LEDs.
-        self.keys.0.sent.set(false);
-        self.keys.0.polled.set(false);
-        self.keys.0.leds.set(0);
-        self.keys.0.led_updates.set(0);
-        self.keys.0.polls.set(0);
         let shared = &self.keys.0;
-        shared.resets.set(shared.resets.get().saturating_add(1));
-        self.keys.0.report_polls.set(0);
-        self.keys.0.report_led_updates.set(0);
+        shared.sent.set(false);
+        shared.polled.set(false);
+        shared.leds.set(0);
+        shared.led_updates.set(0);
+        shared.polls.set(0);
+        shared.report_polls.set(0);
+        shared.report_led_updates.set(0);
+        // Compared for being different, so it may wrap.
+        shared.resets.set(shared.resets.get().wrapping_add(1));
         *self = HidKeyboard::new(self.keys.clone());
     }
 

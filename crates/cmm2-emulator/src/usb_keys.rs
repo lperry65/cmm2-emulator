@@ -69,6 +69,10 @@ struct Key {
     /// The firmware has been sent the error for it. It is reported as a key, in its turn, if it
     /// is still down when there is room, and lost if it is let go before.
     errored: bool,
+    /// It was let go while the keyboard could show reports (not more than six keys down), or the
+    /// keyboard could show them from when the error ended, or every key was let go at once: a
+    /// report without it would have been sent after it was.
+    up_visible: bool,
     /// An errored key has been in a report that was not the error, so a keyboard polled every
     /// millisecond would have sent it: it takes the modifiers of that report, and is kept until
     /// a report with it has been sent.
@@ -92,13 +96,20 @@ pub struct UsbKeys {
     /// In the order they went down. The same key can be here twice, if it was tapped again
     /// before the firmware had the first tap.
     keys: Vec<Key>,
-    /// The report the firmware was last sent.
+    /// The last report the firmware was sent that was not the rollover error, which it ignores:
+    /// the keys it holds.
     reported: [u8; 8],
+    /// Keys that were in `reported` and are up while the keyboard could show reports (six keys
+    /// down at most): it would have shown one without them, and pressed again they need that
+    /// report sent first, or the firmware would see no key up and down again. Keys let go while
+    /// the error was the report are added when it stops being.
+    up_seen: Vec<u8>,
     /// The locks have been compared with the host's since the firmware started polling.
     locks_followed: bool,
-    /// What `KeyReport::led_updates` and `polls` were when a lock key first went down since the
-    /// firmware last answered, and how many lock keys have gone down since: the firmware shows
-    /// each with an update of the LEDs.
+    /// How many LED updates and polls there were when the lock keys now being waited for were
+    /// pressed (or handed to the firmware), and how many of them there are: the firmware shows
+    /// each with an update of the LEDs. It is kept up to date at every lock key press and when a
+    /// lock key is reported, whether or not the locks are being followed.
     lock_keys: Option<LockKeys>,
     /// Whether the host reports AltGr as a Left Control down and a Right Alt down, as Windows does.
     altgr_is_ctrl_alt: bool,
@@ -118,6 +129,7 @@ impl UsbKeys {
             report,
             keys: Vec::new(),
             reported: [0; 8],
+            up_seen: Vec::new(),
             locks_followed: false,
             lock_keys: None,
             altgr_is_ctrl_alt: cfg!(windows),
@@ -167,6 +179,7 @@ impl UsbKeys {
                 overflow,
                 errored: false,
                 placed: false,
+                up_visible: false,
             });
             // The firmware answers a lock key when it is reported (see `settle`), and the LEDs are
             // counted from here.
@@ -194,13 +207,16 @@ impl UsbKeys {
     /// A key came up. One that was never pressed (a console key) is ignored.
     pub fn release(&mut self, usage: u8) {
         self.settle();
-        if let Some(key) = self
+        let held = self
             .keys
-            .iter_mut()
-            .rev()
-            .find(|key| key.usage == usage && key.down)
-        {
-            key.down = false;
+            .iter()
+            .rposition(|key| key.usage == usage && key.down);
+        if let Some(at) = held {
+            self.keys[at].down = false;
+            // While more than six keys are down the keyboard shows no report without this one.
+            let visible = self.keys_down() <= SLOTS;
+            self.keys[at].up_visible = visible;
+            self.note_ups_the_keyboard_would_show();
         }
         self.publish();
     }
@@ -210,7 +226,9 @@ impl UsbKeys {
         self.settle();
         for key in &mut self.keys {
             key.down = false;
+            key.up_visible = true;
         }
+        self.note_ups_the_keyboard_would_show();
         self.publish();
     }
 
@@ -255,6 +273,12 @@ impl UsbKeys {
     // Whether the keyboard's LED byte is what the firmware has set, and nothing is on its way
     // that would change it. The firmware answers each lock key with an update of the LEDs, so a
     // number of updates are expected, one for each lock key that has gone down.
+    //
+    // This leans on the timing of the real firmware (7.00.00b5): it sets the LEDs twice after its
+    // first poll (three times with both locks in it), all before its second, so a lock key reported at the second poll or later has
+    // its start-up updates behind it, and `was_sent()` below holds the comparison until the poll
+    // after the key. A model that answered later could take an update that was not the answer for
+    // one.
     fn leds_are_the_firmwares(&mut self) -> bool {
         self.settle();
         let report = &self.report;
@@ -276,6 +300,42 @@ impl UsbKeys {
     /// Has `follow_locks` look at the locks again, as when the window gets the focus back.
     pub fn check_locks(&mut self) {
         self.locks_followed = false;
+    }
+
+    // With no more than six keys down the keyboard shows a report without each key of the one the
+    // firmware holds that is up: those that came up now, and those that came up while the error was
+    // the report, which it now stops being.
+    fn note_ups_the_keyboard_would_show(&mut self) {
+        if self.keys_down() > SLOTS {
+            return;
+        }
+        // A tap that was let go while the error was the report, and has not been sent, is now
+        // shown to the keyboard as a key that went down and up, unless a later press of the same
+        // key follows it.
+        for at in 0..self.keys.len() {
+            let usage = self.keys[at].usage;
+            // (A later press that had no slot and is let go before it has one is lost, and is not
+            // one.)
+            let later = self.keys[at + 1..]
+                .iter()
+                .any(|key| key.usage == usage && (key.down || !key.overflow || key.placed));
+            let key = &mut self.keys[at];
+            if !key.down && !key.sent && !is_modifier(usage) && !later {
+                key.up_visible = true;
+            }
+        }
+        for usage in self.reported[2..]
+            .iter()
+            .copied()
+            .filter(|&usage| usage > 0)
+        {
+            // A key of that usage that has not been sent is a later press, and its own coming up
+            // is not the up of the key the firmware holds.
+            let later = self.keys.iter().any(|key| key.usage == usage && !key.sent);
+            if !self.is_down(usage) && !later && !self.up_seen.contains(&usage) {
+                self.up_seen.push(usage);
+            }
+        }
     }
 
     // How many keys other than modifiers are down.
@@ -317,19 +377,37 @@ impl UsbKeys {
             self.lock_keys = None;
         }
         if self.report.was_sent() {
-            self.reported = self.report.get();
-            let error = self.reported[2] == ROLLOVER;
+            let report = self.report.get();
+            let error = report[2] == ROLLOVER;
+            if !error {
+                self.reported = report;
+                // The report without a key that was let go has been sent.
+                self.up_seen.retain(|usage| report[2..].contains(usage));
+            }
             // What the keyboard counted as it handed the report over, not as the window looks.
             let (polls, updates) = (
                 self.report.polls_at_report(),
                 self.report.led_updates_at_report(),
             );
+            // The first poll since the firmware started is followed by an update of the LEDs that
+            // is its own, the state it starts with, and then by the answer to a lock key in it
+            // (measured on the real firmware, with one update for any number of lock keys).
+            let mut start = polls == 1 && updates == 0;
             for key in &mut self.keys {
+                // A tap that has been sent was let go before, and the report without it is next.
+                if !key.sent
+                    && key.shown
+                    && key.up_visible
+                    && !is_modifier(key.usage)
+                    && !self.up_seen.contains(&key.usage)
+                {
+                    self.up_seen.push(key.usage);
+                }
                 key.sent |= key.shown;
                 key.errored |= error && key.overflow;
                 // A lock key toggles the firmware's lock when it first comes in a report as a
                 // key: one that was lost to the error, or is held through it, does so later.
-                if !key.appeared && self.reported[2..].contains(&key.usage) {
+                if !key.appeared && !error && report[2..].contains(&key.usage) {
                     key.appeared = true;
                     if matches!(key.usage, CAPS_LOCK | NUM_LOCK) {
                         // With nothing counted (the keyboard was reset since the press, or the
@@ -353,11 +431,9 @@ impl UsbKeys {
                             }
                         }
                         locks.presses += 1;
-                        // The first poll since the firmware started is followed by an update of
-                        // the LEDs that is its own, the state it starts with, and then by the
-                        // answer to the key (measured on the real firmware).
-                        if polls == 1 && updates == 0 {
+                        if start {
                             locks.presses += 1;
+                            start = false;
                         }
                     }
                 }
@@ -380,6 +456,7 @@ impl UsbKeys {
                 key.sent = false;
             }
             self.reported = [0; 8];
+            self.up_seen.clear();
             self.report.set(self.modifiers_down_report());
             return;
         }
@@ -448,7 +525,7 @@ impl UsbKeys {
             };
             let clashes = held_back
                 || waiting_in_report + held >= SLOTS
-                || self.reported[2..].contains(&key.usage)
+                || self.reported[2..].contains(&key.usage) && self.up_seen.contains(&key.usage)
                 || taken(key.usage)
                 || modifiers.is_some_and(|bits| bits != own(key));
             if clashes {
@@ -467,12 +544,8 @@ impl UsbKeys {
         });
         let mut report = [0; 8];
         report[0] = modifiers;
-        let mut count = 0;
-        for &at in &in_report {
-            if count < SLOTS {
-                report[2 + count] = self.keys[at].usage;
-            }
-            count += 1;
+        for (slot, &at) in in_report.iter().take(SLOTS).enumerate() {
+            report[2 + slot] = self.keys[at].usage;
         }
         // More keys down than there are slots is the rollover error, which reports no key: the
         // firmware is told only that there are too many, as by a real keyboard.
@@ -481,8 +554,7 @@ impl UsbKeys {
         // seven were down, and the emulator is polled too slowly to be sure it was.
         let rollover =
             self.keys_down() > SLOTS || self.keys.iter().any(|key| key.overflow && !key.errored);
-        let error = rollover || count > SLOTS;
-        if error {
+        if rollover {
             report[2..].fill(ROLLOVER);
         }
         for (at, key) in self.keys.iter_mut().enumerate() {
@@ -492,7 +564,7 @@ impl UsbKeys {
                 // The error report shows no key: the firmware has only the keys it already had,
                 // and the others, down or let go, wait for their turn. A key that had no slot
                 // is lost if it is let go before it has one (see `errored`).
-                if error {
+                if rollover {
                     key.down && key.sent
                 } else {
                     in_report.contains(&at)
@@ -555,24 +627,13 @@ mod tests {
         panic!("the keys never had nothing more to send");
     }
 
-    /// What a firmware types from the reports it is sent, after one with no keys: each key is
-    /// typed when it is in a report and was not in the one before, with that report's modifiers.
-    /// The firmware ignores the rollover error and goes on with the report it had.
+    /// What a firmware types from the reports it is sent, after one with no keys (see `hear`).
     fn typed_by_the_firmware(reports: impl IntoIterator<Item = [u8; 8]>) -> Vec<(u8, u8)> {
-        let mut typed = Vec::new();
         let mut last = [0; 8];
-        for report in reports {
-            if report[2] == ROLLOVER {
-                continue;
-            }
-            for &key in &report[2..] {
-                if key > 0 && !last[2..].contains(&key) {
-                    typed.push((key, report[0]));
-                }
-            }
-            last = report;
-        }
-        typed
+        reports
+            .into_iter()
+            .flat_map(|report| hear(&mut last, In::Data(report.to_vec())))
+            .collect()
     }
 
     /// The report the firmware ends up with, once it has all of them.
@@ -1767,6 +1828,226 @@ mod tests {
     }
 
     #[test]
+    fn a_key_let_go_and_pressed_again_before_the_error_is_polled_is_typed_twice() {
+        let (mut keys, mut keyboard, _) = polled();
+        let mut reports: Vec<[u8; 8]> = Vec::new();
+        let mut look = |keys: &mut UsbKeys, keyboard: &mut HidKeyboard| {
+            if let In::Data(report) = poll(keyboard) {
+                reports.push(report.try_into().unwrap());
+            }
+            keys.sync();
+        };
+        for usage in A..A + 6 {
+            keys.press(usage);
+            look(&mut keys, &mut keyboard);
+        }
+        // A comes up and goes down again, and a seventh key goes down, with no poll between: the
+        // keyboard would have sent the report without A, and the firmware ignores the error.
+        keys.release(A);
+        keys.press(A);
+        keys.press(0x0B);
+        look(&mut keys, &mut keyboard);
+        keys.release(0x0B);
+        look(&mut keys, &mut keyboard);
+        look(&mut keys, &mut keyboard);
+        let typed = typed_keys(reports);
+        assert_eq!(
+            typed.iter().filter(|&&key| key == A).count(),
+            2,
+            "{typed:?}"
+        );
+    }
+
+    #[test]
+    fn a_tap_let_go_while_more_than_six_keys_are_down_needs_no_gap_before_it_is_pressed_again() {
+        // Two key changes between polls, so outside the limits of the property test, shrunk from
+        // it: the tap of 9 is let go with seven keys down, which the keyboard shows no report
+        // for, and is typed once by both.
+        let events = [
+            (57, false),
+            (6, false),
+            (9, false),
+            (4, true),
+            (83, false),
+            (9, false),
+            (9, true),
+            (7, false),
+            (5, true),
+            (8, false),
+            (9, false),
+            (9, false),
+            (8, true),
+            (57, true),
+            (10, false),
+        ];
+        let (firmware, ideal) = typed_by_the_keys_and_by_a_1_ms_keyboard(&events);
+        assert_eq!(firmware, ideal);
+    }
+
+    #[test]
+    fn a_key_let_go_while_the_error_was_the_report_is_pressed_again_after_it_ends() {
+        // A to F held, G and H seventh and eighth, A let go (seven down: the keyboard shows
+        // nothing), H let go (six: it shows the report without A), and A pressed again before a
+        // poll: typed twice.
+        let events = [
+            (4, true),
+            (5, true),
+            (6, true),
+            (7, true),
+            (8, true),
+            (9, true),
+            (10, true),
+            (11, true),
+            (4, true),
+            (11, false),
+            (4, false),
+            (5, true),
+        ];
+        let (firmware, ideal) = typed_by_the_keys_and_by_a_1_ms_keyboard(&events);
+        assert_eq!(firmware, ideal);
+    }
+
+    #[test]
+    fn a_key_pressed_again_in_the_error_and_let_go_is_not_a_gap_for_the_key_the_firmware_holds() {
+        // 4 is let go and pressed again while seven keys are down, then comes up for good: the
+        // firmware holds the first 4 throughout and types nothing more (shrunk from the
+        // property test with the limit of one key change between polls lifted).
+        let events = [
+            (11, false),
+            (83, false),
+            (4, false),
+            (7, true),
+            (10, false),
+            (5, true),
+            (12, true),
+            (6, false),
+            (4, false),
+            (4, true),
+            (6, false),
+            (12, false),
+            (4, true),
+        ];
+        let (firmware, ideal) = typed_by_the_keys_and_by_a_1_ms_keyboard(&events);
+        assert_eq!(firmware, ideal);
+    }
+
+    #[test]
+    fn a_tap_let_go_while_the_error_was_the_report_has_its_gap_when_the_error_ends() {
+        // Shrunk from the property test with the limit of one key change between polls lifted:
+        // 11 is tapped as a seventh key, and pressed again after the keys have come down to six.
+        let events = [
+            (8, false),
+            (12, false),
+            (7, false),
+            (6, true),
+            (4, false),
+            (11, false),
+            (10, false),
+            (5, false),
+            (11, true),
+            (12, false),
+            (11, false),
+        ];
+        let (firmware, ideal) = typed_by_the_keys_and_by_a_1_ms_keyboard(&events);
+        assert_eq!(firmware, ideal);
+    }
+
+    #[test]
+    fn a_later_press_that_is_dropped_does_not_take_the_gap_of_the_tap_before_it() {
+        // 4 is tapped as the error begins, and a later 4 is pressed and let go while the error is
+        // still the report, and dropped without a place: the first tap has its gap all the same.
+        let events = [
+            (5, true),
+            (6, true),
+            (7, true),
+            (8, true),
+            (9, true),
+            (4, false),
+            (10, false),
+            (11, false),
+            (4, false),
+            (4, false),
+            (4, false),
+            (10, false),
+            (11, true),
+            (4, true),
+            (4, true),
+        ];
+        let (firmware, ideal) = typed_by_the_keys_and_by_a_1_ms_keyboard(&events);
+        // (11 is lost, outside the limits of the property test, and is not this test's business.)
+        let fours = |typed: &Typed| typed.iter().filter(|&&(key, _)| key == 4).count();
+        assert_eq!((fours(&firmware), fours(&ideal)), (2, 2), "{firmware:?}");
+    }
+
+    #[test]
+    fn the_model_of_the_firmware_ignores_the_error() {
+        let error = [0, 0, 1, 1, 1, 1, 1, 1];
+        let a = [0, 0, A, 0, 0, 0, 0, 0];
+        assert_eq!(typed_by_the_firmware([a, error, a]), [(A, 0)]);
+        assert_eq!(
+            typed_by_the_firmware([a, error, [0; 8], a]),
+            [(A, 0), (A, 0)]
+        );
+    }
+
+    #[test]
+    fn caps_and_num_lock_in_the_first_report_after_a_start_are_answered_by_the_third_update() {
+        let (mut keys, mut keyboard, _) = polled_with_leds(0);
+        for usage in [CAPS_LOCK, NUM_LOCK] {
+            keys.press(usage);
+            keys.release(usage);
+        }
+        keyboard.reset();
+        keyboard.setup([0x00, 0x09, 1, 0, 0, 0, 0, 0]);
+        keyboard.in_token(0, 8);
+        poll(&mut keyboard);
+        keys.sync();
+        delivered(&mut keys, &mut keyboard);
+        // The firmware's own start, and then one update for the pair: 0, then 3 and 3.
+        set_leds(&mut keyboard, 0);
+        set_leds(&mut keyboard, LED_CAPS | LED_NUM);
+        keys.follow_locks(false, Some(false));
+        assert_eq!(delivered(&mut keys, &mut keyboard), NOTHING);
+        set_leds(&mut keyboard, LED_CAPS | LED_NUM);
+        keys.follow_locks(false, Some(false));
+        // Both are tapped, in one report.
+        assert_eq!(
+            delivered(&mut keys, &mut keyboard),
+            [[0, 0, CAPS_LOCK, NUM_LOCK, 0, 0, 0, 0], [0; 8]]
+        );
+    }
+
+    #[test]
+    fn a_lock_key_in_the_first_report_is_not_given_a_start_if_the_firmware_has_set_the_leds() {
+        // An update before the first poll is the firmware's start, and is over.
+        let (mut keys, mut keyboard, _) = polled_with_leds(0);
+        keys.press(CAPS_LOCK);
+        keys.release(CAPS_LOCK);
+        keyboard.reset();
+        keyboard.setup([0x00, 0x09, 1, 0, 0, 0, 0, 0]);
+        keyboard.in_token(0, 8);
+        set_leds(&mut keyboard, 0);
+        poll(&mut keyboard);
+        keys.sync();
+        delivered(&mut keys, &mut keyboard);
+        set_leds(&mut keyboard, LED_CAPS);
+        keys.follow_locks(false, Some(false));
+        assert_eq!(delivered(&mut keys, &mut keyboard).len(), 2);
+    }
+
+    #[test]
+    fn a_lock_key_in_a_later_poll_is_not_given_a_start() {
+        let (mut keys, mut keyboard, _) = polled();
+        keys.press(CAPS_LOCK);
+        keys.release(CAPS_LOCK);
+        delivered(&mut keys, &mut keyboard);
+        // No update yet, and the first one is the answer.
+        set_leds(&mut keyboard, LED_CAPS);
+        keys.follow_locks(false, Some(false));
+        assert_eq!(delivered(&mut keys, &mut keyboard).len(), 2);
+    }
+
+    #[test]
     fn altgr_as_control_and_alt_in_a_row_leaves_the_control_out_where_the_host_does_that() {
         let (mut keys, mut keyboard, _) = polled();
         keys.altgr_is_ctrl_alt = true;
@@ -2064,13 +2345,69 @@ mod tests {
         true
     }
 
-    /// How many of `rounds` random runs of 60 changes of nine keys and two modifiers, that keep
-    /// to `limits`, the firmware types differently from the keys than from a 1 ms keyboard. The
-    /// first is printed, as short as it can be made.
-    fn mismatches_with(limits: Limits, rounds: u32) -> u32 {
-        const USAGES: [u8; 11] = [A, B, 6, 7, 8, 9, 10, 11, 12, LEFT_SHIFT, 0xE0];
+    /// How the keys typed by the window differ from those typed for a 1 ms keyboard.
+    #[derive(Default)]
+    struct Kinds {
+        /// Only some of the keys the keyboard gives, counting repeats: keys lost.
+        lost: u32,
+        /// The same keys, with other modifiers.
+        modifiers: u32,
+        /// The same keys in another order.
+        order: u32,
+        /// More keys than the keyboard gives.
+        extra: u32,
+        /// Some lost and some extra.
+        mixed: u32,
+        /// The rounds that differ, for comparing two versions of the keys.
+        rounds: Vec<u32>,
+    }
+
+    impl Kinds {
+        fn total(&self) -> u32 {
+            self.lost + self.modifiers + self.order + self.extra + self.mixed
+        }
+
+        fn count(&mut self, firmware: &Typed, ideal: &Typed) {
+            let keys = |typed: &Typed| typed.iter().map(|&(key, _)| key).collect::<Vec<u8>>();
+            let (f, i) = (keys(firmware), keys(ideal));
+            let sorted = |mut keys: Vec<u8>| {
+                keys.sort_unstable();
+                keys
+            };
+            // Whether every key of `a` is in `b`, counting repeats.
+            let within = |a: &Vec<u8>, b: &Vec<u8>| {
+                let mut rest = b.clone();
+                a.iter().all(|key| {
+                    rest.iter()
+                        .position(|other| other == key)
+                        .map(|at| rest.remove(at))
+                        .is_some()
+                })
+            };
+            if f == i {
+                self.modifiers += 1;
+            } else if sorted(f.clone()) == sorted(i.clone()) {
+                self.order += 1;
+            } else if within(&f, &i) {
+                self.lost += 1;
+            } else if within(&i, &f) {
+                self.extra += 1;
+            } else {
+                self.mixed += 1;
+            }
+        }
+    }
+
+    /// How many of `rounds` random runs of 60 changes of nine keys, the two lock keys and two
+    /// modifiers, that keep to `limits`, the firmware types differently from the keys than from a
+    /// 1 ms keyboard. The first is printed, as short as it can be made.
+    fn mismatches_with(limits: Limits, rounds: u32) -> Kinds {
+        const USAGES: [u8; 13] = [
+            A, B, 6, 7, 8, 9, 10, 11, 12, CAPS_LOCK, NUM_LOCK, LEFT_SHIFT, 0xE0,
+        ];
         let mut random = Random(0x2545_F491_4F6C_DD1D);
-        let mut mismatches = 0;
+        let mut kinds = Kinds::default();
+        let mut shown = false;
         for round in 0..rounds {
             let mut events: Vec<(u8, bool)> = Vec::new();
             for _ in 0..60 {
@@ -2086,8 +2423,10 @@ mod tests {
             if firmware == ideal {
                 continue;
             }
-            mismatches += 1;
-            if mismatches == 1 {
+            kinds.count(&firmware, &ideal);
+            kinds.rounds.push(round);
+            if !shown {
+                shown = true;
                 let differs = |events: &[(u8, bool)]| {
                     let (firmware, ideal) = typed_by_the_keys_and_by_a_1_ms_keyboard(events);
                     firmware != ideal
@@ -2113,14 +2452,14 @@ mod tests {
                 eprintln!("round {round}: {events:?}\n{firmware:?}\n{ideal:?}");
             }
         }
-        mismatches
+        kinds
     }
 
     #[test]
     fn what_the_firmware_types_is_what_a_keyboard_polled_every_millisecond_gives_it() {
         // At most one key changes between two polls of the keys, as with a 1 ms keyboard and a
         // person, and a modifier is not changed twice or pressed after a key before a poll.
-        assert_eq!(mismatches_with(STRICT, 20_000), 0);
+        assert_eq!(mismatches_with(STRICT, 20_000).total(), 0);
     }
 
     #[test]
@@ -2149,7 +2488,26 @@ mod tests {
                 },
             ),
         ] {
-            println!("{name}: {} of 20000", mismatches_with(limits, 20_000));
+            let kinds = mismatches_with(limits, 20_000);
+            println!(
+                "{name}: {} of 20000 (lost {}, modifiers {}, order {}, extra {}, mixed {})",
+                kinds.total(),
+                kinds.lost,
+                kinds.modifiers,
+                kinds.order,
+                kinds.extra,
+                kinds.mixed
+            );
+            // For comparing two versions: CMM2_FUZZ_OUT=<file> lists the rounds that differ.
+            if let Ok(path) = std::env::var("CMM2_FUZZ_OUT") {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap();
+                writeln!(file, "{name}: {:?}", kinds.rounds).unwrap();
+            }
         }
     }
 
@@ -2450,6 +2808,36 @@ mod real_firmware {
         LETTERS[(upper as u8 - b'A') as usize]
     }
 
+    // Caps Lock and Num Lock together in the first report after the firmware starts to poll are
+    // answered by one more update, not two: the LEDs are set three times in all, the first with
+    // the firmware's own state and then twice with both locks on, and no more after that.
+    #[test]
+    #[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test --release -- --ignored"]
+    fn real_firmware_sets_the_leds_three_times_for_caps_and_num_lock_in_its_first_report_over_usb()
+    {
+        let mut board = Board::boot();
+        board.restart();
+        board
+            .keys
+            .report
+            .set([0, 0, CAPS_LOCK, NUM_LOCK, 0, 0, 0, 0]);
+        let report = board.keys.report.clone();
+        let mut changes = Vec::new();
+        while report.polls() <= 400 {
+            board.run(10_000);
+            let now = (report.led_updates(), report.leds());
+            if changes.last() != Some(&now) && now.0 > 0 {
+                changes.push(now);
+            }
+        }
+        assert_eq!(report.polls_at_report(), 1, "the first poll had the keys");
+        assert_eq!(report.led_updates_at_report(), 0);
+        assert_eq!(
+            changes,
+            [(1, 0), (2, LED_CAPS | LED_NUM), (3, LED_CAPS | LED_NUM)]
+        );
+    }
+
     // The firmware ignores a report with the rollover error in the key slots and goes on with the
     // report it had, which the model of the firmware in the tests above relies on.
     // A Caps Lock in the first report after the firmware starts to poll is answered by the second
@@ -2462,14 +2850,20 @@ mod real_firmware {
         // The keys are not looked at, so the report stays as it is until the firmware polls.
         board.keys.report.set([0, 0, CAPS_LOCK, 0, 0, 0, 0, 0]);
         let report = board.keys.report.clone();
-        for _ in 0..30_000 {
-            board.run(100_000);
+        let mut first_leds = None;
+        for _ in 0..300_000 {
+            board.run(10_000);
+            if report.led_updates() == 1 && first_leds.is_none() {
+                first_leds = Some(report.leds());
+            }
             if report.led_updates() >= 2 {
                 break;
             }
         }
         assert_eq!(report.polls_at_report(), 1, "the first poll had the key");
         assert_eq!(report.led_updates_at_report(), 0);
+        // The first update is the firmware's own state, all off, and then the lock is shown.
+        assert_eq!(first_leds, Some(0));
         assert_eq!(report.led_updates(), 2);
         assert_eq!(report.leds() & LED_CAPS, LED_CAPS);
     }

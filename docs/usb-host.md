@@ -693,27 +693,45 @@ it, and it does not tap a lock while six keys are down, as the tap would be a se
 A Caps Lock or Num Lock is waited for (the LED update the firmware answers it with) when it is first
 reported as a key, and not when it goes down, so one lost to the error is not waited for and one
 held through it is, counting its polls and LED updates from the keyboard handing over its report. I
-measured the first poll after the firmware starts: with Caps Lock in it, the firmware sets the LEDs
-twice, the first with its own state (all off) and the second with the lock on, so the window expects
-two updates for a lock key in that first poll. The count of lock keys is kept up to date whether or
+measured the first poll after the firmware starts: with one lock key in it the firmware sets the
+LEDs twice, the first with its own state (all off) and the second with the lock on, and with Caps
+Lock and Num Lock together three times (all off, then both on twice), so the window expects one
+extra update per start, and not one per key. The count of lock keys is kept up to date whether or
 not the locks are being followed: what the firmware has answered is done with at the next lock key,
 the wait for one that has not been answered runs from its press, and a reset of the keyboard takes
 the count with it (a lock key reported first after a reset starts a new count).
 
 I property tested the keys against a keyboard polled after every change (`usb_keys.rs`): 20,000
-random runs of 60 changes of nine keys and two modifiers, with at most one key changing between two
-polls of the keys, no modifier changed twice and none pressed after a key changed, type exactly what
-a keyboard polled every millisecond gives a firmware that ignores the error, modifiers included.
-Outside those limits they do not, as they cannot: the window is polled less often than the keyboard.
-Counting the runs that differ of 20,000 with one limit lifted at a time, I got 5 for a modifier
-pressed after a key changed, 24 for a modifier changed twice and 10,764 for two key changes between
-polls. I traced the shrunk run the test prints for the last: a key let go and pressed again around
-the error is typed once where the keyboard types it twice, because the window compares it with the
-error report and not with the key the firmware still holds. That is one lost keystroke, and most of
-the 10,764 are lost keystrokes of that kind, but sorting them shows they are not all: 9,061 type a
-subset of the keys the keyboard gives (keys lost), 1,272 type the same keys with different
-modifiers, 131 differ in the order or in which keys, 117 type extra keys and 183 are a mixture. I
-have not fixed them yet.
+random runs of 60 changes of eleven keys and two modifiers (nine plain keys and Caps Lock and Num
+Lock, which here are just two more keys: the test does not call the lock following), with at most
+one key changing between two polls of the keys, no modifier changed twice and none pressed after a
+key changed, type exactly what a keyboard polled every millisecond gives a firmware that ignores the
+error, modifiers included. Outside those limits they do not, as they cannot: the window is polled
+less often than the keyboard. One thing the test found and I fixed: a key let go and pressed again
+before the error was polled was typed once where the keyboard types it twice, because the window
+compared it with the error report and not with the last report that was not the error, which is the
+key the firmware still holds. The gap, a report without the key sent before it is pressed again, is
+needed only if the keyboard would have shown a report without it. While seven keys are down it shows
+none, so a key let go then and pressed again while seven are still down needs no gap. Once the keys
+come down to six it shows the report without every key that was let go in the meantime, and the
+window notes those for the gap: the keys the firmware holds, and a tap that has not been sent,
+unless the same key is pressed again later. Counting the runs that differ of 20,000 with one limit
+lifted at a time, I got 6 for a modifier pressed after a key changed, 111 for a modifier changed
+twice and 13,846 for two key changes between polls. Sorting them: for the modifier pressed after a
+key, all 6 are the same keys with other modifiers; for the modifier changed twice, 14 lose keys, 24
+have other modifiers, 1 has another order, 67 type extra keys and 5 are a mixture; for the two key
+changes, 9,716 lose keys, 2,452 have other modifiers, 46 have another order, 622 type extra keys and
+1,010 are a mixture. Most of the two-key-change differences are keys lost, as a tap or a second key
+between two polls is a thing the keyboard would have shown twice. Run round by round against the
+version I had committed, 1,860 of the two-key-change rounds are fixed and 1 is new (round 13,359);
+against the version before the last change, 62 are fixed and 1 is new (round 10,387, the same keys
+with other modifiers). The shrunk run of 13,359 is this: a key is pressed while seven are down and
+gets the error, a poll follows, then another key comes up leaving six, and the first key is let go.
+The window drops that key where the keyboard would have shown it, because it was never put in a
+report: a key waiting before it held it back, with a difference in modifiers between them. That is
+what I could see in the run, and I have not traced the mechanism beyond it. The committed version
+typed the key only through its old rule of always leaving a gap. A broader rule for it was tried in
+review and made the counts worse; I did not test it again.
 
 Property tested (`usb_keys.rs`, 3000 random sequences of presses and releases of three keys and
 three modifiers, with the firmware polling at random in between, and no more than one key going down
