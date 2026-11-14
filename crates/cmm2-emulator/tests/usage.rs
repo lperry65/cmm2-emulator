@@ -6,7 +6,7 @@ use common::*;
 use std::path::PathBuf;
 use std::process::Command;
 
-const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--console-keys] [--unpaced] [--flash <file>] [--sd <file>]";
+const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--console-keys] [--unpaced] [--flash <file>] [--sd <file>] [--rng-seed <number>]";
 
 // Writes a file with the given vector table words to a unique temp path.
 fn temp_firmware(name: &str, sp: u32, reset: u32) -> PathBuf {

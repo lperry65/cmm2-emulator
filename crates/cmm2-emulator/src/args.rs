@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--console-keys] [--unpaced] [--flash <file>] [--sd <file>]";
+pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--console-keys] [--unpaced] [--flash <file>] [--sd <file>] [--rng-seed <number>]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -41,6 +41,9 @@ pub struct RunOptions {
     /// A card image for the SD socket, which has to exist already and is written back at the
     /// end if the guest changed the card.
     pub sd: Option<String>,
+    /// Fixes the RNG's values, so that a run repeats; without it they come from the host's
+    /// entropy and differ from run to run, as the chip's do.
+    pub rng_seed: Option<u64>,
 }
 
 /// Keys to send once the guest has printed some text.
@@ -56,6 +59,7 @@ pub enum ArgError {
     Usage,
     Unknown(String),
     BadCount(String),
+    BadSeed(String),
     BadAddress(String),
     NeedsFirmware(String),
     NeedsConsole(String),
@@ -74,6 +78,7 @@ impl fmt::Display for ArgError {
             ArgError::Usage => {}
             ArgError::Unknown(arg) => writeln!(f, "cmm2-emulator: unknown argument '{arg}'")?,
             ArgError::BadCount(arg) => writeln!(f, "cmm2-emulator: bad count '{arg}'")?,
+            ArgError::BadSeed(arg) => writeln!(f, "cmm2-emulator: bad seed '{arg}'")?,
             ArgError::BadAddress(arg) => writeln!(f, "cmm2-emulator: bad address '{arg}'")?,
             ArgError::NeedsFirmware(option) => {
                 writeln!(f, "cmm2-emulator: {option} needs --firmware")?
@@ -134,7 +139,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, ArgError
         Some(
             option @ ("--run" | "--stop-at" | "--trace" | "--trace-mmio" | "--trace-from"
             | "--console" | "--on" | "--screenshot" | "--window" | "--console-keys"
-            | "--unpaced" | "--flash" | "--sd"),
+            | "--unpaced" | "--flash" | "--sd" | "--rng-seed"),
         ) => Err(ArgError::NeedsFirmware(option.to_string())),
         Some(arg) => Err(ArgError::Unknown(arg.to_string())),
     }
@@ -169,6 +174,10 @@ fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOption
             "--unpaced" => options.unpaced = true,
             "--flash" => options.flash = Some(file_name(&mut args, "--flash")?),
             "--sd" => options.sd = Some(file_name(&mut args, "--sd")?),
+            "--rng-seed" => {
+                let seed = args.next().ok_or(ArgError::Usage)?;
+                options.rng_seed = Some(parse_count(&seed).map_err(|_| ArgError::BadSeed(seed))?)
+            }
             "--screenshot" => options.screenshot = Some(file_name(&mut args, "--screenshot")?),
             "--on" => {
                 let text = args.next().ok_or(ArgError::Usage)?;
@@ -423,6 +432,47 @@ mod tests {
         assert_eq!(
             parse_args(&["--console-keys"]),
             Err(ArgError::NeedsFirmware("--console-keys".into()))
+        );
+    }
+
+    #[test]
+    fn rng_seed_takes_a_decimal_or_hex_number() {
+        assert_eq!(
+            run_options(&["--console", "--rng-seed", "42"]).rng_seed,
+            Some(42)
+        );
+        assert_eq!(
+            run_options(&["--console", "--rng-seed", "0xFFFFFFFFFFFFFFFF"]).rng_seed,
+            Some(u64::MAX)
+        );
+        assert_eq!(run_options(&["--console"]).rng_seed, None);
+    }
+
+    #[test]
+    fn rng_seed_must_be_a_number() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--console", "--rng-seed", "x"]),
+            Err(ArgError::BadSeed("x".into()))
+        );
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--console", "--rng-seed"]),
+            Err(ArgError::Usage)
+        );
+    }
+
+    #[test]
+    fn rng_seed_needs_the_firmware() {
+        assert_eq!(
+            parse_args(&["--rng-seed", "1"]),
+            Err(ArgError::NeedsFirmware("--rng-seed".into()))
+        );
+    }
+
+    #[test]
+    fn rng_seed_alone_has_nothing_to_run() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--rng-seed", "1"]),
+            Err(ArgError::NothingToRun)
         );
     }
 

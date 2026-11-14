@@ -53,11 +53,16 @@ The model is `crates/cmm2-core/src/rng.rs`, with its tests in `rng/tests.rs`.
   off. I take the AHB clock to be 240 MHz, as I do for the timers. On the board's hsi48 the first
   four words come 2346 core cycles (about 4.9 us) after `RNGEN`, and each next four 426 cycles
   after the buffer empties.
-- The RCC side: `RNGEN`, `RNGRST` and `RNGSEL` in `rcc.rs`, handed to the RNG through a small
-  shared handle (`rcc/rng_clock.rs`) that logs each change with its cycle, as the pixel clock
-  does. `0x13C` is an alias of `0x0DC` for the AHB2ENR. With the clock off the registers read 0
-  and writes are dropped. `RNGSEL` sets the kernel clock: hsi48 48 MHz, lse 32.768 kHz, lsi
-  32 kHz.
+- The RCC side: `RNGEN`, `RNGRST` and `RNGSEL` in `rcc.rs`, handed to the RNG through a shared
+  handle (`rcc/signal.rs`, which the pixel clock uses too) that logs each change with its
+  cycle. `0x13C` is an alias of `0x0DC` for the AHB2ENR. With the clock off, or the block held
+  in reset by `RNGRST`, the registers read 0 and writes are dropped. `RNGSEL` sets the kernel
+  clock, and it only exists while the oscillator it picks is on: hsi48 (48 MHz, `RC48ON` in
+  `RCC_CR`), pll1_q (48 MHz as I take it, with `PLL1ON`), lse (32.768 kHz, `LSEON`) or lsi
+  (32 kHz, `LSION`). With no kernel clock nothing is made, and with `CED` clear the clock check
+  complains. After a system reset the RNG assumes the RCC's reset state (clock off). That
+  holds because the RCC's reset leaves RNGSEL at 0 and RC48ON clear and tells the RNG so, and a
+  test holds the two together. It does not depend on which of the two windows is reset first.
 - The clock error is real: with `CED` clear, choosing lse or lsi under the 7.5 MHz limit sets
   `CECS` and `CEIS` and follows the clock, and `CEIS` stays until it is cleared.
 - The interrupt goes through `Irqs` as IRQ 80. The line is a level on the chip but `Irqs` is edge
@@ -66,14 +71,19 @@ The model is `crates/cmm2-core/src/rng.rs`, with its tests in `rng/tests.rs`.
 - The values come from xoshiro256**, seeded by splitmix64 (`rng/prng.rs`), no crate. By default
   the seed comes from the host (the OS entropy behind the standard library's hash keys), so the
   values differ from run to run. `cmm2_memory_with_rng_seed` fixes it for tests and repeatable
-  runs. There is no command line option for it: nothing in the emulator's own runs wants one.
+  runs, and `--rng-seed <number>` on the command line does the same for a run, which a scripted
+  run that uses `RND` needs (`RANDOMIZE` does not help, as `RND` reads the hardware RNG).
 - A seed error cannot happen on this source, but the flags and the recovery sequence are there.
   Only a test can make one.
 
 ## What the firmware does with it
 
-- The boot code writes `RCC_D2CCIP2R` (RNGSEL 0, so hsi48), turns on `RNGEN` in `RCC_AHB2ENR`,
-  writes `RNG_CR` twice, then sets `RNGEN` and polls `RNG_SR` about 14 times before `DRDY`.
+- The boot code writes `RCC_D2CCIP2R` (RNGSEL 0, so hsi48), has `RC48ON` set in `RCC_CR`,
+  turns on `RNGEN` in `RCC_AHB2ENR`, and then I see this on the RNG, in each of the two boots
+  (before and after the reset that follows the date prompt), from a trace of the accesses: read
+  `RNG_CR`, write `RNG_CR` = 0, read `RNG_CR`, write `RNG_CR` = 4 (`RNGEN`), then 98 reads of
+  `RNG_SR` that show `DRDY` clear, and a 99th that shows it set. The polls are fast, so the
+  98 reads span the 2346 core cycles of the first set.
 - MMBasic's `RND` reads the hardware RNG: `PRINT RND` reads `RNG_SR` and then `RNG_DR` once, and
   the value follows the seed. Before the model existed it gave a fixed first value.
 
@@ -85,8 +95,31 @@ The model is `crates/cmm2-core/src/rng.rs`, with its tests in `rng/tests.rs`.
   drops after four reads and the next four take the refill time.
 - The shorter restart after `RNGEN` is cleared and set again (16 RNG clocks and 216 AHB clocks,
   34.3.8). It takes the refill time.
-- pll1_q as a kernel clock choice: PLL1 is not worked out, so I take it as 48 MHz.
+- pll1_q as a kernel clock choice: PLL1's outputs are not worked out, so I take 48 MHz while
+  PLL1 is on, and `DIVQ1EN` is not looked at.
 - A kernel clock that changes in the middle of a start: the work done so far is kept as cycles.
 - A real seed error. The 34.3.7 recovery sequence is only exercised by the tests.
 - What an access with the clock off returns beyond "invalid data" (I return 0), and CStop or
   low-power gating (`RNGLPEN`).
+
+## Where the manual does not settle it, and what I chose
+
+- 213 or 216 AHB clocks: 34.3.3 and 34.5 say 213, and 34.3.8 and 34.7.3 say 216. 34.5 is the
+  section that gives the processing times, so I use its 213 for the first set and for each
+  refill. The 216 of 34.3.8 is for the restart (not modelled) and the 216 of 34.7.3 is a
+  register-level figure for the same refill, so I leave it out.
+- The first set stops while `RNGEN` is clear and resumes where it was (34.3.8 says so). A
+  refill that has started while `RNGEN` was set carries on to the end with `RNGEN` clear, as the
+  note in 34.7.2 says `DRDY` can rise then, because the conditioning runs on the AHB clock. A
+  refill that would start with `RNGEN` already clear waits for it.
+- `CECS` is cleared while `RNGEN` is clear. The manual ties it to the clock condition only
+  ("valid only if CED is 0"), so this is my choice. `CEIS` is set when `CECS` rises, and not set
+  again by a clear while the clock is still wrong.
+- `SECS` clears after the 12th word is read and thrown away once `SEIS` has been cleared. The
+  manual ties `SECS` to the noise condition, and gives the 12 words as the recovery sequence.
+- A seed error does not zero the words already made. 34.3.7 says they can be read but should
+  not be used, while 34.7.3 says a zero means a seed error happened, so the manual disagrees
+  with itself.
+- Any write to `RNG_SR` raises the interrupt again while it is active, as I do for a read of
+  `RNG_DR`, so a handler that returns with the level still active is entered again.
+- With no bus clock, a read gives 0, where the manual says "invalid data" (8.5.11).

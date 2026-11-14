@@ -7,7 +7,10 @@ use crate::local_clock::LocalClock;
 use crate::storage::{load_flash, load_sd};
 use crate::trace::{TraceOut, trace_out};
 use crate::usb_keys::UsbKeys;
-use cmm2_core::{Console, Cpu, Firmware, HidKeyboard, Irqs, KeyReport, SdSlot, cmm2_memory};
+use cmm2_core::{
+    Console, Cpu, Firmware, HidKeyboard, Irqs, KeyReport, SdSlot, cmm2_memory,
+    cmm2_memory_with_rng_seed,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -21,7 +24,11 @@ pub(crate) struct Machine {
 pub(crate) fn build_machine(path: &str, options: &RunOptions) -> Result<Machine, RunError> {
     let firmware = Firmware::load(path)?;
     let irqs = Irqs::new();
-    let memory = cmm2_memory(&irqs);
+    // The RNG takes its values from the host's entropy unless the run fixes the seed.
+    let memory = match options.rng_seed {
+        Some(seed) => cmm2_memory_with_rng_seed(&irqs, seed),
+        None => cmm2_memory(&irqs),
+    };
     let trace = trace_out(options)?;
     let console = memory.console();
     let sd = memory.sd_slot();
