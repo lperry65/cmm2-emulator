@@ -5,7 +5,10 @@ Notes from before the project started, kept for the reasoning and the sources. E
 a search summary, **[idea]** a suggestion that has not been checked. What has been measured since is in
 [hardware-map.md](hardware-map.md), and what the project is aiming for is in [goals.md](goals.md).
 
-## 1. What exists today
+## 1. What existed when I started (snapshot of 2026-11-12)
+
+This section is a snapshot from before the project started. I have not re-checked it since, so
+"today" below means that day.
 
 - **No official CMM2 emulator** [reported]. A MiSTer FPGA forum thread says there does not seem to be
   one (https://misterfpga.org/viewtopic.php?p=36334). A ClockworkPi forum reply says Peter Mather wrote
@@ -71,7 +74,9 @@ All from the CMM2 manuals unless marked.
   end-to-end check: if the emulator reproduces the hash, the ARM code and the firmware are running correctly.
 - **Likely hard parts:** page and frame-blanking timing the programs rely on, SDRAM and cache behaviour, any DMA
   used for fast block copies and fills (not confirmed), USB host, and audio mixing. A first target could be
-  "boots to the prompt and shows the logo in a window".
+  "boots to the prompt and shows the logo in a window". That first target is achieved: as of
+  8260358 (2026-11-14) the real firmware boots to the prompt, runs BASIC and shows the logo in an
+  SDL window (`--window`, see [boot-trace.md](boot-trace.md)).
 
 ## 5. Sources
 

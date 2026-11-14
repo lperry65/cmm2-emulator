@@ -96,27 +96,29 @@ an interrupt enable, so they never raise one. Whether the SPI3, USART or GPIO co
 timer interrupt I only checked this way: I did not trace their code.
 
 Measured on the emulator with the real firmware: `PAUSE 100` gives 100.006 (the board 100.013),
-`PAUSE 60` gives 60.005, and three `TIMER` reads in one statement are 6 to 7 us apart (the board
-4 to 7 us). The emulator is slower on the empty 100,000 iteration FOR loop (about 64 ms against
-44.944 ms on the board); that is memory wait states and speed (issue 65), not this.
+`PAUSE 60` gives 60.005, and three `TIMER` reads in one statement are 6 to 7 us apart (the board 4
+to 7 us). The emulated machine takes longer than the board on the empty 100,000 iteration FOR loop
+(about 64 ms against 44.944 ms on the board; a later run of 400,000 iterations took 255.7 ms, the
+same rate). That is the cycles the model charges for the loop, and not the timer. I have not traced
+why it is more than the board's; the cycle model's gaps are tracked in issues 16 and 65.
 
 ## What is not modelled
 
-- Capture/compare, PWM and DMA requests. Those registers (CCMR, CCER, CCRx, the DMA bits of
-  DIER and the other SR flags) are plain stored registers, and the design leaves room: another
-  flag raised in `catch_up` and another term in `interrupt_active`.
-- Center-aligned counting (CMS). The bits are stored, but counting follows DIR. The manual does
-  not make clear on which edges the update flag is set for each mode (39.3.2).
+- Capture/compare, PWM and DMA requests. Those registers (CCMR, CCER, CCRx, the DMA bits of DIER and
+  the other SR flags) are plain stored registers, and the design leaves room: another flag raised in
+  `catch_up` and another term in `interrupt_active`.
+- Center-aligned counting (CMS). The bits are stored, but counting follows DIR. The manual does not
+  make clear on which edges the update flag is set for each mode (39.3.2).
 - The repetition counter of TIM16 (RCR, 41.4.3): it is stored, and I treat it as 0.
-- UIFREMAP (UIF in bit 31 of CNT), the slave-mode controller and external clocks, the master
-  mode outputs, and the break and dead-time features.
-- A count above ARR. The chip counts on to the end of the width before it wraps; I wrap at the
-  next look. The firmware never does it.
+- UIFREMAP (UIF in bit 31 of CNT), the slave-mode controller and external clocks, the master mode
+  outputs, and the break and dead-time features.
+- A count above ARR. The chip counts on to the end of the width before it wraps; I wrap at the next
+  look. The firmware never does it.
 - CKD, which only matters for the filters; it is stored.
 - One-pulse mode with a down count stops with the count at ARR; the manual does not say.
-- The timer clock is fixed at 240 MHz. It does not follow the RCC. In the first (setup) boot
-  the firmware writes TIM16 PSC 251, which assumes a 252 MHz timer clock, and only after the
-  reset writes 239. With 240 MHz fixed, `TIMER` runs about 4.8% slow in the setup boot.
+- The timer clock is fixed at 240 MHz. It does not follow the RCC (issue 76, open). In the first
+  (setup) boot the firmware writes TIM16 PSC 251, which assumes a 252 MHz timer clock, and only
+  after the reset writes 239. With 240 MHz fixed, `TIMER` runs about 4.8% slow in the setup boot.
 
 ## RM0433 sections used
 

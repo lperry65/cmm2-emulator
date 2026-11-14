@@ -1,10 +1,11 @@
 # What the firmware does at boot
 
-This is the real firmware (v7.00.00b5) running on the emulator with every peripheral register
-served by the plain stub: a register reads back what was last written, or its reset value from
-the SVD if it has not been written (0 where the SVD names no register). Nothing is modelled
-yet, so the run shows what the firmware asks of the hardware and where it first gets stuck.
-Measured with the register reset values in place, over 3 million instructions, with:
+This document was started in iteration 1 and has grown as each model went in. The first section
+is the first run, as of that iteration: the real firmware (v7.00.00b5) on the emulator with every
+peripheral register served by the plain stub (a register reads back what was last written, or its
+reset value from the SVD if it has not been written, 0 where the SVD names no register). Nothing
+was modelled yet, so that run showed what the firmware asks of the hardware and where it first
+got stuck. Measured with the register reset values in place, over 3 million instructions, with:
 
 ```
 cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --run 3000000 --trace trace.txt --trace-mmio
@@ -49,16 +50,20 @@ touching no peripheral. An earlier spike identified the same loop as the flash s
 the firmware starts an erase of the option or program sector and waits for the flash interrupt
 handler to set the byte. The flash controller is the next model.
 
-**Then, with the flash controller modelled:** the erase completes. The firmware unlocks bank 2
-with the two keys, erases sector 7 (`0x081E0000`, the saved options) and sector 1 (`0x08120000`, the
+**Then, with the flash controller modelled:** the erase completes. The firmware unlocks bank 2 with
+the two keys, erases sector 7 (`0x081E0000`, the saved options) and sector 1 (`0x08120000`, the
 program area), then programs both with stores, setting and clearing `PG` around each 32 byte word
 (31 programming sequences on sector 7 and 4 on sector 1 in the first 3 million instructions). The
 flash interrupt handler runs once per erase. The run then settles in a microsecond delay routine at
 `0x0809ADE2` (`ldr` of `TIM16_CNT`, `sub`, `uxth`, `cmp #1000`, `bcc`), waiting for the 16 bit
-difference to reach 1000: 49.6 million reads of `TIM16_CNT` in a 250 million instruction run. It also
-polls `RNG_SR` (44,757 reads). One read goes outside the flash, 2 bytes at `0x08200000` from
-`0x0800419E`, and the machine logs it as unmapped. The next models are a counting `TIM16` (and
-`TIM5`, the free-running counter) and the RNG.
+difference to reach 1000: 49.6 million reads of `TIM16_CNT` in a 250 million instruction run. It
+also polls `RNG_SR` (44,757 reads). One read goes outside the flash, 2 bytes at `0x08200000` from
+`0x0800419E`, and the machine logs it as unmapped. The next models were a counting `TIM16` (and
+`TIM5`, the free-running counter) and the RNG. Both are done: the counting timers (`timer.rs`, with
+their update interrupts since issue 28, see [timers.md](timers.md)) and the RNG (`rng.rs`, issue 22,
+see [rng.md](rng.md)). The RNG matters beyond the delay: with none the poll for `DRDY` timed out and
+the firmware queued a false `Error:1` that the first `NEW` or the end of the first `RUN` printed
+(issue 46, closed).
 
 **Then, with the counting timers modelled:** the delay loops complete, and the firmware's longer
 behaviour shows. The loop at `0x0809DE8A` reads `GPIOB_IDR` bit 13 (pin PB13, `HAL_GPIO_ReadPin`
@@ -123,7 +128,9 @@ Keyboard type: 1=UK, 2=US, 3=DE , 4=FR, 5=ES , 6=BE ?
 and waits for a key. A `1` pushed into the console is echoed and answered with
 `Enter time (24hr clock) HH:MM:SS ? `, the next first-boot question. Two lines differ from the real
 board, whose `OPTION LIST` begins `480MHz Colour Maximite 2 G2`: the firmware here reports 504 MHz and
-no `G2`. How it works out the clock and the board generation is the next thing to find out.
+no `G2`. I did not know yet how it works out the clock and the board generation. That is resolved
+(issue 32): the 504 MHz banner is the factory default the firmware prints before its options are
+saved, and the second boot prints `480MHz Colour Maximite 2 G2`, as shown below.
 
 **The first-boot dialogue, driven from scripted input** (`--console --on "Keyboard type" "1" --on
 "HH:MM:SS" "12:00:00\r" --on "DD/MM/YY" "12/11/26\r"`; the whole run to the date prompt is about four
@@ -174,7 +181,7 @@ release build that is 20 to 30 seconds. After the prompt the firmware sits in an
 |---|---|
 | 1 to 40 | The reset handler resets the clock tree: sets `HSION` in `RCC_CR` (the first read returns the reset value `0x83`, which already has it), then writes 0 to `RCC_CFGR`, the three domain clock configuration registers, the PLL source and configuration registers, the three PLL divider and fraction registers and `RCC_CIER`. It reads `DBGMCU_IDC` and writes `AXI_AXI_TARG7_FN_MOD` (the AXI interconnect), then falls into the C startup. |
 | 41 to 211,595 | The C startup copies initialised data and code (including the ITCM code) and clears the BSS. No peripheral access at all, about 211,000 instructions. |
-| 211,596 to 211,650 | Cache setup through the Cortex-M7 cache maintenance registers, which the SVD does not describe: write `0xE000EF50` (instruction cache invalidate), write `0xE000ED84` and read `0xE000ED80` (the cache size selection and size ID registers), write `0xE000EF60` (data cache invalidate by set and way). |
+| 211,596 to 211,650 | Cache setup through the Cortex-M7 cache maintenance registers, which the SVD does not describe: write `0xE000EF50` (instruction cache invalidate), write `0xE000ED84` and read `0xE000ED80` (the cache size selection and size ID registers), write `0xE000EF60` (data cache invalidate by set and way). As of 8260358 the emulator models no cache and does nothing for them: they are not among the registers zmu implements (`core_register` in `cpu.rs`), so they reach the plain stub over the private peripheral bus, which reads back what was written (0 for the size ID register, as `--lookup` knows none of the four) and has no effect. The firmware boots with that. |
 | 211,648 to 211,669 | Reads `RCC_CFGR`, `RCC_CR` and `RCC_D1CFGR`: a check of the current clock. |
 | 211,752 to 212,300 | Turns on the `SYSCFG` clock (`RCC_APB4ENR` bit 1) and the `GPIOA` clock (`RCC_AHB4ENR` bit 0), then sets pull-downs on `GPIOA` pins 11 and 12 (those pins are the USB data lines on this chip). `GPIOA_PUPDR` reads `0x12100000` and is written as `0x12900000`, then again unchanged, because the reset value already has pin 12. `GPIOA_MODER` reads `0xABFFFFFF` and is written as `0xAB3FFFFF`, then `0xA83FFFFF`. |
 | 212,291 to 212,427 | Turns on the `GPIOF` clock (`RCC_AHB4ENR` to `0x21`), sets a pull-up on `GPIOF` pin 9 (`GPIOF_PUPDR` from `0x12100000` to `0x12140000`) and makes the pin an input (`GPIOF_MODER` from `0xABFFFFFF` to `0xABF3FFFF`). |
@@ -204,9 +211,11 @@ interrupt.
 
 All accesses were 32 bits wide.
 
-## What to expect next
+## What to expect next (historical: written in iteration 1)
 
-I have not run past the `PWR_CSR1` and `PWR_D3CR` waits here. An earlier throwaway spike on a different CPU core
+This is what I wrote when the run still stopped at the `PWR_CSR1` and `PWR_D3CR` waits. Every wait
+in the table has since been passed by a model (see the sections above), and the firmware reaches
+the prompt. Then: I had not run past those waits. An earlier throwaway spike on a different CPU core
 got further by supplying fake values, and it stopped at these points, in this order (addresses
 are the polling loops; to be confirmed on this emulator):
 
@@ -225,7 +234,12 @@ After those, the firmware reaches its idle loops near `0x0807A7EC` and `0x0809A3
 appeared on `USART1_TDR` at that point. The first flash erases are of `0x081E0000` (saved options)
 and `0x08120000` (the program area).
 
-## What this means for the next iteration
+## What this means for the next iteration (historical: written in iteration 1)
+
+This was the plan after the first run. The power controller, the reset and clock controller, the
+RTC, the flash controller, USART1 and the RNG (issue 22, closed) were built as listed. The
+cache maintenance registers are not modelled and the boot does not need them (see the table
+above).
 
 - The boot is steady and cheap until the first wait: about 225,000 instructions, 211,000 of them
   plain data copying.
@@ -295,7 +309,8 @@ ORN with an immediate as undefined, and the tokeniser uses it. That is fixed in 
 
 The time and date are the ones set in the first-boot dialogue (12:00:00 on 12/11/26), counted by
 the RTC model. The first answer takes about 17 million instructions and later ones 7 to 8
-million. `real_firmware_runs_a_command_at_the_prompt` in `tests/real_firmware.rs` checks these.
+million. `real_firmware_runs_a_command_at_the_prompt` in `crates/cmm2-core/tests/console.rs` checks
+these.
 
 ## The LTDC frame (issue 36)
 
@@ -334,4 +349,27 @@ run.
 
 ## Where it blocks now
 
-It does not block at the prompt: commands run, and the frame shows the prompt. I have not run past `PRINT` to find the next wait.
+As of the end of iteration 2 (the LTDC frame): it does not block at the prompt: commands run, and
+the frame shows the prompt. I had not run past `PRINT` to find the next wait.
+
+As of 8260358 (2026-11-14) what works after the prompt, each described in its own document:
+
+- The DS3231 clock chip (commit 2330adc) answers the firmware's bit-banged I2C, so `TIME$`,
+  `DATE$` and `OPTION DS3231 ON` work ([ds3231.md](ds3231.md)).
+- A USB keyboard enumerates and is polled, so `KEYDOWN()` and `INKEY$` work
+  ([usb-host.md](usb-host.md)).
+- An SD card on a disk image: `FILES`, `RUN`, `LIST`, `EDIT` and `AUTOSAVE` use it
+  ([sd-card.md](sd-card.md)).
+- Video in every mode and depth, layers, blending and page flips (commit 1d3c8f2,
+  [video.md](video.md)), and floating point at the prompt.
+- Saved flash and options between runs, and the machine's clock held to the wall clock.
+- `TIMER` and `PAUSE` count properly, with the timers' update interrupts (issues 28 and 70,
+  [timers.md](timers.md)), and `RND` follows the modelled RNG (issue 22, [rng.md](rng.md)).
+
+What is still missing is listed in the status and known gaps sections of the README. I have not
+hunted for the next wait after the prompt as I meant to in iteration 2. The open problems I know of
+at the prompt are issue 47 (a hard fault on `ESC O D`, the SS3 left arrow), issue 48 (pasted lines
+are joined) and issue 71 (the emulator exits silently on `RUN` with the console on a terminal).
+Issue 46 (`Error:1` after the first `FILES` or `NEW`, and a blank first error message) is closed:
+the false `Error:1` came from the missing RNG and is gone (the commit that modelled the RNG is
+0c4af96).

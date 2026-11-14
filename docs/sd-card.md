@@ -178,43 +178,49 @@ timeouts are all in ticks of the 1 kHz function: waiting for the card to be read
 (500), for the data token of a read (100), for the ready after a write (500), and the ACMD41 loop
 (1000). A model that answers at once never hits them.
 
-Two oddities I could not explain, which are probably not about the card:
+Two oddities, which were not about the card:
 
-- The first error message after boot is wrong. With no card, the first `FILES` prints an empty
-  line and the later ones print "SD Card not found"; a first `NEW` prints `Error:1` (with or
+- The first error message after boot was wrong. With no card, the first `FILES` printed an empty
+  line and the later ones printed "SD Card not found"; a first `NEW` printed `Error:1` (with or
   without a card). I saw `Error:1` once after the first `NEW` or `FILES` in every run, and not
-  after a first `PRINT`. I did not find the cause and I do not think the SD driver is involved,
-  since it appears with no card and with a perfect one.
+  after a first `PRINT`. I did not find the cause at the time and I did not think the SD driver was
+  involved, since it appeared with no card and with a perfect one. That was right: the cause was
+  the missing RNG. The firmware's start-up waits for the RNG's data-ready flag, and with none it
+  timed out and queued `Error:1` (issue 46, closed; the model is in [rng.md](rng.md), commit
+  0c4af96). A fresh boot prints no false `Error:1` now, and the first `FILES` with no card says
+  "SD card not present" (from the closing comment on issue 46).
 - The firmware has exFAT strings ("exFAT not supported" and a FAT32 and EXFAT type name), so
   large cards matter to FatFS, but the card layer itself sees only sector numbers.
 
-## 5. What the model has to implement
+## 5. What the model has to implement (the plan; what was built is in section 8)
 
-The smallest sufficient subset for FatFS-style access with the default settings:
+This is the list I wrote from the scratch model, before the card was built. CMD18/12 and CMD25 are
+built now, with CMD9 and CMD10 (section 8). The smallest sufficient subset for FatFS-style access
+with the default settings:
 
-1. **GPIO side.** Port C pins 10, 12 and port D pin 2 as outputs the card watches, port C pin 11
-   as an input the card drives, port D pin 3 (card-detect, low = in) and port H pin 12
-   (write-protect, high = protected) as inputs. The existing GPIO model already gives PD3 low and
-   PH12 low from the board's measurements; those fixed bits become the card's state. Mode 0 SPI:
-   data is sampled on the rising edge of PC10, MSB first. The card changes its output on the
-   falling edge, and the firmware reads `GPIOC_IDR` while the clock is high.
+1. **GPIO side.** Port C pins 10, 12 and port D pin 2 as outputs the card watches, port C pin 11 as
+   an input the card drives, port D pin 3 (card-detect, low = in) and port H pin 12 (write-protect,
+   high = protected) as inputs. The existing GPIO model already gives PD3 low and PH12 low from the
+   board's measurements; those fixed bits become the card's state. Mode 0 SPI: data is sampled on
+   the rising edge of PC10, MSB first. The card changes its output on the falling edge, and the
+   firmware reads `GPIOC_IDR` while the clock is high.
 2. **A card state machine in SPI mode**, byte at a time: idle until a byte with 0b01 in the top two
    bits, collect six bytes, pad with one 0xFF of reply latency, and answer. Required: CMD0 (R1 =
-   0x01), CMD8 (R1 0x01 then 00 00 01 AA), CMD55/ACMD41 (R1 0x01 at least once, then 0x00),
-   CMD58 (R1 0, OCR with bit 30 set, 0xC0FF8000 worked), CMD17 (R1, 0xFE, 512 bytes, two
-   CRC bytes) and CMD24 (R1, accept token 0xFE, take 512 + 2 bytes, answer 0xE5 and some 0x00
-   busy bytes). CMD18/12 and CMD25 with the 0xFC and 0xFD tokens are cheap to add and are the
-   right next step because the firmware has the code for them. An unknown command should get R1
-   with the illegal-command bit (0x04).
+   0x01), CMD8 (R1 0x01 then 00 00 01 AA), CMD55/ACMD41 (R1 0x01 at least once, then 0x00), CMD58
+   (R1 0, OCR with bit 30 set, 0xC0FF8000 worked), CMD17 (R1, 0xFE, 512 bytes, two CRC bytes) and
+   CMD24 (R1, accept token 0xFE, take 512 + 2 bytes, answer 0xE5 and some 0x00 busy bytes). CMD18/12
+   and CMD25 with the 0xFC and 0xFD tokens are cheap to add and were the right next step because the
+   firmware has the code for them (built in `sd.rs`). An unknown command should get R1 with the
+   illegal-command bit (0x04).
 3. **CS (PD2) high** drops any command in progress and makes MISO read 0xFF.
 4. **SPI3, for `OPTION SD TIMING FAST`.** `CR1` (`SPE`, `CSTART`), `CR2.TSIZE`, `CFG1`, `CFG2`
    (stored), `SR`, `IFCR` and `TXDR`/`RXDR` at 8, 16 and 32 bits. Instant completion works: each
    byte written to `TXDR` exchanges one byte with the card and queues the reply; `SR.TXP` set while
-   the transfer has bytes left, `SR.EOT` set once `TSIZE` bytes have gone, `SR.RXWNE` and `SR.RXPLVL`
-   from the receive queue length (the HAL reads 32 bits when four bytes are there, 16 for two
-   or three, 8 for one), `SR.TXC` set; `IFCR.EOTC` clears `EOT`; `CR1.SPE` clear resets it.
-   That was enough for the firmware to mount and list in my scratch model. The SPI3 hardware-
-   rate difference does not matter to the card.
+   the transfer has bytes left, `SR.EOT` set once `TSIZE` bytes have gone, `SR.RXWNE` and
+   `SR.RXPLVL` from the receive queue length (the HAL reads 32 bits when four bytes are there, 16
+   for two or three, 8 for one), `SR.TXC` set; `IFCR.EOTC` clears `EOT`; `CR1.SPE` clear resets it.
+   That was enough for the firmware to mount and list in my scratch model. The SPI3 hardware rate
+   difference does not matter to the card.
 5. **CSD, CID, SCR:** the firmware parses none of them in anything I ran. Return a version-2 CSD
    (CSD_STRUCTURE 1, `C_SIZE` such that (C_SIZE + 1) x 1024 is the sector count, TRAN_SPEED 0x32 or
    0x5A) for CMD9 so that a format or a size query is right, and an arbitrary CID for CMD10. I did
@@ -233,7 +239,14 @@ Surprising, and worth knowing before starting:
   The card can be as large as the image: SDHC addressing (CCS set in the OCR) means CMD17/24 take
   a sector number, and that is what the firmware will do for any OCR with bit 30 set.
 
-## 6. Where it goes in the code (recommendation)
+## 6. Where it goes in the code (the plan; what was built is in section 8)
+
+This is the recommendation I wrote before building. It differs from what was built in these names:
+the card is `SdCard` (`sd.rs`) and the shared handle is `SdSlot` (`sd_slot.rs`), which holds the
+card, the two switches and the four wires; the accessor is `MemoryMap::sd_slot()`, not `sd_card()`;
+the card takes bytes with `mosi` and gives them with `miso`, not `select` and `exchange`; and
+`Gpio::new` takes the slot as its second argument (and the DS3231 slot as its third). SPI3 was not
+built (issue 63).
 
 - **A shared card handle**, like `console()` and `flash_ops()`: a new `sd.rs` with a cheap `SdCard`
   handle (an `Rc<RefCell<..>>`) holding the card state machine, the image and the two switches
@@ -268,7 +281,7 @@ Surprising, and worth knowing before starting:
 
 ## 7. What I could not establish
 
-- The first-error-message oddity and the `Error:1` text (section 4).
+- Nothing about the first-error-message oddity any more: it was the missing RNG (section 4).
 - Whether any command at the prompt reaches CMD18, CMD25, CMD9, CMD10 or ACMD13. I tried the
   common ones. A format (not found in the command list) or a very large sequential read or write
   may be what triggers them.
@@ -286,10 +299,11 @@ Surprising, and worth knowing before starting:
 
 ## 8. What is built
 
-Issue 43 is the first step of section 6: the byte-level card (`sd.rs`), the socket with the
-bit-bang pins (`sd_slot.rs`, read and driven by the GPIO ports C and D), the `--sd` option, and an
-ignored test that boots the real firmware on a FAT32 image from `mkfs.vfat`, lists it, saves a
-program with `AUTOSAVE`, lists and runs it back and finds the file in the image.
+Issue 43 (closed; the SPI3 part of it is now issue 63, open) is the first step of section 6: the
+byte-level card (`sd.rs`), the socket with the bit-bang pins (`sd_slot.rs`, read and driven by the
+GPIO ports C and D), the `--sd` option, and an ignored test that boots the real firmware on a FAT32
+image from `mkfs.vfat`, lists it, saves a program with `AUTOSAVE`, lists and runs it back and finds
+the file in the image.
 
 - The card answers CMD0, CMD8, CMD55/ACMD41, CMD58, CMD17 and CMD24, and since the review of
   that work also CMD18 with CMD12 (a stream of blocks, stopped with the stuff byte, R1 and busy),
@@ -305,6 +319,14 @@ program with `AUTOSAVE`, lists and runs it back and finds the file in the image.
   remember it and not seen against the firmware. SPI3 (`OPTION SD TIMING FAST`) is not there.
 - The card knows whether a write changed it, and the front end only writes the image back to the
   `--sd` file when it did.
+- `AUTOSAVE` stores exactly the bytes the console reader returns, and MMBasic's console makes an LF
+  after a CR only once nothing has arrived for 3 ms. Lines typed with a pause are stored with CRLF
+  and run. Lines pushed in back to back are stored with bare CRs and fail to load, and that is what
+  the board does with the same bytes too (issue 73, closed: not an emulator bug). Two ignored
+  real-firmware tests in `crates/cmm2-core/tests/sd.rs` pin both (commit 82afdd1). For scripted
+  input end each line with CRLF, or wait for the echo before the next. I tried it with a
+  three-line program sent in one `--on` burst: with CRLF line ends the file is 27 bytes and `RUN`
+  prints `SUM 3`; with bare CRs it is 24 bytes and `RUN` says `Error in line 1: Expression syntax`.
 - PD3 reads low with a card in the socket and high without, and then the firmware says "SD card
   not present" without sending anything to the card. PH12 reads low, as the board does, unless the
   front end says the card is protected (a `--sd` file that cannot be written back: read-only, or

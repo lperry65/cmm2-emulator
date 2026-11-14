@@ -87,7 +87,41 @@ counting instructions costs a hook that takes much of the speed advantage back.
 - The CPU sits behind a small interface (step, registers, interrupts raised by the machine), so nothing outside
   that interface depends on zmu.
 
+## Since then (2026-11-14, at commit 8260358)
+
+The decision stands, and the text above is left as I wrote it on 2026-11-12. Several things in it
+have been overtaken:
+
+- The spike patch was 225 added lines across 16 files with the blank ones counted (241 `+` lines
+  less the 16 `+++` headers), and 215 without them, so the "about 215" above is the count without
+  blank lines. I counted the added lines of `spikes/zmu/patches/zmu-local.patch` (kept locally, not
+  in the repository).
+- The speed comparison is superseded. The core runs about 54.5 million instructions a second at
+  the prompt (measured on 2026-11-13, in `usb-host.md`), against an estimated 220 million for the
+  board, so it is about four times short by that estimate, not 2.5 to 3. The profiling is in my
+  local speed notes (not in the repository), and the way to speed is now a JIT built first: see
+  [0002-jit-first.md](0002-jit-first.md). Issues 15 and 16 track the earlier speed work.
+- "No tail-chaining, no exception-entry cycle accounting" is no longer true. The core counts a
+  12-cycle entry and a 6-cycle tail-chained entry (the 6 is ARM's Cortex-M3 and M4 figure, which
+  I have not verified for the M7), derives exceptions as the ARMv7-M manual does, has an explicit
+  lockup state with the priorities the manual gives, and resets to the boot address. The MPU is
+  still not modelled.
+- The SMULL bug (it multiplied unsigned) was fixed (issue 64). That was the one that stopped the
+  game's loader with `Program damaged: symbol table`.
+- Alignment UsageFaults are modelled (8260358, issues 68 and 67, closed): the always-aligned
+  instructions, the `CCR.UNALIGN_TRP` rule for LDR, STR, LDRH, LDRSH, STRH and TBH, precise faults,
+  and `CFSR.UNALIGNED` with escalation to a HardFault. The Device and Strongly-ordered memory types
+  are not modelled, as the core has none. The same commit stops the DWT cycle counter in sleep
+  unless `DBGSLEEP_D1` is set (WFI does not sleep yet, issue 72) and fixes two reset-related bugs.
+- What is still missing in the core: the ARMv7E-M DSP instructions beyond the few I added (issue 77:
+  Galactic Raiders stops at 0x08146b6c, which the reviewer reads as UQADD8). Issue 59 holds the
+  other core follow-ups.
+- Every change I made to the core is listed in `crates/zmu_cortex_m/NOTICE.md`, which has grown well
+  past the spike patch: the interrupt count is 240 now, the fidelity fixes came from checking the
+  core against the ARMv7-M manual, and so on.
+
 ## Where the evidence is
 
 The spike code is not in the repo. The Unicorn spike depends on a GPL-2.0 library, so it stays out of a GPL-3.0
-repository. The zmu spike and its patch live in my local `spikes/` folder.
+repository. The zmu spike and its patch are kept locally in a `spikes/` folder, not in the
+repository.

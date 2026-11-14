@@ -17,7 +17,7 @@ The firmware is built with ST's GNU toolchain 13.3 and newlib, on the ST HAL [fw
 |---|---|---|
 | 0x0000_0000, 64 KB | ITCM RAM | |
 | 0x0800_0000, 1152 KB | Flash: firmware | The `.bin` is 1,179,432 bytes |
-| 0x0812_0000 to 0x081D_FFFF | Flash: stored BASIC program | Six 128 KB pages. Needs flash erase/program emulation |
+| 0x0812_0000 to 0x081D_FFFF | Flash: stored BASIC program | Six 128 KB pages. Erase and program are modelled (`flash.rs`, and the core's flash takes the stores) |
 | 0x081E_0000, 128 KB | Flash: saved options | `OPTION` settings persist here |
 | 0x2000_0000, 128 KB | DTCM RAM | Firmware variables and C stack |
 | 0x2400_0000, 512 KB | AXI SRAM: display page 0 | LTDC framebuffer at boot **[board]** |
@@ -79,11 +79,15 @@ DAC CR 0x10001 and MCR 0x10001: both channels enabled. RNG CR 4: enabled.
 ## USB [board]
 
 OTG controller at 0x4008_0000, with a keyboard plugged in: GUSBCFG 0x20001847 (forced host mode,
-embedded full-speed PHY), GAHBCFG 1 (global interrupt on, **DMA off**, so FIFO/slave mode),
-GCCFG 0x10000, HCFG 0x206, HPRT 0x41805 (device connected and enabled, **low speed**), GINTMSK
-0x23000014. No DMA is a favourable fact for emulation. The emulator models this block as a host controller
-with a low-speed keyboard behind it (docs/usb-host.md section 12); the ID and `GHWCFG` registers it
-returns are guesses, not board readings.
+embedded full-speed PHY), GAHBCFG 1 (global interrupt on, **DMA off**, so FIFO/slave mode), GCCFG
+0x10000, HCFG 0x206, HPRT 0x41805 (device connected and enabled, **low speed**), GINTMSK 0x23000014.
+No DMA is a favourable fact for emulation. The emulator models this block as a host controller with
+a low-speed keyboard behind it (docs/usb-host.md section 12); the ID and `GHWCFG` registers it
+returns are guesses, not board readings. The keyboard is plugged in only when the run has a window
+and no `--console-keys` (`--window` alone, or with `--console`). With `--console` and no window,
+with `--console-keys`, or in a plain `--run`, the port has nothing in it and the firmware sees no
+keyboard. That is decided in `run_live` in `crates/cmm2-emulator/src/live.rs`, which calls
+`plug_in_keyboard` in `machine.rs` (I cite the functions, not lines, as the files change).
 
 ## GPIO [board]
 
@@ -103,7 +107,7 @@ names are from the SVD. These are the values the iteration 2 peripheral models h
 
 | Register | Value | What it says |
 |---|---|---|
-| `PWR_D3CR` | `0x0000E000` | `VOS` = 3 (highest voltage scale) and `VOSRDY` (bit 13) set. The emulator’s stub reads back the reset value `0x4000` and whatever the firmware writes (`0xC000`), so bit 13 never sets and the firmware’s wait never ends |
+| `PWR_D3CR` | `0x0000E000` | `VOS` = 3 (highest voltage scale) and `VOSRDY` (bit 13) set. Historical: the first stub read back the reset value `0x4000` and whatever the firmware wrote (`0xC000`), so bit 13 never set and the firmware's wait never ended. The power controller is modelled now (`pwr.rs`): `VOSRDY` reads as set, and `ACTVOSRDY`, `BRRDY` and `USB33RDY` follow what they wait for |
 | `PWR_CSR1` | `0x0000E000` | `ACTVOS` = 3 and `ACTVOSRDY` set: the same state, as the active status |
 | `PWR_CR1` | `0xF000C100` | `DBP` (backup domain write enable) set, `SVOS` = 3; the top four bits are set and unnamed in the SVD |
 | `PWR_CR2` | `0x00010001` | `BREN` (backup regulator on) and `BRRDY` (ready, bit 16) set |
@@ -115,7 +119,7 @@ names are from the SVD. These are the values the iteration 2 peripheral models h
 | `RCC_AHB4ENR` | `0x100001FF` | GPIO A to I clocks and backup SRAM on |
 | `RCC_APB4ENR` | `0x00010002` | `SYSCFG` and the RTC APB clock on |
 | `RTC_ISR` | `0x00000000` | the RTC is not in initialisation mode |
-| `RNG_CR` / `RNG_SR` | `0x00000004` / `0x00000001` | `RNGEN` set, `DRDY` set |
+| `RNG_CR` / `RNG_SR` | `0x00000004` / `0x00000001` | `RNGEN` set, `DRDY` set (modelled now, see [rng.md](rng.md)) |
 | `USART1_CR1` | `0x2000002D` | `UE`, `RE`, `TE`, `RXNEIE`, `FIFOEN` |
 | `USART1_ISR` | `0x08E210D0` | `TXFT`, `TXFE`, `REACK`, `TEACK`, `CMF`, `EOBF`, `TXE`, `TC` and `IDLE` set |
 | `FLASH_ACR` | `0x00000032` | two wait states, programming delay 3 |

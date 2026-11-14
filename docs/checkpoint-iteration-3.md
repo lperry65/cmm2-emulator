@@ -4,6 +4,12 @@ Written 2026-11-13, at commit 170c81c. The question: does the approach (the real
 emulated STM32H743, on a vendored zmu core) still look like it will reach the goals in
 [goals.md](goals.md)? My answer is **go**, with one decision for Lee about speed.
 
+This is a snapshot, and I have left it as it was written. Since then video, the keyboard, the SD
+card, the DS3231, the RNG and the timer interrupts have been built, the decision about speed is made
+(an x86-64 JIT first, [decisions/0002-jit-first.md](decisions/0002-jit-first.md)), and the figures
+below are older than my later speed measurements (in [0002](decisions/0002-jit-first.md) and
+`usb-host.md`). The README has the current status.
+
 ## What works
 
 The unmodified firmware (7.00.00b5) runs from reset in a terminal:

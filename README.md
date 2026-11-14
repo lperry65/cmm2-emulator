@@ -8,7 +8,108 @@ real machine and can be developed and tested without the hardware.
 
 ## Status
 
-Early planning. Nothing runs yet. Progress is tracked in the GitHub issues and milestones.
+As of commit 8260358 (2026-11-14) the emulator boots the unmodified 7.00.00b5 firmware through its
+first-boot setup and a system reset to the `>` prompt and runs BASIC there. What works:
+
+- The Cortex-M7 (a vendored and changed copy of the zmu core, see "The CPU core" below) and the
+  peripherals the firmware waits on, checked against the real firmware: clocks and power, the RTC,
+  the flash controller (erase and program, so the options and a stored program persist), GPIO,
+  USART1 as the console, the timers TIM5 and TIM16, the RNG, and the LTDC.
+- `TIMER` and `PAUSE` count properly: TIM5 and TIM16 raise their update interrupts (issues 28 and
+  70, see [docs/timers.md](docs/timers.md)). The timer clock is a fixed 240 MHz and does not follow
+  the RCC (issue 76).
+- The RNG is modelled ([docs/rng.md](docs/rng.md)), so `RND` gives different numbers from run to
+  run, as on the board, and a fresh boot no longer prints a false `Error:1` (issues 22 and 46).
+- Video in every mode and colour depth, with layers, blending and page flips, in an SDL window
+  (`--window`) or as a PPM file (`--screenshot`).
+- A USB keyboard, driven from the window through the firmware's real USB host stack, so
+  `KEYDOWN()`, `INKEY$` and Ctrl-C work as on the board. The console over a terminal also works.
+- An SD card on a disk image (`--sd`), in the firmware's default SPI mode.
+- Saved flash and options between runs (`--flash`), and the board's DS3231 clock chip.
+- Real-time pacing at the machine's 480 MHz clock (built; it has no effect while the host is
+  slower than the machine).
+
+Galactic Raiders, the game I am writing for the CMM2, loads and draws all its sprites and colours
+(my report). In a reviewer's run it ran for about 95 s of host time and then stopped at an ARMv7E-M
+DSP instruction that the core does not implement, at 0x08146b6c (issue 77). My own first run
+returned straight to the shell, and I do not know that it ended at that fault. In the reviewer's run
+the game printed `startup_load_ms=763.0`; I do not know what that covers, so I make no comparison
+with the board. It is far too slow to play yet (speed, issue 74).
+
+### The CPU core
+
+The core is my changed copy of zmu, and the changes are listed in `crates/zmu_cortex_m/NOTICE.md`,
+which is the detailed record; the decision to use it is
+[docs/decisions/0001-cpu-engine.md](docs/decisions/0001-cpu-engine.md). Since the first boot it has been checked against the
+ARMv7-M manual: exceptions that arise while another is entered are derived exceptions as the manual
+has them, an exception entry counts 12 cycles and a tail-chained entry 6 (the 6 is ARM's figure for
+the Cortex-M3 and M4, which I have not verified for the M7), a lockup is a state of its own with the
+priorities the manual gives, a reset loads the vector table from a boot address, and SMULL, which
+multiplied unsigned, is fixed (issue 64). Alignment UsageFaults are modelled (8260358, issues 68 and
+67, closed): the instructions that always fault on an unaligned address do so, LDR, STR, LDRH,
+LDRSH, STRH and TBH only with `CCR.UNALIGN_TRP` set, the fault is precise, and `CFSR.UNALIGNED` is
+recorded, with escalation to a HardFault. Not modelled is the Device and Strongly-ordered memory
+types, as the core has none. The same commit stops the DWT cycle counter in sleep unless
+`DBGSLEEP_D1` is set (the emulator does not sleep on WFI yet, issue 72) and fixes two reset-related
+bugs. What it still lacks is the rest of the ARMv7E-M DSP instructions (issue 77: the game stops at
+0x08146b6c, which the reviewer reads as UQADD8).
+
+### Speed
+
+Speed is the main thing that is not done. These are the figures, and which of them I measured:
+
+- Measured: the core runs about 54.5 million instructions a second at the prompt (2026-11-13,
+  release build; `docs/usb-host.md` section 12), and about 24 to 25 million in the BASIC interpreter
+  (`FOR i=1 TO 100000:a=a+1:NEXT`, a quiet machine; the working is in my local speed notes, which
+  are not in the repository).
+- Estimated, not measured: the board runs about 220 million instructions a second (zmu's cycle
+  estimate, as in `docs/checkpoint-iteration-3.md`). By that estimate the host is about four times
+  too slow. That "about four times" is an estimate from instruction counts.
+- Measured on a program: an empty `FOR` loop of 400,000 iterations takes 255.7 ms on the emulated
+  machine's clock (read with `TIMER`, on 2026-11-14), and the board takes 44.944 ms for 100,000 (my
+  measurement on the board, issue 70). So the emulated machine takes about 1.4 times as long as the
+  board on that loop. This compares the machine's clock with the board's, not the host's speed.
+
+I decided on 2026-11-14 to build an x86-64 JIT directly, with no interim steps, because the interim
+steps (an estimate of about 2.7 to 2.8 times together; two of the five were measured on prototypes;
+the working is in my local speed notes) cannot reach the board's speed. See
+[docs/decisions/0002-jit-first.md](docs/decisions/0002-jit-first.md) (issue 74).
+
+### Windows
+
+The project is cross-platform Rust. I have built and run it on Linux only so far (CI runs on
+Ubuntu). Windows is planned (issue 75): several parts of the front end are Unix-only now (the signal
+handling, the terminal's raw mode, file locks and `/proc`), and the SDL2 build and a Windows CI job
+are not done. The JIT design has to weigh portability for the same reason.
+
+### Known gaps
+
+The open issues at 8260358, from `gh issue list --state open`:
+
+- Speed and timing: 74 (the JIT), 15 (the speed of the machine's bus path), 16 (zmu fidelity gaps
+  found while integrating), 65 (memory wait states), 72 (WFI never sleeps), 76 (timer clocks do
+  not follow the RCC).
+- The CPU core: 77 (DSP instructions), 59 (zmu follow-ups after dec44de, to check against the
+  ARMv7-M manual), 17 (readable disassembly in the trace).
+- Console and input: 66 (console input arrives faster than the baud rate), 48 (pasted lines are
+  joined), 47 (a hard fault on `ESC O D`, the SS3 left arrow), 71 (the emulator exits silently on
+  `RUN` with the console on a terminal; every end has to say why, and that is being fixed), 62
+  (keyboard follow-ups), 53 (USB mouse), 54 (gamepad).
+- Storage and the board's state: 63 (SPI3 for the SD card, `OPTION SD TIMING FAST`), 44 (a host
+  folder as the SD card), 41 (the guest writes 32 zero bytes into the firmware region of flash), 69
+  (remember the board between runs).
+- Window and platform: 39 (scaling, full screen and aspect controls), 75 (Windows).
+- Firmware and end-to-end: 57 (firmware 5.07, the version the Gen 2 shipped with), 49 (run
+  Galactic Raiders as an end-to-end test), 25 (boot to the MMBasic idle loop: the acceptance is only
+  partly met. No test asserts the idle loop; the tests assert the prompt and commands, in
+  `crates/cmm2-core/tests/console.rs`. `GPIOH_IDR`, `GPIOD_IDR` and `TIM5_CNT` appear in
+  docs/boot-trace.md only in its iteration-1 sections, as an expectation from an earlier spike that
+  was never confirmed. A speed note exists, in my local speed notes, which are not in the
+  repository).
+- Not in an issue: sound (the DAC) and a GDB option (the vendored core has a GDB server, but the
+  front end does not start it).
+
+Progress is tracked in the GitHub issues and milestones.
 
 ## Target
 
@@ -18,13 +119,25 @@ Early planning. Nothing runs yet. Progress is tracked in the GitHub issues and m
 
 ## Layout
 
-The repository is a Cargo workspace with two crates:
+The repository is a Cargo workspace with three members, two of them mine:
 
 - `cmm2-core`: the emulation (CPU, memory, peripherals). It has no SDL or UI dependency, so it can
   be tested on its own and reused.
 - `cmm2-emulator`: the front end binary. It owns the window and input and drives `cmm2-core`.
+- `zmu_cortex_m`: the Cortex-M core, a vendored copy of the one in
+  [zmu](https://github.com/jjkt/zmu) with my changes to it (listed in
+  `crates/zmu_cortex_m/NOTICE.md`). It is Apache-2.0, as upstream; `cmm2-core` depends on it.
 
-They are separate so the SDL front end stays out of the emulation code.
+`cmm2-core` and `cmm2-emulator` are separate so the SDL front end stays out of the emulation code.
+
+In `cmm2-emulator`, `main.rs` is a short entry point over modules: `args` (the command line),
+`batch` (a run with no console or window), `live` (a run with the console or a window), `machine`
+(building the machine), `storage`, `saveable`, `atomic_write` and `run_and_save` (the `--flash` and
+`--sd` files, read at the start and saved safely at the end), `panic_hook`, `signals`, `output` and
+`error`, `trace`, `slice`, `report` and `inspect`, `script` (the `--on` keys), `pacing`,
+`terminal`, `keys`, `usb_keys`, `window` and `local_clock`. The unit tests of a module are in
+`<module>/tests.rs` beside it, or in the file itself for some of the smaller ones, and the
+command-line and real-firmware tests are in `crates/*/tests/`, split by topic.
 
 ## Building
 
@@ -33,11 +146,21 @@ cargo build
 cargo test
 ```
 
-One test checks the vector table of the real firmware, so it is ignored by default. To run it, point
-`CMM2_FIRMWARE` at your copy of the `.bin`:
+Building needs the SDL2 development files (`libsdl2-dev` on Debian and Ubuntu). I have built and run
+it on Linux only so far; Windows is planned (issue 75).
+
+Nearly all the ignored tests run the real firmware: they need your copy of the `.bin` and take a
+while. `cargo test --workspace -- --ignored --list` counts 68 of them (counted on 2026-11-14 in a
+clean `git archive` of 8260358; listing needs no firmware): 44 in `cmm2-core` (43 in the nine files
+of `crates/cmm2-core/tests/`, and a display speed test in `display/tests.rs`), 23 in `cmm2-emulator`
+(3 in `tests/real_firmware.rs` and 20 in the tests of `keys.rs` and `usb_keys.rs`), and one in
+`zmu_cortex_m`. Two of the 68 do not use the firmware: the display speed test, which times the
+compositing, and the `zmu_cortex_m` one, a decode dump run by hand with `ZMU_DUMP_IMAGE` and
+`ZMU_DUMP_OUT`. To run the others, point `CMM2_FIRMWARE` at the `.bin`; a release build is a good
+deal faster:
 
 ```
-CMM2_FIRMWARE=/path/to/CMM2_MMBasic_7.00.00b5.bin cargo test -- --ignored
+CMM2_FIRMWARE=/path/to/CMM2_MMBasic_7.00.00b5.bin cargo test --workspace --release -- --ignored
 ```
 
 ### Trying it
@@ -59,6 +182,12 @@ cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --run 232000000 --trace t.tx
 
 `--console` can write the trace to a file in the same way (`--trace-mmio` there needs `--trace`).
 
+`--screenshot <file>` writes the screen as a PPM file when the run ends, in any mode. If the
+firmware has not turned the LTDC on by then it says `no screenshot: the LTDC is not enabled` and
+writes none. `--firmware <file>` alone prints the initial stack pointer and the reset handler,
+`--lookup 0x<address>` names the peripheral register at an address, and `--version` prints the
+version.
+
 To use it interactively, connect the console to your terminal:
 
 ```
@@ -66,7 +195,7 @@ cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console
 ```
 
 What you type goes to the firmware and what it prints appears as it sends it. Ctrl-] quits. The
-first text takes about ten seconds to appear today (about 196 million instructions).
+first text appears after about 196 million instructions: a few seconds in a release build.
 
 For scripts and CI, `--on <text> <keys>` types the keys once the firmware has printed the text
 (`\r`, `\n`, `\t`, `\e`, `\\` and `\xHH` are understood), and `--run` ends the run:
@@ -75,6 +204,35 @@ For scripts and CI, `--on <text> <keys>` types the keys once the firmware has pr
 cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --run 260000000 \
     --on "Keyboard type" "1"
 ```
+
+Typed input has two limits to know about. First, MMBasic's console makes an LF after a CR only
+once nothing has arrived for 3 ms, so keys pushed in one go reach it as bare CRs. A program sent
+that way is stored with bare CRs by `AUTOSAVE` and then fails to load, and the real board does the
+same with the same bytes (issue 73, closed: not an emulator bug). So end each line of scripted
+input for `--console` and `--on` with CRLF (`\r\n`), or wait for the echo before the next line. I
+tried a three-line program through `AUTOSAVE` in one `--on` burst: with CRLF it ran, with bare CRs
+`RUN` said `Error in line 1: Expression syntax`. Second, the bytes reach the firmware as fast as it
+reads them, not at the serial baud rate (issue 66, open), so a paste of more than 255 bytes
+overflows MMBasic's 256-byte input buffer and part of it is lost. I have not tested that overflow
+myself; the figure is from the issue.
+
+MMBasic's `RND` reads the hardware RNG, so `RANDOMIZE` does not make a run repeat.
+`--rng-seed <number>` seeds the RNG model, so that `RND` gives the same numbers in every run. The
+number is decimal or `0x` hexadecimal, up to 64 bits. Without it the seed comes from the host and
+the numbers differ from run to run, as on the board. Anything else (text, a negative number, one
+too large) prints `cmm2-emulator: bad seed '<value>'` and the usage text, and exits with status 2.
+A fully repeatable scripted run needs more than the seed:
+
+- input only through `--on` (nothing typed at the terminal, no window);
+- the same starting `--flash` and `--sd` images each time. Both are written back at the end of a
+  run, so copy them first, or the second run starts from what the first left;
+- no reading of the clock: with `OPTION DS3231 ON` the firmware takes `TIME$` and `DATE$` from the
+  DS3231 model, which follows the host's clock, and a chip that has been set keeps following it
+  (see below).
+
+I checked it with a flash file that had been through the first boot: the same seed twice, and the
+same value as `42` and as `0x2A`, printed the same three numbers for `PRINT RND;RND;RND`, and
+another seed, or none, printed others.
 
 To see the screen, add `--window`. It opens an SDL window that shows what the firmware has drawn
 and scales it to fit, and closing the window ends the run. It works with or without `--console`
@@ -97,15 +255,15 @@ US host keyboard with a UK firmware layout gives UK characters for some keys (Sh
 The firmware starts polling the keyboard about 300 million instructions after the prompt: 1.4 s of
 the machine's time, and about 6 s of host time in a release build (measured, the tests in
 `usb_keys.rs`). Until then the keys are the console's: the window types bytes into the UART, which
-is what answers the first-boot keyboard question and anything typed before USB is up. On that
-path printable keys come as SDL text input, so the host layout and Shift apply, and the other keys
-are sent as the bytes the firmware's console reads from a terminal. Enter is CR, Backspace is
-0x08 (the firmware ignores 0x7F), and Tab and Escape are themselves. The arrows are `ESC [ A` to `D`, Home and End are `ESC [ 1 ~` and `ESC [ 4 ~` (measured: the
-firmware does not read xterm's `ESC [ H` and `ESC [ F`), Insert, Delete, Page Up and Page Down are
-`ESC [ 2 ~`, `3~`, `5~` and `6~`, F1 to F4 are `ESC O P` to `S`, and F5 to F12 are `ESC [ 15 ~`,
-`17~`, `18~`, `19~`, `20~`, `21~`, `23~` and `24~`. Ctrl with a letter sends the control code,
-so Ctrl-C stops a running program. Held keys repeat as SDL repeats them. Text other than ASCII
-is dropped, as the console has no way to take it.
+is what answers the first-boot keyboard question and anything typed before USB is up. On that path
+printable keys come as SDL text input, so the host layout and Shift apply, and the other keys are
+sent as the bytes the firmware's console reads from a terminal. Enter is CR, Backspace is 0x08 (the
+firmware ignores 0x7F), and Tab and Escape are themselves. The arrows are `ESC [ A` to `D`, Home and
+End are `ESC [ 1 ~` and `ESC [ 4 ~` (measured: the firmware does not read xterm's `ESC [ H` and
+`ESC [ F`), Insert, Delete, Page Up and Page Down are `ESC [ 2 ~`, `3~`, `5~` and `6~`, F1 to F4 are
+`ESC O P` to `S`, and F5 to F12 are `ESC [ 15 ~`, `17~`, `18~`, `19~`, `20~`, `21~`, `23~` and
+`24~`. Ctrl with a letter sends the control code, so Ctrl-C stops a running program. Held keys
+repeat as SDL repeats them. Text other than ASCII is dropped, as the console has no way to take it.
 
 Once the firmware polls the keyboard the window sends USB reports only, and no console bytes, or
 every key would be typed twice. A key that is held across that moment was typed on the console, so
@@ -118,90 +276,95 @@ and no USB keyboard is plugged in, which is useful if USB misbehaves. The host t
 (`--console`) always feeds the UART, in both modes. With `--window` and no `--console` the
 window alone gives input; with both, the terminal and the window feed the same console.
 
-`--console` and `--window` run the machine at its own speed: the core's clock (480 MHz) is held
-to the wall clock by sleeping, in steps of at most 10 ms, whenever the emulation is ahead. When
-the host is too slow it runs flat out and does not try to catch up later, and a stall (dragging
-the window, a suspended process) is forgotten rather than made up with a burst. Add `--unpaced`
-to run as fast as the host allows. A plain `--run` is never paced. Today the host is about 4 to
-7 times slower than the real machine, so pacing does nothing until the core gets faster.
+`--console` and `--window` run the machine at its own speed: the core's clock (480 MHz) is held to
+the wall clock by sleeping, in steps of at most 10 ms, whenever the emulation is ahead. When the
+host is too slow it runs flat out and does not try to catch up later, and a stall (dragging the
+window, a suspended process) is forgotten rather than made up with a burst. Add `--unpaced` to run
+as fast as the host allows. A plain `--run` is never paced. The host is too slow for the machine's
+clock (see "Speed" under Status for the figures and which are measured), so pacing does nothing
+until the core gets faster. One boot run (200 million instructions, an unpaced `--run` of the first-
+boot text) took about 6 s of CPU time on 2026-11-14, on a loaded machine (a load average of about 20
+in the reviewer's repeat). That is slower than the 70 to 77 million a second that I measured for the
+boot in my local speed notes, so the two disagree, and I do not know which is right.
 
-`--flash <file>` keeps the board's settings between runs, as a real board does. If the file
-exists it is loaded at the start, and the flash and the clock are written back to it when the run
-ends. That is the quit key, the window closed, the `--run` limit, `--stop-at`, a fault, a SIGINT,
-SIGTERM or SIGHUP (Ctrl-C in a terminal that is not in raw mode, `kill`, the terminal being
-closed), and a panic in the emulator, which is saved from and then goes on as a panic (the
-terminal is put back before its message prints, and while the run goes the message is held back
-until the files are written, and then said, as standard error may be a pipe that nobody is
-reading and a message with a backtrace may not fit in it). A panic that comes while another is
-being unwound (a `Drop` that panics) is an abort, and nothing is saved then; what was held and the new message are written at once, so that they are not lost with it. The write goes through a temporary file in the
-same directory (named `.cmm2.<pid>.<time>.tmp`, so that one left by a crash is never in the
-way), which is synced and renamed over the file, and then the directory is synced, so a crash
-never leaves half a file. A directory that cannot be synced (not readable, or a file system with
-no such thing) is a warning on stderr, as the file is in its place by then. A crash does leave
-that temporary file, as big as the card. A save holds an advisory lock (`flock`) on its temporary
-file while it is open, which goes when the process does, however it ends. When a run starts, the
-`.cmm2.<pid>.<time>.tmp` files in the directory that have not been changed for a minute and that
-can be locked are removed: nobody is writing them. So a live emulator's file on this host is never touched,
-whatever the pid in its name means to this host (another host or container sharing the
-directory) and whatever the clock does. On a file system whose locks are not shared between
-hosts (NFS mounted with `local_lock=flock` or `nolock`, say) a lock does not show a save on
-another host, and then a left-over file of a save that is going on there could be removed by
-an emulator starting here, and that save would fail when it renames it (the old file is kept
-and nothing is lost, but the run's changes are). Where locking does not work at all the lock
-fails and nothing is removed, so a left-over file there has to be removed by hand. Another one
-that is left is a file with no read and no write right (mode 000), which cannot be locked:
-`rm .cmm2.*.tmp` in the directory clears it. The files that are looked at are only regular
-files (a FIFO, or a link, with such a name is left alone). The name has to be digits only, with a process id above 0, to count. A symlink is followed, even a dangling one (the first save creates what
-it points to), so the file it points to is the one replaced and the link stays. The file keeps
-its permissions. It does not keep its owner, which only a privileged process can set, and a hard
-link to the old file stops seeing the contents, as the file is replaced and not written in
-place. What the save needs is a directory it can make a file in, so the file's own permissions do
-not matter (a read-only file is replaced and keeps its mode). That is looked at when the run
-starts, with the effective user's rights, and a `--flash` file that could not be saved is an error
-then, naming why: the directory does not exist (or a part of the path is not a directory, or the
-links loop), a directory on the path cannot be searched, the directory is not writable (or is
+`--flash <file>` keeps the board's settings between runs, as a real board does. If the file exists
+it is loaded at the start, and the flash and the clock are written back to it when the run ends.
+That is the quit key, the window closed, the `--run` limit, `--stop-at`, a fault, a SIGINT, SIGTERM
+or SIGHUP (Ctrl-C in a terminal that is not in raw mode, `kill`, the terminal being closed), and a
+panic in the emulator, which is saved from and then goes on as a panic (the terminal is put back
+before its message prints, and while the run goes the message is held back until the files are
+written, and then said, as standard error may be a pipe that nobody is reading and a message with a
+backtrace may not fit in it). A panic that comes while another is being unwound (a `Drop` that
+panics) is an abort, and nothing is saved then; what was held and the new message are written at
+once, so that they are not lost with it. The write goes through a temporary file in the same
+directory (named `.cmm2.<pid>.<time>.tmp`, so that one left by a crash is never in the way), which
+is synced and renamed over the file, and then the directory is synced, so a crash never leaves half
+a file. A directory that cannot be synced (not readable, or a file system with no such thing) is a
+warning on stderr, as the file is in its place by then. A crash does leave that temporary file, as
+big as the card. A save holds an advisory lock (`flock`) on its temporary file while it is open,
+which goes when the process does, however it ends. When a run starts, the `.cmm2.<pid>.<time>.tmp`
+files in the directory that have not been changed for a minute and that can be locked are removed:
+nobody is writing them. So a live emulator's file on this host is never touched, whatever the pid in
+its name means to this host (another host or container sharing the directory) and whatever the clock
+does. On a file system whose locks are not shared between hosts (NFS mounted with `local_lock=flock`
+or `nolock`, say) a lock does not show a save on another host, and then a left-over file of a save
+that is going on there could be removed by an emulator starting here, and that save would fail when
+it renames it (the old file is kept and nothing is lost, but the run's changes are). Where locking
+does not work at all the lock fails and nothing is removed, so a left-over file there has to be
+removed by hand. Another one that is left is a file with no read and no write right (mode 000),
+which cannot be locked: `rm .cmm2.*.tmp` in the directory clears it. The files that are looked at
+are only regular files (a FIFO, or a link, with such a name is left alone). The name has to be
+digits only, with a process id above 0, to count. A symlink is followed, even a dangling one (the
+first save creates what it points to), so the file it points to is the one replaced and the link
+stays. The file keeps its permissions. It does not keep its owner, which only a privileged process
+can set, and a hard link to the old file stops seeing the contents, as the file is replaced and not
+written in place. What the save needs is a directory it can make a file in, so the file's own
+permissions do not matter (a read-only file is replaced and keeps its mode). That is looked at when
+the run starts, with the effective user's rights, and a `--flash` file that could not be saved is an
+error then, naming why: the directory does not exist (or a part of the path is not a directory, or
+the links loop), a directory on the path cannot be searched, the directory is not writable (or is
 append-only), the file system is read-only, the file is immutable or append-only (`chattr +i`,
 `+a`), or it is another user's file in a sticky directory such as /tmp (unless the user has
 CAP_FOWNER, which is looked at and not just being root). A file that cannot be read is refused in
 words as well. A name that is empty (an unset shell variable), or ends in a slash, or in `.` or
-`..`, or is longer than the file system allows (255 bytes on most) is refused too, and so is a
-link that leads to such a name. The
-temporary file has a short name of its own, so that a name of any allowed length can be saved. Both files have to be regular files: a device, a FIFO or a directory is refused before
-anything is opened (a FIFO would hang the load, and `sudo` with `--sd /dev/mmcblk0` would read a
-whole card and then rename a file over its node). What cannot be seen at the start, and so can
-still fail when the run is over and lose it, is the rest: a full disk or quota, a file made
+`..`, or is longer than the file system allows (255 bytes on most) is refused too, and so is a link
+that leads to such a name. The temporary file has a short name of its own, so that a name of any
+allowed length can be saved. Both files have to be regular files: a device, a FIFO or a directory is
+refused before anything is opened (a FIFO would hang the load, and `sudo` with `--sd /dev/mmcblk0`
+would read a whole card and then rename a file over its node). What cannot be seen at the start, and
+so can still fail when the run is over and lose it, is the rest: a full disk or quota, a file made
 immutable during the run, a network file system that goes away, a security module (SELinux,
 AppArmor) that says no.
 
 With `--console` the terminal is in raw mode, so Ctrl-C goes to the guest and the quit key is
 Ctrl-]; a signal sent from outside (SIGTERM, SIGHUP) still ends the run, and so does SIGINT with
-`--window` and no `--console`. A signal that was ignored when the emulator started (a job run
-with `nohup`, or in the background from a shell that ignores SIGINT) stays ignored. When a signal
-ends a run the files are written first, and then the emulator ends by that same signal, so the
-exit status is 128 plus its number and a shell stops a loop or an `&&` chain. A second signal
-ends it at once, with no save, and with nothing said of a panic's message that was being held
-(the handler cannot take a lock or allocate): that is what a second Ctrl-C means, and the run is lost back to
-the last time the files were written, which is the start of it. The same is true of a run that is
-blocked writing to a pipe, a FIFO or a terminal that nobody reads: the first signal ends it and
-it saves. Everything the run writes (the guest's output, the summary, the lines on stderr,
-`--trace-mmio`, and the `--trace` file, which may be a FIFO or `/dev/stdout`) goes through one
-writer, which writes by what the descriptor is. Regular files, and the memory devices that take
-any write at once (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random` and `/dev/urandom`), are
-written directly, 64 KB at a time, with no waiting. A pipe, a FIFO or the slave side of a
-terminal is reopened through `/proc/self/fd` with `O_NONBLOCK`, which is an open file description
-of its own (stdin and stderr stay blocking), written 64 KB at a time, and when it takes no more
-the writer waits for it to, or for the signal, whichever comes first; there is no instant in
-which a signal can be missed. Anything else (a socket, the master side of a pseudo-terminal, any
-other device, or no /proc) is written the old way, in small chunks after a wait, and there a
-signal in the instants between the wait and the write can be missed, and a second one ends the
-run without the save. A signal that comes while the files are being written waits for the
-end of the run as any other, and a second one still ends it at once. Before the run begins, while the files are
-being read (which can be slow, or stuck on a hung mount), a signal ends the process at once with
-its own status, as there is nothing to save yet. From the start of the run the main thread takes
-the signals, as the threads the emulator makes (stdin, SDL) have them blocked; threads that SDL
-makes later by itself are not covered. What nothing can save is the process being killed outright (SIGKILL), an abort, or the power going.
-The first run, with no file yet, goes through the first-boot setup and saves the options it makes.
-A second run with the same file reaches the prompt with no setup questions and no reset:
+`--window` and no `--console`. A signal that was ignored when the emulator started (a job run with
+`nohup`, or in the background from a shell that ignores SIGINT) stays ignored. When a signal ends a
+run the files are written first, and then the emulator ends by that same signal, so the exit status
+is 128 plus its number and a shell stops a loop or an `&&` chain. A second signal ends it at once,
+with no save, and with nothing said of a panic's message that was being held (the handler cannot
+take a lock or allocate): that is what a second Ctrl-C means, and the run is lost back to the last
+time the files were written, which is the start of it. The same is true of a run that is blocked
+writing to a pipe, a FIFO or a terminal that nobody reads: the first signal ends it and it saves.
+Everything the run writes (the guest's output, the summary, the lines on stderr, `--trace-mmio`, and
+the `--trace` file, which may be a FIFO or `/dev/stdout`) goes through one writer, which writes by
+what the descriptor is. Regular files, and the memory devices that take any write at once
+(`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random` and `/dev/urandom`), are written directly, 64
+KB at a time, with no waiting. A pipe, a FIFO or the slave side of a terminal is reopened through
+`/proc/self/fd` with `O_NONBLOCK`, which is an open file description of its own (stdin and stderr
+stay blocking), written 64 KB at a time, and when it takes no more the writer waits for it to, or
+for the signal, whichever comes first; there is no instant in which a signal can be missed. Anything
+else (a socket, the master side of a pseudo-terminal, any other device, or no /proc) is written the
+old way, in small chunks after a wait, and there a signal in the instants between the wait and the
+write can be missed, and a second one ends the run without the save. A signal that comes while the
+files are being written waits for the end of the run as any other, and a second one still ends it at
+once. Before the run begins, while the files are being read (which can be slow, or stuck on a hung
+mount), a signal ends the process at once with its own status, as there is nothing to save yet. From
+the start of the run the main thread takes the signals, as the threads the emulator makes (stdin,
+SDL) have them blocked; threads that SDL makes later by itself are not covered. What nothing can
+save is the process being killed outright (SIGKILL), an abort, or the power going. The first run,
+with no file yet, goes through the first-boot setup and saves the options it makes. A second run
+with the same file reaches the prompt with no setup questions and no reset:
 
 ```
 cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --flash board.flash
@@ -216,33 +379,35 @@ it is slower than the wall clock when the host is slow, and it stands still whil
 off. That makes the file 917,512 bytes, and the run stops with an error, leaving the file alone, if
 it is any other size than the three below.
 
-The Gen 2's real time comes from the external DS3231, and the emulator has one fitted, always. It
-is on PD4 and PD5, bit-banged by the firmware, and `OPTION DS3231 ON` at the prompt switches the
+The Gen 2's real time comes from the external DS3231, and the emulator has one fitted, always. It is
+on PD4 and PD5, bit-banged by the firmware, and `OPTION DS3231 ON` at the prompt switches the
 firmware over to it (it saves the option and reboots), as on the board. Until you set the time the
-chip shows the host PC's local time (the system's time zone), so `TIME$` and `DATE$` follow the
-PC's clock, daylight saving changes included. Setting `TIME$ =` or `DATE$ =` makes it a clock of
-its own, like the real chip: it counts seconds evenly from then on and knows nothing of daylight
-saving or time zones, so a time set at 00:59:59 as the PC's clocks go forward does not jump an hour.
-What it keeps in the `--flash` file is the time as an offset from the PC's UTC clock, so it goes on
-counting while the emulator is closed, as the chip does on its battery. Delete the file, or the
-chip's state in it, to get back to the PC's time. Without `--flash` the time you set is lost at the
-end of the run. With the option off the firmware uses the STM32's RTC as before and never talks to
-the chip. The time zone is read from the system once, when the chip is first asked the time, so a zone
-changed while the emulator runs (a new `TZ`, a move to another zone) shows from the next run; the
-zone's daylight saving rules are applied at each time. If the PC's clock is stepped (by NTP, or by
-hand) while the emulator runs, a chip you have never set follows the step, and one you have set
-follows it in UTC; the real chip would not see it, but it only matters while the emulator runs.
-See [docs/ds3231.md](docs/ds3231.md).
+chip shows the host PC's local time (the system's time zone), so `TIME$` and `DATE$` follow the PC's
+clock, daylight saving changes included. Setting `TIME$ =` or `DATE$ =` makes it a clock of its own,
+like the real chip: it counts seconds evenly from then on and knows nothing of daylight saving or
+time zones, so a time set at 00:59:59 as the PC's clocks go forward does not jump an hour. What it
+keeps in the `--flash` file is the time as an offset from the PC's UTC clock, so it goes on counting
+while the emulator is closed, as the chip does on its battery. Delete the file, or the chip's state
+in it, to get back to the PC's time. Without `--flash` the time you set is lost at the end of the
+run. With the option off the firmware uses the STM32's RTC as before and never talks to the chip.
+The time zone is read from the system once, when the chip is first asked the time, so a zone changed
+while the emulator runs (a new `TZ`, a move to another zone) shows from the next run; the zone's
+daylight saving rules are applied at each time. If the PC's clock is stepped (by NTP, or by hand)
+while the emulator runs, a chip you have never set follows the step, and one you have set follows it
+in UTC; the real chip would not see it, but it only matters while the emulator runs. See
+[docs/ds3231.md](docs/ds3231.md).
 
-The chip's state is added to the file only once you have set its time or cleared its status
-flags. A file whose chip was never set is 917,512 bytes, which builds from before the chip was
-modelled read too. After a run that set the time the file is 917,522 bytes: the ten more bytes are
-the offset (milliseconds, an i64), whether the time was set, and the chip's status register. A build
-from before the chip was modelled refuses a file of that size ("the saved flash and clock are 917512
-bytes ..."), so if you go back to such a build, delete the file or truncate it to its first
-917,512 bytes (you then lose the time you set). Files of 917,520 bytes, which an earlier
-version of this build wrote (the offset in seconds from the host's local time), still load, with the
-same time, and are written back in the new form.
+The chip's state is added to the file only once the chip is no longer as it was made: you have set
+its time, cleared its status flags, or written the weekday or the 12-hour form of the hours
+register. A file whose chip was never touched is 917,512 bytes, which builds from before the chip
+was modelled read too. Once it was, the file is 917,522 bytes: the ten more bytes are the offset
+(milliseconds, an i64), a flag byte and the chip's status register. In the flag byte bit 0 says the
+time was set, bits 1 to 3 are the weekday count the chip keeps and bit 4 is the 12-hour form. A
+build from before the chip was modelled refuses a file of that size ("the saved flash and clock are
+917512 bytes ..."), so if you go back to such a build, delete the file or truncate it to its first
+917,512 bytes (you then lose the time you set). Files of 917,520 bytes, which an earlier version of
+this build wrote (the offset in seconds from the host's local time), still load, with the same time,
+and are written back in the new form.
 
 The address 0x08120000, where the user flash starts and the firmware ends, is only known to me
 for MMBasic 7.00.00b5 (its image ends 216 bytes below it); I have not checked it against another
@@ -251,23 +416,22 @@ release that does not fit is noticed and its tail is not merged into the `--flas
 
 `--sd <file>` puts an SD card in the socket, with the file as its contents. The firmware drives the
 card in SPI mode over GPIO pins, and the card is a model of that: it answers the commands the
-firmware sends (initialisation, single-block and multiple-block read and write, and the CSD and
-CID registers) from the image. The file has to exist and has to be a whole number of 512-byte
-blocks, and at least 512 KB (the smallest size a version 2.0 CSD can describe), or the run stops
-with an error and the file is left alone; the emulator never makes a card out of nothing. When the run ends, by any of the ways above, the card is written back to the
-file, in the way `--flash` is, but only if the guest has changed the card. A card that was only
-read leaves the file alone, so a run that never wrote to it does not touch it (its time and inode
-stay the same), and changes made to the file on the host meanwhile are not lost. If the guest did
-write, the whole image is written back from the emulator's copy and replaces the file, so do not
-change the file on the host during such a run. A card is write-protected,
-as with the switch on a real one, when its file could not be written back: the file is read-only
-(its permissions say so), or its directory is not writable (or is append-only), or its file
-system is read-only, or the file is immutable or append-only, or it is another user's file in a
-sticky directory such as /tmp (the same reasons as for `--flash`, which refuses to start
-instead). The
-emulator says which on stderr; the firmware reads the pin, says "The physical drive is write
-protected" and does not write, and nothing is written back whatever happens. Without `--sd` the socket is empty and the
-firmware says "SD card not present".
+firmware sends (initialisation, single-block and multiple-block read and write, and the CSD and CID
+registers) from the image. The file has to exist and has to be a whole number of 512-byte blocks,
+and at least 512 KB (the smallest size a version 2.0 CSD can describe), or the run stops with an
+error and the file is left alone; the emulator never makes a card out of nothing. When the run ends,
+by any of the ways above, the card is written back to the file, in the way `--flash` is, but only if
+the guest has changed the card. A card that was only read leaves the file alone, so a run that never
+wrote to it does not touch it (its time and inode stay the same), and changes made to the file on
+the host meanwhile are not lost. If the guest did write, the whole image is written back from the
+emulator's copy and replaces the file, so do not change the file on the host during such a run. A
+card is write-protected, as with the switch on a real one, when its file could not be written back:
+the file is read-only (its permissions say so), or its directory is not writable (or is
+append-only), or its file system is read-only, or the file is immutable or append-only, or it is
+another user's file in a sticky directory such as /tmp (the same reasons as for `--flash`, which
+refuses to start instead). The emulator says which on stderr; the firmware reads the pin, says "The
+physical drive is write protected" and does not write, and nothing is written back whatever happens.
+Without `--sd` the socket is empty and the firmware says "SD card not present".
 
 The whole image is held in memory for the run, so the card is as big as the RAM you can spare. I
 have only used 64 MB. A few GB is reasonable (a 4 GB card is a 4 GB allocation, read at the start
@@ -285,15 +449,14 @@ cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --flash board.flas
 ```
 
 `7z l card.img` lists what is on it after a run. To put a file on it before a run, mtools'
-`mcopy -i card.img file.bas ::` should do it, though I have not tried that here. The firmware sets the card up the first time it is used, which costs
-about 5 million instructions; after that it is quick. The CMM2 has no `SAVE` or `LOAD` for
-programs: `FILES`, `RUN "T.BAS"`, `LIST "T.BAS"`, `EDIT "T.BAS"` and `AUTOSAVE "T.BAS"` use the
-card. `OPTION SD TIMING FAST` (the SPI3 peripheral) is not modelled yet. The multiple-block
+`mcopy -i card.img file.bas ::` does it: I put a one-line `PRINT` program on a card that way and
+`RUN` ran it (2026-11-14). The firmware sets the card up the first time it is used, which costs
+about 5 million instructions; after that it is quick. The CMM2 has no `SAVE` or `LOAD` for programs:
+`FILES`, `RUN "T.BAS"`, `LIST "T.BAS"`, `EDIT "T.BAS"` and `AUTOSAVE "T.BAS"` use the card.
+`OPTION SD TIMING FAST` (the SPI3 peripheral) is not modelled yet (issue 63). The multiple-block
 commands and the CSD and CID are there and unit tested, but the firmware did not use them for
 anything I tried with it (a 640 KB file written, copied and read back, `FILES` and `MM.INFO`), so
 they have not been seen working against the real firmware.
-
-Building needs the SDL2 development files (`libsdl2-dev` on Debian and Ubuntu).
 
 ## Firmware and documentation are not included
 

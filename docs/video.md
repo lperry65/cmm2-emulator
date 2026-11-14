@@ -211,10 +211,10 @@ apart (page 1 at `0xD00EC000`).
   reload (`CLUTWR` is not shadowed). The registers around the layers are not.
   The clock is woken at the blank so the frame is current without any register access.
 
-Tests: unit tests in `display.rs` (each format, layers, blending, default colour, errors),
-`ltdc.rs` (frame rate for 800x600 and 640x480 and the 640x480 rate through the RCC, a pixel clock
-that starts, stops or changes, line events flagged once, VBR timing, layer 2 registers and colour
-table), `rcc.rs` (the pixel clock and PLL3's ranges), `window.rs` (the fit of a picture with no
-size); real-firmware tests (ignored, `CMM2_FIRMWARE`) in `crates/cmm2-core/tests/real_firmware.rs`:
-every depth at 800x600 and 640x480 with shapes, page flips and the two layers, and the frame rates.
-`CMM2_SCREENSHOTS=<dir>` makes them leave PPMs.
+Tests: unit tests in `display/tests.rs` (each format, layers, blending, default colour, errors),
+`ltdc/tests.rs` (frame rate for 800x600 and 640x480 and the 640x480 rate through the RCC, a pixel
+clock that starts, stops or changes, line events flagged once, VBR timing, layer 2 registers and
+colour table), `rcc/tests.rs` (the pixel clock and PLL3's ranges), `window.rs` in the front end (the
+fit of a picture with no size); real-firmware tests (ignored, `CMM2_FIRMWARE`) in
+`crates/cmm2-core/tests/video.rs`: every depth at 800x600 and 640x480 with shapes, page flips and
+the two layers, and the frame rates. `CMM2_SCREENSHOTS=<dir>` makes them leave PPMs.

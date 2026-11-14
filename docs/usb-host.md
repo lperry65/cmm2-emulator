@@ -2,8 +2,10 @@
 
 This is the spike for issue 11. I wanted to know what the emulator has to do so that the real
 firmware (v7.00.00b5) sees a USB keyboard, with held-key state, so that `KEYDOWN()` and `INKEY$`
-work and games can be played. Today the window types into the console UART (`keys.rs`), which
-has no key-up events.
+work and games can be played. When I wrote this the window typed into the console UART (`keys.rs`),
+which has no key-up events. That is now only the first part of a run: the keyboard is built, and
+the window is a USB keyboard once the firmware polls it (section 12). Sections 1 to 11 are the
+spike as I wrote it, with notes where the build has overtaken them.
 
 The short answer is good news:
 
@@ -176,11 +178,13 @@ configuration, with the length it got from step 5. The firmware then prints
 cycle 1.334 billion (instruction about 710 million) it sends **SET_REPORT** for the keyboard LEDs
 (21 09 00 02 00 00 01 00, one data byte, 0x00: all LEDs off), starts the first interrupt IN
 transfer, and only then are keys read. So a keyboard becomes usable about 2.78 s of emulated time
-after reset, which is about 30 s of wall time today (the host runs about 25 million instructions
-a second). That is worth knowing for tests and for what the window does before then (section 7).
+after reset, which was about 30 s of wall time in the scratch model (the host ran about 25 million
+instructions a second then). In the build the firmware starts polling about 299 million
+instructions after the second prompt, 5.5 to 6 s of host time unpaced (section 12). That is worth
+knowing for tests and for what the window does before then (section 7).
 
-The firmware sends `SET_REPORT` again whenever a lock-key LED changes, [guess, not tested]. The
-device only has to accept it.
+The firmware sends `SET_REPORT` again whenever a lock-key LED changes (I guessed this in the spike;
+it is measured now, see "The lock keys" in section 12). The device only has to accept it.
 
 **Hot plug.** [scratch] I detached the device 300 ms after the first poll (`PCSTS` and `PENA` clear,
 `PENCHNG` set, `GINTSTS.DISCINT`, bit 29, set and `HPRTINT` pending). The firmware read `HPRT`
@@ -359,7 +363,12 @@ low-speed device behind a hub is not supported"), so keyboard and mouse together
 need either a full-speed hub with full-speed devices or one device that is both. A composite
 device avoids modelling a hub, and the firmware handles it.
 
-## 7. What the window has to supply
+## 7. What the window has to supply (the plan, before it was built; what was built is in section 12)
+
+This is the list I wrote from the spike. The window does these things now. Where the build differs:
+the extra keys past six are the rollover error (`0x01` in all six slots), which the firmware ignores
+as I checked on the real firmware (section 12); and the wait before the keyboard is usable is about
+6 s of host time, not 30 s.
 
 - **SDL scancodes, not keycodes or text.** SDL's scancode numbers for the main keyboard are the
   USB HID usage numbers (A is 4, Return 40, F1 58, left Ctrl 224, right GUI 231). So the mapping is
@@ -374,10 +383,10 @@ device avoids modelling a hub, and the firmware handles it.
   everything. More than six keys: ignore the extra (a real keyboard sends a roll-over error).
 - Deliver the **current state at the first poll** after enumeration, not just changes: a key held
   during the 2.78 s before the first poll would otherwise be lost.
-- **Before the keyboard is usable** (about 30 s of wall time today), the window can keep sending bytes
-  to the UART. I suggest: bytes to the UART until the firmware has started polling the keyboard
-  (the model knows: the first interrupt IN), HID after. Keep the UART path for `--console` in any
-  case; it is how every existing test types.
+- **Before the keyboard is usable** (about 30 s of wall time in the spike; about 6 s in the
+  build), the window can keep sending bytes to the UART. I suggest: bytes to the UART until the
+  firmware has started polling the keyboard (the model knows: the first interrupt IN), HID after.
+  Keep the UART path for `--console` in any case; it is how every existing test types.
 - The keyboard should be attached only when there is a window (or a flag), so that no existing
   console test sees the extra `Connected` line. With the model present and no device, boot is the
   same as today (measured: 1.2 billion instructions, 20.0 s without the model, 20.3 s with it
@@ -413,7 +422,10 @@ Report descriptor (63 bytes, the standard boot keyboard):
 
 For the mouse I used a 52-byte descriptor with three buttons, X, Y and wheel, in a 4-byte report.
 
-## 10. Plan
+## 10. Plan (before it was built; what was built is in section 12)
+
+This is the plan I wrote from the spike, and the numbers in it are the spike's. The keyboard was
+built as issues 50 to 52 (closed). The mouse (issue 53) and the gamepad (issue 54) are open.
 
 **Where it fits.** The same pattern as the console and the SD slot:
 
@@ -440,7 +452,7 @@ For the mouse I used a 52-byte descriptor with three buttons, X, Y and wheel, in
 with a lot of logging): the controller and channels 500 and tests 400; keyboard device and
 descriptors 150 and tests 100; handle and plumbing 80; window mapping and report builder 250
 and tests 150; mouse 200; real-firmware integration tests 100 (they need the firmware and about
-710 million instructions, 30 s). Gamepad: unknown until its spike.
+710 million instructions, which was 30 s then). Gamepad: unknown until its spike.
 
 **Ticket split** (as a suggestion):
 
@@ -464,8 +476,9 @@ plug in one session with a throwaway model, and every register the firmware touc
 document. The risks that remain are small and specific: the few values I guessed (below), the
 fidelity of the model to real silicon where the firmware does not care but a future firmware might
 (`CHH` after an OUT transfer, `GSNPSID` and `GHWCFG` contents), and the 30 s wait before the first
-key (today's speed; the firmware's own delays at 480 MHz are about 2.8 s). No-go is not on the
-table for the keyboard. The gamepad is the real unknown and should not be promised.
+key (the speed of the scratch model; the firmware's own delays at 480 MHz are about 2.8 s, and the
+build waits about 6 s of host time). No-go is not on the table for the keyboard. The gamepad is the
+real unknown and should not be promised.
 
 ## 11. What I could not establish, and open questions
 
@@ -486,9 +499,16 @@ table for the keyboard. The gamepad is the real unknown and should not be promis
   full speed. I expect `PSPD` 1, `HCFG` 1 (48 MHz) and `LSDEV` clear in `HCCHAR` [guess].
 - **A real hub**: I did not model one; hubs need their own class requests and are not needed if the
   composite device is used.
-- **Lock keys** (`KEYDOWN(8)`, the LED report) and **Caps Lock** behaviour: untested.
+- **Lock keys** (`KEYDOWN(8)`, the LED report) and **Caps Lock** behaviour: untested in the spike.
+  Tested on the real firmware since: the LED reports, Caps Lock and Num Lock, and the window
+  following the host's locks (section 12, "The lock keys"; tests in `usb_keys.rs` and
+  `crates/cmm2-core/tests/usb_keyboard.rs`). I have not compared them with a real board.
 - **What `CHH` and `CHENA` do after an OUT transfer on real silicon**: guessed (section 5).
-- **A system reset with a device attached**: not tested.
+- **A system reset with a device attached**: not tested in the spike. Tested on the real firmware
+  since: after a restart the firmware polls the keyboard again and the window goes back to the
+  console keys in between (`real_firmware_polls_a_usb_keyboard_again_after_a_restart` in
+  `crates/cmm2-core/tests/usb_keyboard.rs`, and
+  `real_firmware_asks_for_the_console_keys_again_after_a_restart_over_usb` in `usb_keys.rs`).
 - **Why the second gap (1.03 s) exists**: I see it in the traces (no USB activity between the last
   control transfer and the first interrupt IN) but did not find which firmware wait it is.
 - **The firmware's behaviour with a first-boot flash**: the keyboard question (`Keyboard type: 1=UK`)
@@ -803,5 +823,5 @@ Lock on macOS (it reads as off), so there the window leaves Num Lock as the firm
 Wayland compositor that did not report it would turn the firmware's Num Lock off at each focus
 change, and I do not know of one. Scroll Lock is not followed.
 
-The mouse and the gamepad (issues after) need a composite device or a second device behind a hub,
-which the port does not have.
+The mouse (issue 53) and the gamepad (issue 54) are not built. They need a composite device or a
+second device behind a hub, which the port does not have.
