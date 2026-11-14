@@ -237,8 +237,48 @@ The firmware needs a few things zmu does not do, so I changed the following.
   ReturnAddress() value of the original fault"; the note is repeated at p. B1-529); I stacked the
   SVC itself. The IT state an SVC stacks (escalated or not) is the one after the SVC, to match
   that return address (the note in ReturnAddress(), p. B1-534); it was the state before. If the
-  SVCall entry fails while stacking, the derived fault stacks the SVC's own address, so the IT
-  state is put back to what it was before the SVC. BKPT with no
+  entry of an exception fails while stacking, it is a derived exception on exception entry and
+  follows DerivedLateArrival() (B1.5.11, pp. B1-547, B1-548) and PushStack (B1.5.6, p. B1-532):
+  - the derived exception reuses the one PushStack: SP is lowered once, the frame is the original's
+    (its return address, and its IT state, which ExceptionTaken() clears and PushStack does not),
+    and no second frame is pushed. Before, the derived fault pushed a frame of its own below the
+    first, with the wrong IT state and, for SVC, the SVC's own address.
+  - the derived exception is the stacking fault (BusFault STKERR, MemManage MSTKERR) delivered by
+    the escalation rules: it is escalated to HardFault when it is disabled or when the preempted
+    priority is not lower than its own. If it is escalated, or its GROUP priority (PRIGROUP
+    applied, as DerivedLateArrival() compares OEpriority and DEpriority) is higher than the
+    original's, it is taken and the original stays pending; otherwise (the same group or lower)
+    the original is taken on the frame and the derived exception is left pending.
+  - which exception is left pending: an original that came from the pending exceptions
+    (`check_exceptions`, so also an interrupt, a fault pended through SHCSR, a MON_PEND
+    DebugMonitor) is always left pending, as the manual has it. A synchronous original that is
+    entered now (an SVC, a BKPT, a fault from `handle_fault`) is left pending only when it
+    returns to the next instruction (SVCall, and the like): a fault or a BKPT returns to the
+    instruction itself, which runs again, so the manual's unconditional SetPending(OEnumber) would
+    run it twice. That is a deliberate departure from the pseudocode. The ignoring of a derived
+    DebugMonitor (a watchpoint) does not arise, there are no watchpoints.
+  - a derived HardFault at an execution priority below 0 is a lockup (B1.5.15, p. B1-556): the
+    core stops with a Lockup trap.
+  - a vector read error for the original (B1-547: always a HardFault; B1-556: a lockup for NMI and
+    HardFault) is the same thing on the same frame, with the fault VectorTable (HFSR.VECTTBL):
+    the HardFault is taken and the original stays pending by the rules above; if the HardFault's
+    vector cannot be read either (the table is read upwards, so it is that of NMI or HardFault
+    that fails together with it), or taking the exception fails, the core locks up. Before, the
+    frame was pushed and the exception cleared and never taken, or a second frame was pushed.
+  - the trap is for the exception that was taken, by the fault trap mode, with the fault that
+    made it (the original's, or the stacking fault when the derived one is taken), or else for the
+    derived one by the mode. It reports the PC of the faulting instruction (the SVC itself for an
+    SVC), not the return address. Nothing from one entry is kept for the next one: the entry
+    returns how it ended.
+  - an exception selected by `check_exceptions` counts as that step's exception entry, whether the
+    entry worked or failed; the GDB step after a halt (a BKPT, or a breakpoint or watchpoint from
+    the debugger's list: C1-695 applies whenever the core leaves Debug state) takes it instead of
+    an instruction and counts 12 cycles for it, like `handle_fault`, in the cycle counter, DWT and
+    SysTick.
+  - the test `test_failing_stacks_and_unreadable_vectors_never_panic_and_lower_sp_by_one_frame`
+    runs random stacks near the end of SRAM, VTORs, priorities, PRIGROUP, fault enables and
+    pending exceptions, and checks that no entry lowers SP by more than one frame.
+  BKPT with no
   semihosting host is a debug event (C1.5, p. C1-694; B1.5.14, HardFault on breakpoint
   escalation): DFSR.BKPT is set, the DebugMonitor is taken if DEMCR.MON_EN is set and its group
   priority is higher than the execution priority, and otherwise it is a HardFault with HFSR.DEBUGEVT, a lockup
@@ -246,8 +286,9 @@ The firmware needs a few things zmu does not do, so I changed the following.
   and MON_PEND stays set until the exception is taken or a write clears it (C1-689); the BKPT takes
   the DebugMonitor at once, so the code does not set the bit for it and it reads 0 afterwards.
   A software write of MON_PEND = 1 to DEMCR pends the DebugMonitor whatever MON_EN is (C1-689):
-  it is taken by the usual priority rules, taking it clears MON_PEND, and a write of 0 removes the
-  pending exception. The return
+  it is taken by the usual priority rules, taking it clears MON_PEND and the pending state (also when a BKPT takes it directly), and a write
+  of 0 removes the pending exception. Whether a write pends is decided by the pending state of the
+  exception, not by the stored bit. The return
   address is the BKPT itself for both (ReturnAddress(), synchronous). DFSR bits are set when the event halts or
   generates an exception (C1-694), so DFSR.BKPT is set on the HardFault path too; only whether
   they are set for an event that is ignored or causes lockup is IMPLEMENTATION DEFINED. BKPT #0xab with no host is the same.
@@ -261,9 +302,12 @@ The firmware needs a few things zmu does not do, so I changed the following.
   register write), and then continue and step go on. A BKPT that halts does not advance the IT
   state, as it does not move the PC, and takes no pending exception in that step (the debugger
   sees the PC on the BKPT; the exception stays pending). The halt is consumed when the simulation
-  reports it. It used to be a HardFault under the server. A stacking failure on the
-  entry of an exception is a lockup by the same rule as a fault (execution priority below 0), not
-  by the IPSR. The xPSR that a refused return stacks holds only the fields the xPSR has (reserved
+  reports it. The step after a halt starts by taking a pending exception of sufficient priority,
+  and does not execute an instruction in that step (Halting debug stepping, C1.5, p. C1-695), so
+  a continue with the PC still on the BKPT takes it instead of halting again, and with PendSV
+  pending the step after `set $pc` takes it before the next instruction runs. It used to be a HardFault under the server. A stacking failure on the
+  entry of an exception is a derived exception (above), a lockup when the execution priority is
+  below 0, not by the IPSR. The xPSR that a refused return stacks holds only the fields the xPSR has (reserved
   bits 23:20, and GE without the DSP extension, are zero).
 - CCR.STKALIGN (B3.2, p. B3-605; B1.5.7, p. B1-535): whether the bit is RW or RO (RAO) and its reset
   value are IMPLEMENTATION DEFINED, and Arm recommends a reset of 1. On the armv7em build (the
@@ -304,6 +348,9 @@ The firmware needs a few things zmu does not do, so I changed the following.
   return. It was dropped, so an interrupt inside an IT block corrupted the handler.
 - Default features: `default` is now `["armv7em", "fpv5-d16"]`, the Cortex-M7 with the
   double-precision FPU. All other features are unchanged.
+
+The armv7m build needs `--no-default-features --features armv7m`: with the default features
+also on, `build.rs` stops.
 
 `cargo clippy -p zmu_cortex_m --all-targets -- -D warnings` is clean (the crate denies
 `clippy::pedantic`; the test code had unseparated long literals, `assert!` with `==`, and a few

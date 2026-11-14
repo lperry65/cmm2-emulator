@@ -681,7 +681,7 @@ impl SystemControlBlock for Processor {
         #[cfg(not(feature = "armv6m"))]
         {
             use crate::core::exception::{Exception, ExceptionHandling};
-            let was_pended = self.demcr & DEMCR_MON_PEND != 0;
+            let was_pended = self.exception_pending(Exception::DebugMonitor);
             if value & DEMCR_MON_PEND != 0 && !was_pended {
                 self.set_exception_pending(Exception::DebugMonitor);
             } else if value & DEMCR_MON_PEND == 0 && was_pended {

@@ -281,3 +281,108 @@ fn test_exception_returns_with_forged_frames_never_panic_the_host() {
         }
     }
 }
+
+// Exception entries on stacks that fail and vector tables that cannot be read: random stack
+// pointers near the end of SRAM, random VTOR, priorities, fault enables, PRIGROUP and pending
+// exceptions, entered by SVC, BKPT, UDF and from the pending ones. Nothing panics, and an entry
+// lowers the stack pointer by at most one frame (B1.5.11: a derived exception reuses the one
+// PushStack), whatever fails.
+#[cfg(not(feature = "armv6m"))]
+#[test]
+fn test_failing_stacks_and_unreadable_vectors_never_panic_and_lower_sp_by_one_frame() {
+    use crate::bus::Bus;
+    use crate::core::exception::{Exception, ExceptionHandling};
+    use crate::decoder::decode_16;
+
+    let count = std::env::var("ZMU_GUEST_FUZZ")
+        .ok()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(DEFAULT_OPCODES)
+        / 100;
+    let mut rng = Rng(0x5eed_1234_9876_abcd);
+    let stacks = [
+        0x2000_0200_u32,
+        0x2001_fff0,
+        0x2002_0000,
+        0x2002_0004,
+        0x2002_0010,
+        0x2002_0048,
+        0x2002_0070,
+        0,
+        0x0000_0010,
+        0xffff_fff0,
+    ];
+    let vtors = [
+        0_u32,
+        0x2001_ffe0,
+        0x2001_fffc,
+        0x2001_ffc0,
+        0xffff_fff0,
+        0x2002_0000,
+    ];
+    let priorities = [0_u8, 0x20, 0x40, 0x80];
+    let faults = [
+        Exception::MemoryManagementFault,
+        Exception::BusFault,
+        Exception::UsageFault,
+        Exception::SVCall,
+        Exception::SysTick,
+        Exception::PendSV,
+        Exception::DebugMonitor,
+    ];
+    let actions = [0xdf00_u16, 0xbe00, 0xde00, 0xbf00];
+
+    for _ in 0..count {
+        let mut core = processor();
+        core.ccr = rng.next() & 0x201;
+        core.write32(0xE000_ED24, (rng.next() & 7) << 16).unwrap();
+        core.write32(0xE000_ED0C, 0x05fa_0000 | ((rng.next() % 8) << 8))
+            .unwrap();
+        for exception in faults {
+            core.set_exception_priority(exception, priorities[rng.next() as usize % 4]);
+        }
+        core.write32(0xE000_EDFC, (rng.next() & 3) << 16).unwrap();
+        core.vtor = vtors[rng.next() as usize % vtors.len()];
+        core.set_msp(stacks[rng.next() as usize % stacks.len()]);
+        core.execution_priority = core.get_execution_priority();
+        for _ in 0..(rng.next() % 3) {
+            core.set_exception_pending(faults[rng.next() as usize % faults.len()]);
+        }
+        if rng.next().is_multiple_of(2) {
+            core.write32(0xE000_E100, 1).unwrap();
+            core.write32(0xE000_E200, 1).unwrap();
+        }
+        core.set_pc(START);
+        let action = actions[rng.next() as usize % actions.len()];
+
+        let before = core.get_msp();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            core.execute(&decode_16(action), 2);
+            let lowered = before.wrapping_sub(core.get_msp());
+            assert!(
+                lowered <= 0x6c || lowered > 0xffff_ff00,
+                "the action lowered SP by {lowered:#x}"
+            );
+            for _ in 0..3 {
+                let sp = core.get_msp();
+                core.check_exceptions();
+                let lowered = sp.wrapping_sub(core.get_msp());
+                assert!(
+                    lowered <= 0x6c || lowered > 0xffff_ff00,
+                    "an entry lowered SP by {lowered:#x}"
+                );
+            }
+        }));
+        if let Err(panic) = outcome {
+            let message = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(ToString::to_string))
+                .unwrap_or_default();
+            panic!(
+                "action {action:#x}, SP {before:#x}, VTOR {:#x} panicked: {message}",
+                core.vtor
+            );
+        }
+    }
+}

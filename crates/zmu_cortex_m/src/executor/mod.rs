@@ -170,8 +170,20 @@ fn conditional_setflags(setflags: SetFlags, in_it_block: bool) -> bool {
 }
 
 impl Processor {
+    /// Count `count` cycles: the cycle counter, DWT and `SysTick`.
+    #[inline(always)]
+    pub(crate) fn account_cycles(&mut self, count: u32) {
+        self.cycle_count += u64::from(count);
+        if (self.dwt_ctrl & 1) != 0 {
+            self.dwt_tick(count);
+        }
+        if (self.syst_csr & 1) != 0 {
+            self.syst_step(count);
+        }
+    }
+
     #[cfg(not(feature = "armv6m"))]
-    fn fault_delivery_exception(&mut self, fault: Fault) -> Exception {
+    pub(crate) fn fault_delivery_exception(&mut self, fault: Fault) -> Exception {
         let mapped_exception = fault.exception();
 
         // A fault is taken as itself when it is enabled and its priority is higher than the
@@ -191,11 +203,11 @@ impl Processor {
 
     #[cfg(feature = "armv6m")]
     #[allow(clippy::unused_self)] // the armv7 build needs the processor
-    fn fault_delivery_exception(&mut self, fault: Fault) -> Exception {
+    pub(crate) fn fault_delivery_exception(&mut self, fault: Fault) -> Exception {
         fault.exception()
     }
 
-    fn queue_fault_trap(
+    pub(crate) fn queue_fault_trap(
         &mut self,
         fault: Fault,
         exception: Exception,
@@ -244,8 +256,13 @@ impl Processor {
         // an escalated fault keeps the return address of the original (B1.5.6, p. B1-534)
         let return_address = status.return_address.unwrap_or(fault_pc);
 
-        match self.enter_exception(exception, return_address, status.refused_return) {
-            Ok(()) => {
+        match self.enter_exception(
+            exception,
+            return_address,
+            status.refused_return,
+            crate::core::exception::EntrySource::Synchronous,
+        ) {
+            Ok(crate::core::exception::EntryOutcome::Entered) => {
                 if self.get_fault_trap_mode().should_trap(exception) {
                     self.queue_fault_trap(
                         fault,
@@ -255,6 +272,9 @@ impl Processor {
                         FaultTrapReason::Fault,
                     );
                 }
+            }
+            Ok(crate::core::exception::EntryOutcome::Derived(entry)) => {
+                self.queue_derived_traps(&entry, Some(fault), fault_pc);
             }
             Err(entry_fault) => {
                 self.record_fault_status(entry_fault, FaultStatusContext::default());
@@ -847,13 +867,7 @@ impl Executor for Processor {
                 Err(fault) => self.handle_fault(fault, pc),
             },
         };
-        self.cycle_count += u64::from(count);
-        if (self.dwt_ctrl & 1) != 0 {
-            self.dwt_tick(count);
-        }
-        if (self.syst_csr & 1) != 0 {
-            self.syst_step(count);
-        }
+        self.account_cycles(count);
         // a halt into a debugger takes no exception in the same step
         if (self.pending_exception_count != 0 || self.sleeping) && !self.debug_halt {
             self.check_exceptions();
@@ -1353,7 +1367,6 @@ mod tests {
     #[cfg(not(feature = "armv6m"))]
     fn test_handle_fault_escalates_entry_stacking_fault_to_hardfault() {
         let mut core = Processor::new();
-        core.fault_trap_mode(FaultTrapMode::none());
         core.set_msp(0);
 
         let cycles = core.handle_fault(Fault::Forced, 0x0800_0250);

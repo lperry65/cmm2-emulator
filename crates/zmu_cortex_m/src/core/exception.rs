@@ -205,7 +205,7 @@ pub trait ExceptionHandling {
     ///
     /// Check if any exceptions have happened.
     ///
-    fn check_exceptions(&mut self);
+    fn check_exceptions(&mut self) -> bool;
 }
 
 trait ExceptionHandlingHelpers {
@@ -291,6 +291,39 @@ pub enum Exception {
     },
 }
 
+/// How an exception entry ended.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub(crate) enum EntryOutcome {
+    /// The exception was entered.
+    Entered,
+    /// The entry failed (stacking, or reading the vector) and a derived exception was dealt with.
+    Derived(DerivedEntry),
+}
+
+/// What `DerivedLateArrival()` made of a failed entry.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub(crate) struct DerivedEntry {
+    /// The fault of the entry.
+    pub fault: Fault,
+    /// The derived exception, after escalation.
+    pub derived: Exception,
+    /// The exception that was taken.
+    pub taken: Exception,
+    /// The exception that was running when it happened.
+    pub active_exception: Option<Exception>,
+    /// The core locked up.
+    pub lockup: bool,
+}
+
+/// Where an exception entry comes from.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub(crate) enum EntrySource {
+    /// Selected from the pending exceptions.
+    Pending,
+    /// An instruction or fault being entered now.
+    Synchronous,
+}
+
 impl Processor {
     /// CCR.NONBASETHRDENA. ARMv6-M has no such bit.
     #[cfg_attr(feature = "armv6m", allow(clippy::unused_self))]
@@ -311,27 +344,215 @@ impl Processor {
         exception == Exception::HardFault && self.get_execution_priority() < 0
     }
 
+    /// The group priority of an exception, as `DerivedLateArrival()` compares them (B1-548).
+    fn group_priority(&self, exception: Exception) -> i16 {
+        let priority = self.get_exception_priority(exception);
+        if priority < 0 {
+            priority
+        } else {
+            let group: i16 = 2 << self.aircr.get_bits(8..11);
+            priority - priority % group
+        }
+    }
+
+    /// The entry of `original` failed (`fault` is a stacking fault, or the vector read error of
+    /// the original): `DerivedLateArrival()` (B1.5.11, pp. B1-547, B1-548). The derived exception
+    /// reuses the one `PushStack`: the frame is the original's, with its return address, and no
+    /// second frame is pushed. If the derived exception is escalated to `HardFault`, or its group
+    /// priority is higher than the original's, it is taken and the original is left pending;
+    /// otherwise the original is taken and the derived one is left pending. A `HardFault` at an
+    /// execution priority below 0 is a lockup (B1.5.15), and so is a vector read error for NMI
+    /// and `HardFault` (p. B1-556): the vector of the derived `HardFault` is read after theirs
+    /// (a higher address), so it cannot be read either, and taking it fails. An exception that came from `check_exceptions` is always left
+    /// pending, as the manual has it; a synchronous one entered now is only left pending when it
+    /// returns to the next instruction, since a fault or BKPT runs again.
+    fn derived_exception_on_entry(
+        &mut self,
+        original: Exception,
+        fault: Fault,
+        source: EntrySource,
+        lr_override: Option<u32>,
+        stacked: bool,
+    ) -> EntryOutcome {
+        let active_exception = self.active_exception();
+        self.record_fault_status(fault, FaultStatusContext::default());
+        let derived = self.fault_delivery_exception(fault);
+        let escalated = derived != fault.exception();
+
+        let mut entry = DerivedEntry {
+            fault,
+            derived,
+            taken: derived,
+            active_exception,
+            lockup: self.is_lockup(derived),
+        };
+        if !entry.lockup {
+            if stacked {
+                self.set_exception_return_lr();
+                if let Some(lr) = lr_override {
+                    self.lr = lr;
+                }
+            }
+            let derived_first =
+                escalated || self.group_priority(derived) < self.group_priority(original);
+            let (taken, pended) = if derived_first {
+                (derived, original)
+            } else {
+                (original, derived)
+            };
+            entry.taken = taken;
+            self.pend_after_failed_entry(pended, pended == derived, source);
+            if self.exception_taken(taken).is_err() {
+                entry.lockup = true;
+            }
+        }
+        if entry.lockup {
+            self.running = false;
+            self.sleeping = false;
+        }
+        EntryOutcome::Derived(entry)
+    }
+
+    /// Queue the trap of an entry that was derived: the exception that was taken, by the trap
+    /// mode, with the fault that made it (`original_fault` for the original, the stacking fault
+    /// for the derived one), or else the derived one; a lockup is always reported.
+    pub(crate) fn queue_derived_traps(
+        &mut self,
+        entry: &DerivedEntry,
+        original_fault: Option<Fault>,
+        pc: u32,
+    ) {
+        use crate::core::fault::FaultTrapReason;
+        if entry.lockup {
+            self.queue_fault_trap(
+                entry.fault,
+                entry.derived,
+                pc,
+                entry.active_exception,
+                FaultTrapReason::Lockup,
+            );
+            return;
+        }
+        let taken_fault = if entry.taken == entry.derived {
+            Some(entry.fault)
+        } else {
+            original_fault
+        };
+        let mode = self.get_fault_trap_mode();
+        if let Some(fault) = taken_fault
+            && mode.should_trap(entry.taken)
+        {
+            self.queue_fault_trap(
+                fault,
+                entry.taken,
+                pc,
+                entry.active_exception,
+                FaultTrapReason::Fault,
+            );
+        } else if mode.should_trap(entry.derived) {
+            self.queue_fault_trap(
+                entry.fault,
+                entry.derived,
+                pc,
+                entry.active_exception,
+                FaultTrapReason::Fault,
+            );
+        }
+    }
+
+    /// Leave an exception pending after the entry of the other one. One that was selected from the
+    /// pending ones is always left pending. A synchronous original is only left pending when it
+    /// returns to the next instruction (interrupts, `PendSV`, `SysTick`, NMI, `SVCall`, and a
+    /// `DebugMonitor` that `MON_PEND` pended); a fault, or a BKPT, returns to the instruction
+    /// itself, which runs again, so pending it would run it twice. That is a departure from the
+    /// manual's unconditional `SetPending(OEnumber)`.
+    fn pend_after_failed_entry(
+        &mut self,
+        exception: Exception,
+        is_derived: bool,
+        source: EntrySource,
+    ) {
+        let returns_to_next = match exception {
+            Exception::Interrupt { .. }
+            | Exception::PendSV
+            | Exception::SysTick
+            | Exception::NMI
+            | Exception::SVCall => true,
+            Exception::DebugMonitor => self.demcr & (1 << 17) != 0,
+            _ => false,
+        };
+        if !(is_derived || returns_to_next || source == EntrySource::Pending) {
+            return;
+        }
+        if let Exception::Interrupt { n } = exception {
+            self.nvic_write_ispr(n / 32, 1 << (n % 32));
+        } else {
+            self.set_exception_pending(exception);
+        }
+    }
+
+    /// The `EXC_RETURN` value `PushStack` leaves in LR (B1.5.6, p. B1-533), from the mode and
+    /// CONTROL as they are before `ExceptionTaken()`.
+    pub(crate) fn set_exception_return_lr(&mut self) {
+        #[cfg(feature = "has-fp")]
+        {
+            let fpca = u32::from(!self.control.fpca) << 4;
+            if self.mode == ProcessorMode::HandlerMode {
+                self.lr = 0b1111_1111_1111_1111_1111_1111_1110_0001 + fpca;
+            } else {
+                let thread = 1 << 3;
+                let spsel = u32::from(self.control.sp_sel) << 2;
+                self.lr = 0b1111_1111_1111_1111_1111_1111_1110_0001 + fpca + thread + spsel;
+            }
+        }
+        #[cfg(not(feature = "has-fp"))]
+        {
+            if self.mode == ProcessorMode::HandlerMode {
+                self.lr = 0xFFFF_FFF1;
+            } else if self.control.sp_sel {
+                self.lr = 0xFFFF_FFFD;
+            } else {
+                self.lr = 0xFFFF_FFF9;
+            }
+        }
+    }
+
     /// Enter an exception. `refused` is set by the fault of an exception return that was refused.
     pub(crate) fn enter_exception(
         &mut self,
         exception: Exception,
         return_address: u32,
         refused: Option<RefusedReturn>,
-    ) -> Result<(), Fault> {
+        source: EntrySource,
+    ) -> Result<EntryOutcome, Fault> {
         if exception == Exception::Reset {
-            self.reset()
-        } else {
-            if let Exception::Interrupt { n } = exception {
-                self.nvic_unpend_interrupt(n);
+            return self.reset().map(|()| EntryOutcome::Entered);
+        }
+        if let Exception::Interrupt { n } = exception {
+            self.nvic_unpend_interrupt(n);
+        }
+        // ExceptionReturn() refuses a bad EXC_RETURN before the pop with no PushStack
+        if refused.is_none_or(|refused| refused.pushes_frame) {
+            if let Err(fault) = self.push_stack(return_address, refused) {
+                // The stacking failed: DerivedLateArrival(), which reuses this PushStack
+                let lr_override = refused.map(|refused| refused.handler_lr);
+                return Ok(self.derived_exception_on_entry(
+                    exception,
+                    fault.on_exception_entry_stack(),
+                    source,
+                    lr_override,
+                    true,
+                ));
             }
-            // ExceptionReturn() refuses a bad EXC_RETURN before the pop with no PushStack
-            if refused.is_none_or(|refused| refused.pushes_frame) {
-                self.push_stack(return_address, refused)
-                    .map_err(Fault::on_exception_entry_stack)?;
-            } else if let Some(refused) = refused {
-                self.lr = refused.handler_lr;
+        } else if let Some(refused) = refused {
+            self.lr = refused.handler_lr;
+        }
+        match self.exception_taken(exception) {
+            Ok(()) => Ok(EntryOutcome::Entered),
+            // the vector of the original could not be read: a derived HardFault on the same frame
+            Err(fault) => {
+                Ok(self.derived_exception_on_entry(exception, fault, source, None, false))
             }
-            self.exception_taken(exception)
         }
     }
 
@@ -384,6 +605,7 @@ impl ExceptionHandlingHelpers for Processor {
         #[cfg(not(feature = "armv6m"))]
         if exception == Exception::DebugMonitor {
             self.demcr &= !(1 << 17);
+            self.clear_pending_exception(Exception::DebugMonitor);
         }
         self.exceptions.get_mut(&exception.into()).unwrap().active = true;
         self.set_shcsr_exception_active(exception, true);
@@ -519,7 +741,7 @@ impl ExceptionHandlingHelpers for Processor {
                     | it.get_bits(2..8) << 10
             }
         };
-        self.itstate = 0;
+        // ITSTATE is cleared by ExceptionTaken(), not here: a failed PushStack leaves it
         self.write32(frameptr.wrapping_add(0x1c), xpsr)?;
 
         #[cfg(feature = "has-fp")]
@@ -538,27 +760,7 @@ impl ExceptionHandlingHelpers for Processor {
             }
         }
 
-        #[cfg(feature = "has-fp")]
-        {
-            let fpca = u32::from(!self.control.fpca) << 4;
-            if self.mode == ProcessorMode::HandlerMode {
-                self.lr = 0b1111_1111_1111_1111_1111_1111_1110_0001 + fpca;
-            } else {
-                let thread = 1 << 3;
-                let spsel = u32::from(self.control.sp_sel) << 2;
-                self.lr = 0b1111_1111_1111_1111_1111_1111_1110_0001 + fpca + thread + spsel;
-            }
-        }
-        #[cfg(not(feature = "has-fp"))]
-        {
-            if self.mode == ProcessorMode::HandlerMode {
-                self.lr = 0xFFFF_FFF1;
-            } else if self.control.sp_sel {
-                self.lr = 0xFFFF_FFFD;
-            } else {
-                self.lr = 0xFFFF_FFF9;
-            }
-        }
+        self.set_exception_return_lr();
         if let Some(refused) = refused {
             self.lr = refused.handler_lr;
         }
@@ -806,7 +1008,12 @@ impl ExceptionHandling for Processor {
     }
 
     fn exception_entry(&mut self, exception: Exception, return_address: u32) -> Result<(), Fault> {
-        self.enter_exception(exception, return_address, None)
+        let pc = self.get_pc();
+        match self.enter_exception(exception, return_address, None, EntrySource::Synchronous)? {
+            EntryOutcome::Entered => {}
+            EntryOutcome::Derived(entry) => self.queue_derived_traps(&entry, None, pc),
+        }
+        Ok(())
     }
 
     fn exception_return(&mut self, exc_return: u32) -> Result<(), Fault> {
@@ -873,31 +1080,34 @@ impl ExceptionHandling for Processor {
     }
 
     #[inline(always)]
-    fn check_exceptions(&mut self) {
+    fn check_exceptions(&mut self) -> bool {
         if let Some(exception) = self.get_pending_exception() {
             self.sleeping = false;
             self.clear_pending_exception(exception);
             let pc = self.get_pc();
-            if let Err(fault) = self.exception_entry(exception, pc) {
-                let active_exception = self.active_exception();
-                self.record_fault_status(fault, crate::core::fault::FaultStatusContext::default());
-                self.set_hfsr_forced();
-                let trap_reason =
-                    if exception == Exception::HardFault || self.is_lockup(Exception::HardFault) {
-                        crate::core::fault::FaultTrapReason::Lockup
-                    } else {
-                        crate::core::fault::FaultTrapReason::Fault
-                    };
-                self.pending_fault_trap = Some(crate::core::fault::FaultContext {
-                    trap_reason,
-                    fault,
-                    exception: Exception::HardFault,
-                    pc,
-                    active_exception,
-                });
+            match self.enter_exception(exception, pc, None, EntrySource::Pending) {
+                Ok(EntryOutcome::Entered) => {}
+                Ok(EntryOutcome::Derived(entry)) => self.queue_derived_traps(&entry, None, pc),
+                Err(fault) => {
+                    // only a failing reset gets here
+                    let active_exception = self.active_exception();
+                    self.record_fault_status(fault, FaultStatusContext::default());
+                    self.set_hfsr_forced();
+                    self.queue_fault_trap(
+                        fault,
+                        Exception::HardFault,
+                        pc,
+                        active_exception,
+                        crate::core::fault::FaultTrapReason::Fault,
+                    );
+                }
             }
-        } else if self.sleeping && self.has_wakeup_condition() {
-            self.sleeping = false;
+            true
+        } else {
+            if self.sleeping && self.has_wakeup_condition() {
+                self.sleeping = false;
+            }
+            false
         }
     }
 }
@@ -957,7 +1167,7 @@ mod tests {
     #[cfg(not(feature = "armv6m"))]
     use crate::core::fault::Fault;
     #[cfg(not(feature = "armv6m"))]
-    use crate::core::fault::FaultTrapReason;
+    use crate::core::fault::{FaultTrapMode, FaultTrapReason};
     #[cfg(not(feature = "armv6m"))]
     use crate::core::instruction::Instruction;
     #[cfg(feature = "has-dsp-ext")]
@@ -1393,6 +1603,7 @@ mod tests {
 
         // Arrange
         processor.reset().unwrap();
+        processor.set_msp(0x2000_0200);
         processor.nvic_write_iser(0, 1);
         processor.nvic_write_ispr(0, 1);
         assert_eq!(processor.nvic_read_ispr(0), 1);
@@ -2364,6 +2575,9 @@ mod tests {
         core.itstate = itstate;
         core.push_stack(99, None).unwrap();
         let xpsr = core.read32(IT_STACK_START - 0x20 + 0x1c).unwrap();
+        // ExceptionTaken() clears the IT state, not PushStack
+        assert_eq!(core.itstate, itstate);
+        core.exception_taken(Exception::SysTick).unwrap();
         (core, xpsr)
     }
 
@@ -2734,25 +2948,461 @@ mod tests {
         assert_eq!(processor.ccr & 1, 0);
     }
 
-    // ITSTATE stacked is consistent with the stacked PC (ReturnAddress(), B1.5.6, p. B1-534): an
-    // SVC whose entry fails while stacking leaves the IT state before the SVC, as its own address
-    // is what the derived fault stacks.
+    // ---- DerivedLateArrival() (B1.5.11, pp. B1-547, B1-548) -----------------------------------
+
+    #[cfg(not(feature = "armv6m"))]
+    fn svc_with_a_failing_stack(msp: u32, itstate: u8) -> Processor {
+        let mut processor = Processor::new();
+        processor.ccr = 0; // STKALIGN clear: the frame is 0x20 below the stack pointer
+        processor.set_msp(msp);
+        processor.set_pc(0x100);
+        processor.itstate = itstate;
+        crate::core::register::Apsr::set_z_bit(&mut processor.psr, true);
+        processor.execute(&decode_16(0xdf00), 2);
+        processor
+    }
+
+    // Probe A: the xPSR write fails (the frame ends at 0x2002_0004). The derived fault is
+    // escalated to HardFault, SVCall stays pending, and there is one frame (the original's), with
+    // the return address of SVCall.
     #[test]
     #[cfg(not(feature = "armv6m"))]
-    fn test_an_svc_whose_stacking_fails_stacks_the_it_state_of_the_svc() {
-        let mut processor = Processor::new();
-        processor.set_msp(0x2002_0010); // the frame straddles the end of SRAM
-        processor.set_pc(0x100);
-        processor.itstate = 0x0c; // ITE EQ
-        crate::core::register::Apsr::set_z_bit(&mut processor.psr, true);
+    fn test_an_svc_whose_stacking_fails_takes_the_derived_fault_on_the_one_frame() {
+        let mut processor = svc_with_a_failing_stack(0x2002_0004, 0x0c);
+        assert_eq!(processor.psr.get_isr_number(), 3);
+        assert!(processor.exception_pending(Exception::SVCall));
+        assert_eq!(processor.get_msp(), 0x2002_0004 - 0x20, "no second frame");
+        assert_eq!(processor.read32(0x2002_0004 - 0x20 + 0x18), Ok(0x102));
+        assert_eq!(processor.itstate, 0, "ExceptionTaken() clears IT");
+        assert_eq!(processor.cfsr & (1 << 4), 1 << 4, "MSTKERR");
+        // the trap reports the faulting instruction, not the return address
+        let trap = processor.take_pending_fault_trap().expect("a trap");
+        assert_eq!(trap.pc, 0x100);
+    }
 
+    // Probe B: the failure is in the FP part of the frame, after the xPSR: the stacked IT state is
+    // the one after the SVC, as ReturnAddress() is (p. B1-534).
+    #[test]
+    #[cfg(feature = "has-fp")]
+    fn test_an_svc_whose_fp_stacking_fails_stacks_the_it_state_after_the_svc() {
+        let mut processor = Processor::new();
+        processor.write32(0xE000_ED88, 0x00F0_0000).unwrap(); // CP10 and CP11
+        processor.write32(0xE000_EF34, 0).unwrap(); // FPCCR: no lazy stacking
+        processor.control.fpca = true;
+        processor.set_msp(0x2002_0048);
+        processor.set_pc(0x100);
+        processor.itstate = 0x0c;
+        crate::core::register::Apsr::set_z_bit(&mut processor.psr, true);
         processor.execute(&decode_16(0xdf00), 2);
 
         assert_eq!(processor.psr.get_isr_number(), 3);
         let frame = processor.get_msp();
-        assert_eq!(processor.read32(frame + 0x18), Ok(0x100));
+        assert_eq!(frame, 0x2002_0048 - 0x68);
+        assert_eq!(processor.read32(frame + 0x18), Ok(0x102));
         let xpsr = processor.read32(frame + 0x1c).unwrap();
-        assert_eq!((xpsr >> 10) & 0x3f, 0x0c >> 2);
-        assert_eq!((xpsr >> 25) & 0x3, 0x0c & 0x3);
+        assert_eq!((xpsr >> 10) & 0x3f, 0x18 >> 2);
+        assert_eq!((xpsr >> 25) & 0x3, 0x18 & 0x3);
+        assert_eq!(processor.itstate, 0);
+    }
+
+    // Probe E: the derived MemManage (priority 0x40) is lower than SVCall (0): SVCall is taken on
+    // the frame, MemManage is left pending.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_derived_fault_of_lower_priority_leaves_it_pending_and_takes_svcall() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor.write32(0xE000_ED24, 1 << 16).unwrap(); // MEMFAULTENA
+        processor.set_exception_priority(Exception::MemoryManagementFault, 0x40);
+        processor.set_exception_priority(Exception::SVCall, 0);
+        processor.set_msp(0x2002_0004);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xdf00), 2);
+
+        assert_eq!(processor.psr.get_isr_number(), 11);
+        assert!(processor.exception_pending(Exception::MemoryManagementFault));
+        assert_eq!(processor.read32(processor.get_msp() + 0x18), Ok(0x102));
+        assert_eq!(processor.get_msp(), 0x2002_0004 - 0x20);
+    }
+
+    // Equal priorities: the original is taken first, the derived one waits (DEpriority is not
+    // lower than OEpriority).
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_derived_fault_of_equal_priority_waits_for_the_original() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor.write32(0xE000_ED24, 1 << 16).unwrap();
+        processor.set_exception_priority(Exception::MemoryManagementFault, 0x20);
+        processor.set_exception_priority(Exception::SVCall, 0x20);
+        processor.set_msp(0x2002_0004);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xdf00), 2);
+        assert_eq!(processor.psr.get_isr_number(), 11);
+        assert!(processor.exception_pending(Exception::MemoryManagementFault));
+    }
+
+    // A derived fault of higher priority than the original is taken, the original stays pending.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_derived_fault_of_higher_priority_is_taken_and_the_original_stays_pending() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor.write32(0xE000_ED24, 1 << 16).unwrap();
+        processor.set_exception_priority(Exception::MemoryManagementFault, 0);
+        processor.set_exception_priority(Exception::SVCall, 0x40);
+        processor.set_msp(0x2002_0004);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xdf00), 2);
+        assert_eq!(processor.psr.get_isr_number(), 4);
+        assert!(processor.exception_pending(Exception::SVCall));
+        assert!(!processor.exception_pending(Exception::MemoryManagementFault));
+    }
+
+    // A stacking failure on the entry of an NMI while the HardFault handler runs (priority -1) is a
+    // lockup (B1.5.15, p. B1-556): the core stops and no second frame is pushed.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_stacking_failure_on_nmi_entry_in_hardfault_is_a_lockup() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        set_active_exception(&mut processor, Exception::HardFault);
+        processor.set_msp(0x2002_0004);
+        processor.execution_priority = processor.get_execution_priority();
+        processor.exception_entry(Exception::NMI, 0x100).unwrap();
+        assert!(!processor.running);
+        let trap = processor.take_pending_fault_trap().expect("a trap");
+        assert_eq!(trap.trap_reason, FaultTrapReason::Lockup);
+        assert_eq!(processor.get_msp(), 0x2002_0004 - 0x20);
+    }
+
+    // Repeated failed entries do not walk the stack down: the derived HardFault is taken once and
+    // nothing of lower priority is taken in it.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_repeated_checks_with_a_failing_stack_take_the_derived_fault_once() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor.set_msp(0x2002_0004);
+        processor.execution_priority = processor.get_execution_priority();
+        processor.set_exception_pending(Exception::SysTick);
+        assert!(processor.check_exceptions());
+        assert_eq!(processor.psr.get_isr_number(), 3);
+        let msp = processor.get_msp();
+        assert!(processor.running);
+        assert!(
+            !processor.check_exceptions(),
+            "SysTick waits behind HardFault"
+        );
+        assert_eq!(processor.get_msp(), msp);
+        assert!(processor.exception_pending(Exception::SysTick));
+    }
+
+    // A BKPT that takes the DebugMonitor directly, and whose stacking fails, takes the derived
+    // fault; the BKPT itself runs again, so the monitor is only left pending if MON_PEND pended it.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_bkpt_whose_debug_monitor_stacking_fails_takes_the_derived_fault() {
+        for mon_pend in [false, true] {
+            let mut processor = Processor::new();
+            processor.ccr = 0;
+            processor.set_msp(0x2002_0004);
+            processor.set_pc(0x100);
+            processor.execution_priority = processor.get_execution_priority();
+            let demcr = (1 << 16) | if mon_pend { 1 << 17 } else { 0 };
+            processor.write32(0xE000_EDFC, demcr).unwrap();
+            processor.execute(&decode_16(0xbe00), 2);
+            assert_eq!(processor.psr.get_isr_number(), 3);
+            assert_eq!(
+                processor.exception_pending(Exception::DebugMonitor),
+                mon_pend
+            );
+        }
+    }
+
+    // An interrupt-type entry that fails while stacking stays pending, and MON_PEND with it.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_debug_monitor_whose_stacking_fails_stays_pending() {
+        let mut processor = Processor::new();
+        processor.set_msp(0x2002_0010);
+        processor.execution_priority = processor.get_execution_priority();
+        processor.write32(0xE000_EDFC, 1 << 17).unwrap();
+        processor.check_exceptions();
+        assert!(processor.exception_pending(Exception::DebugMonitor));
+        assert_eq!(processor.demcr & (1 << 17), 1 << 17);
+    }
+
+    // The pending state of the DebugMonitor is the table's, not the bit in DEMCR: a write that
+    // sets MON_PEND pends it when it is not pending, whatever the stored bit says.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_mon_pend_write_pends_when_nothing_is_pending() {
+        let mut processor = Processor::new();
+        processor.demcr = 1 << 17; // stored, but nothing pending
+        processor.write32(0xE000_EDFC, 1 << 17).unwrap();
+        assert!(processor.exception_pending(Exception::DebugMonitor));
+    }
+
+    // A pended DebugMonitor that a BKPT takes directly is not pending any more: it runs once.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_bkpt_taking_a_pended_debug_monitor_clears_the_pending_state() {
+        let mut processor = Processor::new();
+        processor.set_msp(0x2000_0200);
+        processor.set_pc(0x100);
+        processor.execution_priority = processor.get_execution_priority();
+        processor
+            .write32(0xE000_EDFC, (1 << 16) | (1 << 17))
+            .unwrap();
+        processor.execute(&decode_16(0xbe00), 2);
+        assert_eq!(processor.psr.get_isr_number(), 12);
+        assert!(!processor.exception_pending(Exception::DebugMonitor));
+        assert_eq!(processor.demcr & (1 << 17), 0);
+    }
+
+    // An interrupt whose entry fails while stacking stays pending, in the NVIC too.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_an_interrupt_whose_stacking_fails_stays_pending() {
+        let mut processor = Processor::new();
+        processor.set_msp(0x2002_0010);
+        processor.execution_priority = processor.get_execution_priority();
+        processor.write32(0xE000_E100, 1).unwrap(); // ISER0: enable interrupt 0
+        processor.write32(0xE000_E200, 1).unwrap(); // ISPR0: pend interrupt 0
+        processor.check_exceptions();
+        assert!(processor.exception_pending(Exception::Interrupt { n: 0 }));
+        assert_eq!(processor.read32(0xE000_E200), Ok(1));
+    }
+
+    // A refused return whose frame cannot be stacked still gives the handler the refused EXC_RETURN.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_failed_stacking_of_a_refused_return_keeps_the_refused_lr() {
+        let mut processor = Processor::new();
+        processor.set_msp(0x2002_0004);
+        processor.ccr = 0;
+        let refused = RefusedReturn {
+            pushes_frame: true,
+            frame_lr: 0x1234,
+            handler_lr: 0xffff_fff0,
+            frame_xpsr: None,
+        };
+        processor
+            .enter_exception(
+                Exception::UsageFault,
+                0x100,
+                Some(refused),
+                EntrySource::Synchronous,
+            )
+            .unwrap();
+        assert_eq!(processor.get_r(Reg::LR), 0xffff_fff0);
+    }
+
+    // ---- derived exceptions, round three ----------------------------------------------------
+
+    // A failed SVC entry must leave nothing behind that hides the trap of a later, unrelated
+    // fault: MemManage is the derived fault, taken; the handler fixes SP; a UDF then escalates to
+    // HardFault, and that HardFault has its trap.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_failed_svc_entry_does_not_hide_the_trap_of_the_next_fault() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor.write32(0xE000_ED24, 1 << 16).unwrap(); // MEMFAULTENA
+        processor.set_exception_priority(Exception::MemoryManagementFault, 0);
+        processor.set_exception_priority(Exception::SVCall, 0x40);
+        processor.set_msp(0x2002_0004);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xdf00), 2);
+        assert_eq!(processor.psr.get_isr_number(), 4);
+        let _ = processor.take_pending_fault_trap();
+
+        processor.set_msp(0x2000_0200);
+        processor.set_pc(0x200);
+        processor.execute(&decode_16(0xde00), 2); // udf: UsageFault is disabled, HardFault
+        assert_eq!(processor.psr.get_isr_number(), 3);
+        let trap = processor
+            .take_pending_fault_trap()
+            .expect("a HardFault trap");
+        assert_eq!(trap.exception, Exception::HardFault);
+        assert_eq!(trap.pc, 0x200);
+    }
+
+    // The same through a BKPT that enters the DebugMonitor.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_failed_bkpt_entry_does_not_hide_the_trap_of_the_next_fault() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor.write32(0xE000_ED24, 1 << 16).unwrap();
+        processor.write32(0xE000_EDFC, 1 << 16).unwrap(); // MON_EN
+        processor.set_exception_priority(Exception::MemoryManagementFault, 0);
+        processor.set_exception_priority(Exception::DebugMonitor, 0x40);
+        processor.execution_priority = processor.get_execution_priority();
+        processor.set_msp(0x2002_0004);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xbe00), 2);
+        assert_eq!(processor.psr.get_isr_number(), 4);
+        let _ = processor.take_pending_fault_trap();
+
+        processor.set_msp(0x2000_0200);
+        processor.set_pc(0x200);
+        processor.execute(&decode_16(0xde00), 2);
+        assert!(processor.take_pending_fault_trap().is_some());
+    }
+
+    // The trap is for the exception that was taken: a UDF with UsageFault disabled is a HardFault;
+    // its stacking fails, the derived MemManage is pended and the HardFault is taken, with a trap.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_the_trap_is_for_the_exception_taken_when_the_derived_one_is_pended() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor.write32(0xE000_ED24, 1 << 16).unwrap();
+        processor.set_exception_priority(Exception::MemoryManagementFault, 0);
+        processor.set_msp(0x2002_0004);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xde00), 2);
+        assert_eq!(processor.psr.get_isr_number(), 3);
+        let trap = processor
+            .take_pending_fault_trap()
+            .expect("a HardFault trap");
+        assert_eq!(trap.exception, Exception::HardFault);
+        assert_eq!(trap.pc, 0x100);
+    }
+
+    // DerivedLateArrival() compares group priorities (B1-548): with PRIGROUP 5 priorities 0x20 and
+    // 0x30 are in one group, so the original is taken and the derived fault waits.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_derived_and_original_in_one_priority_group_take_the_original_first() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor
+            .write32(0xE000_ED0C, 0x05FA_0000 | (5 << 8))
+            .unwrap();
+        processor.write32(0xE000_ED24, 1 << 16).unwrap();
+        processor.set_exception_priority(Exception::MemoryManagementFault, 0x20);
+        processor.set_exception_priority(Exception::SVCall, 0x30);
+        processor.set_msp(0x2002_0004);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xdf00), 2);
+        assert_eq!(processor.psr.get_isr_number(), 11);
+        assert!(processor.exception_pending(Exception::MemoryManagementFault));
+    }
+
+    // A fault that was pended (SHCSR.USGFAULTPENDED) and selected is not lost when its entry
+    // fails and the derived MemManage (MSTKERR) is taken first.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_pended_fault_whose_entry_fails_stays_pended() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor
+            .write32(0xE000_ED24, (1 << 18) | (1 << 16) | (1 << 12))
+            .unwrap();
+        processor.set_exception_priority(Exception::MemoryManagementFault, 0);
+        processor.set_exception_priority(Exception::UsageFault, 0x40);
+        processor.set_msp(0x2002_0004);
+        processor.execution_priority = processor.get_execution_priority();
+        assert!(processor.check_exceptions());
+        assert_eq!(processor.psr.get_isr_number(), 4);
+        assert!(processor.exception_pending(Exception::UsageFault));
+    }
+
+    // A vector read error is a derived HardFault on the same frame (B1-547), and a lockup for NMI
+    // and HardFault (B1-556): the table ends at 0x2002_0000 here, so the vector of SysTick, 15, is
+    // past it and the vector of HardFault, 3, is not.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_an_unreadable_vector_is_a_derived_hardfault_on_the_same_frame() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor.vtor = 0x2001_FFE0;
+        processor.set_msp(0x2000_0200);
+        processor.execution_priority = processor.get_execution_priority();
+        processor.set_exception_pending(Exception::SysTick);
+        assert!(processor.check_exceptions());
+        assert_eq!(processor.psr.get_isr_number(), 3);
+        assert_eq!(processor.get_msp(), 0x2000_0200 - 0x20, "one frame");
+        assert_eq!(processor.hfsr & (1 << 1), 1 << 1, "VECTTBL");
+        assert!(processor.exception_pending(Exception::SysTick));
+        assert!(processor.running);
+    }
+
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_an_unreadable_vector_on_the_svc_path_pushes_one_frame() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor.vtor = 0x2001_FFE0; // vector 11 at 0x2002_000C: unreadable, 3 at 0x2001_FFEC
+        processor.set_msp(0x2000_0200);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xdf00), 2);
+        assert_eq!(processor.psr.get_isr_number(), 3);
+        assert_eq!(processor.get_msp(), 0x2000_0200 - 0x20, "one frame");
+        assert!(processor.exception_pending(Exception::SVCall));
+        assert_eq!(processor.read32(0x2000_0200 - 0x20 + 0x18), Ok(0x102));
+    }
+
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_an_unreadable_vector_for_nmi_or_hardfault_is_a_lockup() {
+        for (exception, vtor) in [
+            (Exception::NMI, 0x2001_FFFC_u32),
+            (Exception::HardFault, 0x2001_FFF8),
+        ] {
+            let mut processor = Processor::new();
+            processor.ccr = 0;
+            processor.vtor = vtor;
+            processor.set_msp(0x2000_0200);
+            processor.exception_entry(exception, 0x100).unwrap();
+            assert!(!processor.running, "{exception:?}");
+            assert_eq!(processor.get_msp(), 0x2000_0200 - 0x20, "one frame");
+            let trap = processor.take_pending_fault_trap().expect("a trap");
+            assert_eq!(trap.trap_reason, FaultTrapReason::Lockup);
+        }
+    }
+
+    // The trap of the derived exception, by the trap mode, when the original is the one taken: the
+    // SVC fails stacking, MemManage (lower priority) is pended, SVCall is taken, and the mode that
+    // traps MemManage only gets that trap.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_the_derived_exception_is_trapped_by_the_mode_when_the_original_is_taken() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        let mut mode = FaultTrapMode::none();
+        mode.set_trap(Exception::MemoryManagementFault, true);
+        processor.fault_trap_mode(mode);
+        processor.write32(0xE000_ED24, 1 << 16).unwrap();
+        processor.set_exception_priority(Exception::MemoryManagementFault, 0x40);
+        processor.set_exception_priority(Exception::SVCall, 0);
+        processor.set_msp(0x2002_0004);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xdf00), 2);
+        assert_eq!(processor.psr.get_isr_number(), 11);
+        let trap = processor
+            .take_pending_fault_trap()
+            .expect("a MemManage trap");
+        assert_eq!(trap.exception, Exception::MemoryManagementFault);
+        assert_eq!(trap.pc, 0x100);
+    }
+
+    // An SVC escalated to HardFault stacks the return address of SVCall, but its trap reports the
+    // instruction, also when the stacking fails.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_the_trap_of_an_escalated_svc_with_a_failing_stack_reports_the_svc() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor.primask = true;
+        processor.set_msp(0x2002_0004);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xdf00), 2);
+        let trap = processor.take_pending_fault_trap().expect("a trap");
+        assert_eq!(trap.pc, 0x100);
+        assert_eq!(processor.read32(processor.get_msp() + 0x18), Ok(0x102));
     }
 }

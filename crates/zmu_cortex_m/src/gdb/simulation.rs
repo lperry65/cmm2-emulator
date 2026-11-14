@@ -5,12 +5,16 @@
 use crate::DeviceBus;
 use crate::MemoryMapConfig;
 use crate::Processor;
+use crate::core::exception::ExceptionHandling;
 use crate::core::fault::{FaultContext, FaultTrapMode};
 use crate::core::register::BaseReg;
 use crate::core::reset::Reset;
 use crate::executor::Executor;
 use crate::semihosting::SemihostingCommand;
 use crate::semihosting::SemihostingResponse;
+
+/// Cycles of an exception entry, as `handle_fault` counts them.
+const EXCEPTION_ENTRY_CYCLES: u32 = 12;
 
 ///
 /// Cortex System simulation framework
@@ -24,6 +28,8 @@ pub struct Simulation {
     pub watchpoints: Vec<u32>,
     /// Breakpoints
     pub breakpoints: Vec<u32>,
+    /// The last step halted on a BKPT: the next one starts by taking a pending exception.
+    after_halt: bool,
 }
 
 ///
@@ -95,6 +101,7 @@ impl Simulation {
             exec_mode: SimulationExecMode::Step,
             watchpoints: Vec::new(),
             breakpoints: Vec::new(),
+            after_halt: false,
         })
     }
 
@@ -106,6 +113,7 @@ impl Simulation {
             exec_mode: SimulationExecMode::Step,
             watchpoints: Vec::new(),
             breakpoints: Vec::new(),
+            after_halt: false,
         }
     }
 
@@ -177,23 +185,38 @@ impl Simulation {
     /// Single step the simulation
     ///
     pub fn step(&mut self) -> SimulationEvent {
-        if self.processor.running {
+        // Halting debug stepping (C1.5, p. C1-695): leaving Debug state takes a pending exception
+        // of sufficient priority instead of executing the next instruction
+        let mut entered = false;
+        if std::mem::take(&mut self.after_halt) {
+            // an exception that was selected counts, whether its entry worked or failed: only one
+            // exception entry is taken in a step
+            entered = self.processor.check_exceptions();
+        }
+        if entered {
+            // what an exception entry takes (`handle_fault` counts the same)
+            self.processor.account_cycles(EXCEPTION_ENTRY_CYCLES);
+        } else if self.processor.running {
             self.processor.step();
         } else if self.processor.sleeping {
             self.processor.step_sleep();
         }
         // a BKPT in the guest halts into the debugger; the halt is consumed here
         let halted = std::mem::take(&mut self.processor.debug_halt);
+        self.after_halt = halted;
         if let Some(context) = self.processor.take_pending_fault_trap() {
             return SimulationEvent::FaultTrap(context);
         }
         if halted {
             return SimulationEvent::Break;
         }
+        // whenever the core is reported to the debugger it leaves Debug state at the next step
         if self.breakpoints.contains(&self.processor.get_pc()) {
+            self.after_halt = true;
             return SimulationEvent::Break;
         }
         if self.watchpoints.contains(&self.processor.get_pc()) {
+            self.after_halt = true;
             return SimulationEvent::WatchRead(self.processor.get_pc());
         }
         if !self.processor.running && !self.processor.sleeping {
@@ -217,7 +240,8 @@ pub enum SimulationRunEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::exception::ExceptionHandling;
+    use crate::bus::Bus;
+    use crate::core::exception::Exception;
     use crate::core::register::Ipsr;
 
     // vector table (SP, reset), then `bkpt #0`, `nop`, `bkpt #0xab`
@@ -291,5 +315,93 @@ mod tests {
             });
         assert!(matches!(simulation.step(), SimulationEvent::FaultTrap(_)));
         assert!(!simulation.processor.debug_halt);
+    }
+
+    // vector table with PendSV, then `bkpt`, `cpsid i`, `nop` at 0x40 and the handler at 0x4c
+    fn simulation_with_a_pendsv_handler() -> Simulation {
+        let mut code = vec![0_u8; 0x50];
+        code[0..4].copy_from_slice(&0x2000_0100_u32.to_le_bytes());
+        code[4..8].copy_from_slice(&0x0000_0041_u32.to_le_bytes());
+        code[0x38..0x3c].copy_from_slice(&0x0000_004d_u32.to_le_bytes());
+        code[0x0c..0x10].copy_from_slice(&0x0000_004d_u32.to_le_bytes());
+        code[0x40..0x46].copy_from_slice(&[0x00, 0xbe, 0x72, 0xb6, 0x00, 0xbf]);
+        code[0x4c..0x4e].copy_from_slice(&[0x00, 0xbf]);
+        let mut processor = Processor::new();
+        processor.flash_memory(code.len(), &code);
+        processor.cache_instructions();
+        processor.running = true;
+        processor.reset().unwrap();
+        processor.execution_priority = processor.get_execution_priority();
+        Simulation::from_processor(processor)
+    }
+
+    // C1.5 Halting debug stepping (p. C1-695): a step out of Debug state takes a pending exception
+    // of sufficient priority instead of executing the next instruction: with PendSV pending, the
+    // step after `set $pc` takes it before `cpsid i` runs.
+    #[test]
+    fn test_a_step_after_a_halt_takes_a_pending_exception_before_the_next_instruction() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        assert!(matches!(simulation.step(), SimulationEvent::Break));
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        simulation.processor.set_pc(0x42); // the cpsid i
+        assert!(matches!(simulation.step(), SimulationEvent::DoneStep));
+        assert_eq!(simulation.processor.psr.get_isr_number(), 14);
+        assert_eq!(simulation.processor.get_pc(), 0x4c);
+        assert!(!simulation.processor.primask, "cpsid i has not run");
+    }
+
+    // and a continue with the PC still on the BKPT takes the exception, and does not halt again
+    #[test]
+    fn test_a_continue_from_a_halt_takes_a_pending_exception_and_does_not_halt_again() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        assert!(matches!(simulation.step(), SimulationEvent::Break));
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        assert!(matches!(simulation.step(), SimulationEvent::DoneStep));
+        assert_eq!(simulation.processor.psr.get_isr_number(), 14);
+        assert_eq!(simulation.processor.get_pc(), 0x4c);
+    }
+
+    // An exception entry that fails while stacking is still the one exception entry of the step:
+    // the derived HardFault is taken and the next instruction does not run in the same step.
+    #[test]
+    fn test_a_failed_entry_after_a_halt_does_not_run_the_next_instruction() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        assert!(matches!(simulation.step(), SimulationEvent::Break));
+        simulation.processor.ccr = 0; // STKALIGN clear: the xPSR word is past the end of SRAM
+        simulation.processor.set_msp(0x2002_0004);
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        simulation.processor.set_pc(0x42); // the cpsid i
+        assert!(matches!(simulation.step(), SimulationEvent::FaultTrap(_)));
+        assert_eq!(simulation.processor.psr.get_isr_number(), 3);
+        assert_eq!(simulation.processor.get_pc(), 0x4c);
+        assert!(!simulation.processor.primask, "cpsid i has not run");
+        assert!(simulation.processor.exception_pending(Exception::PendSV));
+    }
+
+    // C1-695 applies whenever the core leaves Debug state, after a breakpoint from the debugger's
+    // list too: the step takes the pending exception before the next instruction, and it costs
+    // what an exception entry costs (12 cycles).
+    #[test]
+    fn test_a_step_after_a_listed_breakpoint_takes_a_pending_exception_first() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.set_pc(0x44); // the nop
+        simulation.breakpoints.push(0x46);
+        assert!(matches!(simulation.step(), SimulationEvent::Break));
+        assert_eq!(simulation.processor.get_pc(), 0x46);
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        let cycles = simulation.processor.cycle_count;
+        assert!(matches!(simulation.step(), SimulationEvent::DoneStep));
+        assert_eq!(simulation.processor.psr.get_isr_number(), 14);
+        let frame = simulation.processor.get_msp();
+        assert_eq!(simulation.processor.read32(frame + 0x18), Ok(0x46));
+        assert_eq!(simulation.processor.cycle_count, cycles + 12);
     }
 }

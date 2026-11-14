@@ -31,9 +31,7 @@ impl IsaException for Processor {
             // SVCall has to be able to preempt what runs (PRIMASK, BASEPRI and FAULTMASK count);
             // if it cannot, the SVC is a forced HardFault, which is a lockup below priority 0.
             // The IT state stacked is the one after the SVC, like the return address
-            // (ReturnAddress(), B1.5.6, p. B1-534). If the entry fails while stacking, the
-            // derived fault stacks the SVC's own address, so the IT state goes back.
-            let it_before = self.itstate;
+            // (ReturnAddress(), B1.5.6, p. B1-534).
             self.it_advance();
             if self.get_exception_priority(Exception::SVCall) >= self.get_execution_priority() {
                 // an escalated fault keeps the return address of the original: for SVCall it is
@@ -46,7 +44,12 @@ impl IsaException for Processor {
             }
             let return_address = self.get_pc().wrapping_add(2);
             if let Err(fault) = self.exception_entry(Exception::SVCall, return_address) {
-                self.itstate = it_before;
+                // only a vector read error gets here (a failed stacking is handled by
+                // DerivedLateArrival() in the entry): the return address stays SVCall's
+                self.pending_fault_status = Some(FaultStatusContext {
+                    return_address: Some(return_address),
+                    ..FaultStatusContext::default()
+                });
                 return Err(fault);
             }
             return Ok(ExecuteSuccess::Branched { cycles: 12 });
