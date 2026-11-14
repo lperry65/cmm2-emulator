@@ -243,7 +243,7 @@ mod tests {
     use super::*;
     use crate::bus::Bus;
     use crate::core::exception::Exception;
-    use crate::core::register::Ipsr;
+    use crate::core::register::{Ipsr, Reg};
 
     // vector table (SP, reset), then `bkpt #0`, `nop`, `bkpt #0xab`
     fn simulation_with_a_bkpt() -> Simulation {
@@ -436,7 +436,8 @@ mod tests {
         let cycles = simulation.processor.cycle_count;
         simulation.step();
         assert_eq!(simulation.processor.psr.get_isr_number(), 14);
-        assert_eq!(simulation.processor.cycle_count, cycles + 12);
+        // the cycle of the sleeping step, and the entry
+        assert_eq!(simulation.processor.cycle_count, cycles + 1 + 12);
     }
 
     // The cycles of the step that returns from PendSV (`bx lr`), with and without SysTick pending
@@ -539,13 +540,12 @@ mod tests {
     }
 
     // A pending Reset whose vectors cannot be read is a lockup at priority -1 with the lockup
-    // address 0xFFFFFFFE (B1-556), with VECTTBL and without FORCED, and no entry. (Our `reset()`
-    // keeps VTOR, where TakeReset's ResetSCSRegs would clear it: the embedder sets VTOR before the
-    // first reset to boot from the flash base, so VTOR is kept.)
+    // address 0xFFFFFFFE (B1-556), with VECTTBL and without FORCED, and no entry. `reset()` loads
+    // VTOR from the boot address (ResetSCSRegs resets it, INITVTOR on the Cortex-M7).
     #[test]
     fn test_a_failed_reset_is_a_lockup_at_the_lockup_address() {
         let mut simulation = simulation_with_a_pendsv_handler();
-        simulation.processor.vtor = 0x1fff_ff80;
+        simulation.processor.boot_address = 0x1fff_ff80; // reset loads it into VTOR
         simulation.processor.set_pc(0x44);
         simulation.processor.set_exception_pending(Exception::Reset);
         let cycles = simulation.processor.cycle_count;
@@ -632,7 +632,8 @@ mod tests {
         let cycles = simulation.processor.cycle_count;
         simulation.step();
         assert!(simulation.processor.is_locked_up());
-        assert_eq!(simulation.processor.cycle_count, cycles + 1);
+        // the cycle of the sleeping step, and one for the lockup
+        assert_eq!(simulation.processor.cycle_count, cycles + 1 + 1);
     }
 
     // A lockup on the entry that starts the step after a halt counts one.
@@ -656,7 +657,7 @@ mod tests {
     fn test_a_lockup_after_a_halt_is_left_by_an_nmi_through_the_lockup_step() {
         let mut simulation = simulation_with_a_pendsv_handler();
         assert!(matches!(simulation.step(), SimulationEvent::Break));
-        simulation.processor.lock_up();
+        simulation.processor.lock_up(-1);
         simulation.processor.set_exception_pending(Exception::NMI);
         simulation.step();
         assert!(!simulation.processor.is_locked_up());
@@ -672,7 +673,156 @@ mod tests {
         processor.running = false; // as after a semihosting exit
         assert_eq!(processor.entry_cycles(false), 12);
         assert_eq!(processor.entry_cycles(true), 6);
-        processor.lock_up();
+        processor.lock_up(-1);
         assert_eq!(processor.entry_cycles(false), 1);
+    }
+
+    // A sleeping core counts the cycles it sleeps through in the cycle counter, as in DWT and
+    // SysTick (see NOTICE.md).
+    #[test]
+    fn test_a_sleeping_step_counts_its_cycle() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.sleeping = true;
+        let cycles = simulation.processor.cycle_count;
+        simulation.step();
+        assert_eq!(simulation.processor.cycle_count, cycles + 1);
+    }
+
+    // ---- lockup priorities, addresses and resets (B1.5.15, B1-555 to B1-558) ----------------
+
+    // An NMI whose vector cannot be read locks up at priority -2 whatever the running priority
+    // (B1-556), so the NMI that is pended again is not retried and traps once.
+    #[test]
+    fn test_an_nmi_vector_read_error_locks_up_at_minus_two() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.vtor = 0x1fff_ff80;
+        simulation.processor.set_pc(0x44);
+        simulation.processor.set_exception_pending(Exception::NMI);
+        assert!(matches!(simulation.step(), SimulationEvent::FaultTrap(_)));
+        assert!(simulation.processor.is_locked_up());
+        assert_eq!(simulation.processor.execution_priority, -2);
+        for _ in 0..3 {
+            assert!(
+                matches!(simulation.step(), SimulationEvent::DoneStep),
+                "the NMI is not retried"
+            );
+            assert!(simulation.processor.is_locked_up());
+        }
+    }
+
+    // The same with the guard: an NMI pended behind an SVC that locks up is retried once, in the
+    // locked step, and not in the step that found the lockup.
+    #[test]
+    fn test_an_nmi_pended_behind_a_lockup_is_tried_once_in_the_locked_step() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.vtor = 0x1fff_ff80;
+        simulation.processor.set_pc(0x46); // svc
+        simulation.processor.set_exception_pending(Exception::NMI);
+        let cycles = simulation.processor.cycle_count;
+        assert!(matches!(simulation.step(), SimulationEvent::FaultTrap(_)));
+        assert_eq!(simulation.processor.cycle_count, cycles + 1);
+        // the NMI is tried, and its vector fails: a second lockup, at -2, and one more trap
+        assert!(matches!(simulation.step(), SimulationEvent::FaultTrap(_)));
+        for _ in 0..3 {
+            assert!(matches!(simulation.step(), SimulationEvent::DoneStep));
+        }
+    }
+
+    // INVPC on an NMI return to an execution priority of -1 locks up at -2 and at 0xFFFFFFFE
+    // (B1-558): the NMI that is pended is not taken on top of the active one.
+    #[test]
+    fn test_invpc_on_an_nmi_return_locks_up_at_minus_two_at_the_lockup_address() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation
+            .processor
+            .test_set_active_exception(Exception::HardFault);
+        simulation
+            .processor
+            .test_set_active_exception(Exception::NMI);
+        simulation.processor.execution_priority = simulation.processor.get_execution_priority();
+        simulation.processor.set_r(Reg::LR, 0xffff_fff9);
+        simulation.processor.set_pc(0x4c); // bx lr
+        simulation.processor.set_exception_pending(Exception::NMI);
+        assert!(matches!(simulation.step(), SimulationEvent::FaultTrap(_)));
+        assert!(simulation.processor.is_locked_up());
+        assert_eq!(simulation.processor.execution_priority, -2);
+        assert_eq!(simulation.processor.get_pc(), 0xffff_fffe);
+        assert!(matches!(simulation.step(), SimulationEvent::DoneStep));
+        assert!(simulation.processor.is_locked_up());
+        assert_eq!(simulation.processor.psr.get_isr_number(), 2);
+    }
+
+    // An unstacking fault on a return from NMI to the HardFault handler locks up at -1 and at
+    // 0xFFFFFFFE (B1-557), where the `bx lr` was.
+    #[test]
+    fn test_an_unstacking_fault_on_an_nmi_return_locks_up_at_the_lockup_address() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation
+            .processor
+            .test_set_active_exception(Exception::HardFault);
+        simulation
+            .processor
+            .test_set_active_exception(Exception::NMI);
+        simulation.processor.execution_priority = simulation.processor.get_execution_priority();
+        simulation.processor.set_msp(0x1fff_ff00); // unmapped
+        simulation.processor.set_r(Reg::LR, 0xffff_fff1);
+        simulation.processor.set_pc(0x4c);
+        assert!(matches!(simulation.step(), SimulationEvent::FaultTrap(_)));
+        assert!(simulation.processor.is_locked_up());
+        assert_eq!(simulation.processor.execution_priority, -1);
+        assert_eq!(simulation.processor.get_pc(), 0xffff_fffe);
+    }
+
+    // A reset recovers a locked core completely: the next step runs instructions again.
+    #[test]
+    fn test_a_reset_recovers_a_locked_core() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation
+            .processor
+            .test_set_active_exception(Exception::HardFault);
+        simulation.processor.execution_priority = simulation.processor.get_execution_priority();
+        simulation.processor.set_pc(0x48); // udf in the HardFault handler
+        assert!(matches!(simulation.step(), SimulationEvent::FaultTrap(_)));
+        assert!(simulation.processor.is_locked_up());
+        simulation.reset().unwrap();
+        assert!(!simulation.processor.is_locked_up());
+        assert!(simulation.processor.running);
+        assert!(
+            matches!(simulation.step(), SimulationEvent::Break),
+            "the bkpt at the reset vector"
+        );
+    }
+
+    // The core can be stepped out of a lockup at -1 by an NMI, and `lockup_can_end` says so; one
+    // at -2 cannot.
+    #[test]
+    fn test_only_a_lockup_below_minus_two_cannot_be_ended_by_an_nmi() {
+        let mut processor = Processor::new();
+        processor.lock_up(-1);
+        assert!(!processor.lockup_can_end());
+        processor.set_exception_pending(Exception::NMI);
+        assert!(processor.lockup_can_end());
+        let mut processor = Processor::new();
+        processor.lock_up(-2);
+        processor.set_exception_pending(Exception::NMI);
+        assert!(!processor.lockup_can_end());
+    }
+
+    // The same through the GDB simulation's reset.
+    #[test]
+    fn test_a_failed_simulation_reset_leaves_the_core_locked_up() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation
+            .processor
+            .test_set_active_exception(Exception::HardFault);
+        simulation.processor.execution_priority = simulation.processor.get_execution_priority();
+        simulation.processor.set_pc(0x48); // udf in the HardFault handler
+        simulation.step();
+        assert!(simulation.processor.is_locked_up());
+        simulation.processor.boot_address = 0x1fff_ff80;
+        assert!(simulation.reset().is_err());
+        assert!(simulation.processor.is_locked_up());
+        assert!(!simulation.processor.running);
+        assert_eq!(simulation.processor.get_pc(), 0xffff_fffe);
     }
 }

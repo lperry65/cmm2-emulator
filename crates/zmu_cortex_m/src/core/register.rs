@@ -145,7 +145,9 @@ impl BaseReg for Processor {
     #[inline(always)]
     fn bx_write_pc(&mut self, address: u32) -> Result<(), Fault> {
         if self.mode == ProcessorMode::HandlerMode && (address.get_bits(28..32) == 0b1111) {
-            self.exception_return(address.get_bits(0..28))
+            let result = self.exception_return(address.get_bits(0..28));
+            self.exception_return_faulted = result.is_err();
+            result
         } else {
             self.blx_write_pc(address);
             Ok(())

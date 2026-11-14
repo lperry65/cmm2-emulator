@@ -178,7 +178,8 @@ impl Bus for Bridge {
 
 /// Starts the core from the vector table at the start of flash.
 fn boot(processor: &mut Processor) -> Result<(), CpuError> {
-    processor.vtor = FLASH_BASE;
+    // Every reset, the guest's included, loads VTOR from the boot address.
+    processor.boot_address = FLASH_BASE;
     processor
         .reset()
         .map_err(|fault| CpuError::Reset(fault.to_string()))?;
@@ -306,8 +307,10 @@ impl Cpu {
         let limit = self.instruction_count().saturating_add(max_instructions);
         while self.instruction_count() < limit {
             let pc = self.pc();
-            // A locked-up core executes nothing, so the count would never reach the limit.
-            if self.is_locked_up() {
+            // A locked-up core executes nothing, so the count would never reach the limit. An
+            // exception that can preempt the lockup (an NMI at a lockup of priority -1, or a
+            // reset) is stepped, which takes it; nothing in the machine pends one today.
+            if self.is_locked_up() && !self.processor.lockup_can_end() {
                 return Stop::Fault(Fault {
                     pc,
                     description: format!("core locked up (B1.5.15), fetching {pc:#010x}"),
@@ -336,7 +339,8 @@ impl Cpu {
     }
 
     /// Whether the core is locked up (B1.5.15): it executes nothing, and a run stops at once with
-    /// a fault. Only a reset leaves it (an NMI too, if the core is stepped).
+    /// a fault. A reset leaves it, and so does an NMI pended at a lockup of priority -1, which a
+    /// run steps in.
     pub fn is_locked_up(&self) -> bool {
         self.processor.is_locked_up()
     }

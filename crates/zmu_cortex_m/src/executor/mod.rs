@@ -10,7 +10,7 @@ use crate::core::fetch::Fetch;
 use crate::core::instruction::{Imm32Carry, Instruction, SetFlags, instruction_size};
 
 use crate::core::operation::condition_test;
-use crate::core::register::{Apsr, BaseReg};
+use crate::core::register::{Apsr, BaseReg, Ipsr};
 use crate::decoder::Decoder;
 use crate::memory::map::MapMemory;
 use crate::peripheral::{dwt::Dwt, systick::SysTick};
@@ -186,13 +186,20 @@ fn conditional_setflags(setflags: SetFlags, in_it_block: bool) -> bool {
 
 impl Processor {
     /// Lock the core up (B1.5.15): it stops executing and keeps fetching the lockup address, at the
-    /// priority of the lockup (at least -1). Only an NMI (from a `HardFault` lockup) or a reset
-    /// leaves it (B1-555, `step_locked_up`).
-    pub(crate) fn lock_up(&mut self) {
+    /// priority of the lockup. What can leave it is what can preempt that priority: an NMI (-2)
+    /// from a lockup at -1 (B1-555 names the `HardFault` handler; FAULTMASK and the reset handler
+    /// are at -1 too), a reset (-3) from either, and nothing from a lockup at -2 (`step_locked_up`).
+    pub(crate) fn lock_up(&mut self, priority: i16) {
         self.locked_up = true;
         self.running = false;
         self.sleeping = false;
-        self.execution_priority = self.execution_priority.min(-1);
+        self.execution_priority = priority;
+    }
+
+    /// Whether a locked-up core can leave the lockup now: an exception can preempt it (an NMI at a
+    /// lockup of priority -1, or a pending reset), which a step takes.
+    pub fn lockup_can_end(&self) -> bool {
+        self.locked_up && self.get_pending_exception().is_some()
     }
 
     /// One step of a locked-up core: nothing executes. An exception that can preempt the lockup
@@ -292,6 +299,9 @@ impl Processor {
 
         self.record_fault_status(fault, status);
 
+        // a failing exception return left this flag, for the lockup address
+        let from_return = std::mem::take(&mut self.exception_return_faulted);
+
         if self.is_lockup(exception) {
             self.queue_fault_trap(
                 fault,
@@ -300,7 +310,30 @@ impl Processor {
                 active_exception,
                 FaultTrapReason::Lockup,
             );
-            self.lock_up();
+            // INVPC on a return from the NMI handler to an execution priority of -1 locks up at -2
+            // (B1-558); the others at the priority the core runs at
+            let priority = if fault == Fault::InvPc
+                && self.psr.get_isr_number() == usize::from(Exception::NMI)
+            {
+                -2
+            } else {
+                self.get_execution_priority().min(-1)
+            };
+            self.lock_up(priority);
+            // the lockup address of INVPC and of a bus or MemManage fault on unstacking is
+            // 0xFFFFFFFE (B1-557, B1-558); an instruction's other faults keep its address
+            if from_return
+                && matches!(
+                    fault,
+                    Fault::InvPc
+                        | Fault::DAccViol
+                        | Fault::Preciserr
+                        | Fault::Impreciseerr
+                        | Fault::Msunskerr
+                )
+            {
+                self.set_pc(0xffff_fffe);
+            }
             // a lockup enters no exception: the step takes the one cycle of the fetch
             return 1;
         }
@@ -870,13 +903,9 @@ impl ExecutorHelper for Processor {
 impl Executor for Processor {
     #[inline(always)]
     fn step_sleep(&mut self) {
-        if (self.syst_csr & 1) != 0 {
-            self.syst_step(1);
-        }
+        // the cycle of the sleeping step: the cycle counter, DWT and SysTick (NOTICE.md)
+        self.account_cycles(1);
         let entered = self.check_exceptions();
-        if (self.dwt_ctrl & 1) != 0 {
-            self.dwt_tick(1);
-        }
         if entered {
             let cycles = self.entry_cycles(false);
             self.account_cycles(cycles);

@@ -148,8 +148,14 @@ pub struct Processor {
     pub(crate) debugger_attached: bool,
     /// A BKPT halted into the attached debugger and the debugger has not been told yet.
     pub(crate) debug_halt: bool,
-    /// The core is locked up (B1.5.15): nothing executes, and only an NMI or a reset leaves it.
+    /// The core is locked up (B1.5.15): nothing executes. A reset leaves it, and an NMI if the
+    /// lockup is at priority -1 (one at -2 can only be left by a reset).
     pub(crate) locked_up: bool,
+    /// Set by a failing exception return, for the fault that follows it (the lockup address).
+    pub(crate) exception_return_faulted: bool,
+    /// The vector table address `reset()` loads into VTOR (the boot address, INITVTOR on the
+    /// Cortex-M7; zero by default). The embedder sets it to boot from where the firmware is.
+    pub boot_address: u32,
     /// An exception return was made in the current step: an exception taken at its end is
     /// tail-chained.
     pub(crate) exception_returned: bool,
@@ -371,6 +377,8 @@ impl Processor {
             debugger_attached: false,
             debug_halt: false,
             locked_up: false,
+            exception_return_faulted: false,
+            boot_address: 0,
             exception_returned: false,
             running: true,
             exit_code: 0,
@@ -490,8 +498,8 @@ impl Processor {
         self.pending_fault_trap = Some(context);
     }
 
-    /// Whether the core is locked up (B1.5.15). It does not run, and only an NMI or a reset
-    /// leaves the lockup.
+    /// Whether the core is locked up (B1.5.15). It does not run; a reset leaves it, and an NMI at
+    /// a lockup of priority -1 (see `lockup_can_end`).
     pub fn is_locked_up(&self) -> bool {
         self.locked_up
     }

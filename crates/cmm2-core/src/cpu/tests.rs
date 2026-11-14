@@ -1065,7 +1065,7 @@ fn core_register_matches_zmu() {
     // The core has to be reset before its exception registers can be written.
     let mut processor = Processor::new();
     processor.flash_memory_at(FLASH_BASE, 8, &[0; 8]);
-    processor.vtor = FLASH_BASE;
+    processor.boot_address = FLASH_BASE;
     processor.reset().unwrap();
     let mut wrong = Vec::new();
     for addr in (0xE000_0000..0xE010_0000).step_by(4) {
@@ -1328,16 +1328,64 @@ fn a_run_after_a_lockup_returns_and_reports_it() {
         .recv_timeout(std::time::Duration::from_secs(20))
         .expect("a run after a lockup must return");
     assert!(locked);
+    let descriptions: Vec<&str> = stops
+        .iter()
+        .map(|stop| match stop {
+            Stop::Fault(fault) => fault.description.as_str(),
+            other => panic!("expected a fault, got {other:?}"),
+        })
+        .collect();
+    // 1: the UDF, escalated to HardFault; 2: the UDF in the handler, the lockup trap, once; then
+    // the locked core is reported, not stepped
+    assert!(descriptions[0].contains("UndefInstr"), "{descriptions:?}");
     assert!(
-        stops.iter().all(|stop| matches!(stop, Stop::Fault(_))),
-        "{stops:?}"
+        descriptions[1].starts_with("lockup trap"),
+        "{descriptions:?}"
     );
-    let Stop::Fault(last) = stops.last().unwrap() else {
-        unreachable!()
-    };
     assert!(
-        last.description.contains("locked up"),
-        "{}",
-        last.description
+        descriptions[2].contains("core locked up"),
+        "{descriptions:?}"
     );
+    assert!(
+        descriptions[3].contains("core locked up"),
+        "{descriptions:?}"
+    );
+}
+
+// An NMI pended at a lockup of priority -1 (the HardFault handler faulted) leaves it (B1-555) and
+// a run steps it in: the NMI handler runs. Nothing in the machine pends an NMI today; this is the
+// core's rule.
+#[test]
+fn a_run_takes_an_nmi_out_of_a_lockup() {
+    use zmu_cortex_m::core::exception::{Exception, ExceptionHandling};
+    let mut words = vec![0u32; 64];
+    words[0] = SP;
+    words[1] = CODE | 1;
+    words[2] = (CODE + 4) | 1; // NMI
+    words[3] = (CODE + 2) | 1; // HardFault
+    let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    // udf; udf (the HardFault handler); movs r4,#7; b . (the NMI handler)
+    bytes.extend(
+        [0xDE00_u16, 0xDE00, 0x2407, 0xE7FE]
+            .iter()
+            .flat_map(|h| h.to_le_bytes()),
+    );
+    let image = Firmware::from_bytes(bytes).unwrap();
+    let mut cpu = Cpu::new(&image, MemoryMap::new(), Irqs::new()).unwrap();
+    assert!(matches!(cpu.run(100), Stop::Fault(_)));
+    assert!(matches!(cpu.run(100), Stop::Fault(_)));
+    assert!(cpu.is_locked_up());
+    cpu.processor.set_exception_pending(Exception::NMI);
+    let stop = cpu.run(100);
+    assert!(!cpu.is_locked_up(), "{stop:?}");
+    assert_eq!(cpu.reg(4), 7);
+}
+
+// A reset, the guest's included, loads VTOR from the boot address: the flash base.
+#[test]
+fn a_reset_puts_vtor_back_at_the_flash_base() {
+    let mut cpu = cpu(&ARITH);
+    cpu.processor.vtor = 0x2000_0000;
+    cpu.reset();
+    assert_eq!(cpu.processor.vtor, FLASH_BASE);
 }

@@ -19,13 +19,29 @@ pub trait Reset {
 
 impl Reset for Processor {
     fn reset(&mut self) -> Result<(), Fault> {
+        let result = self.take_reset();
+        if let Err(fault) = result {
+            // A vector read error at reset is a lockup at priority -1 with the lockup address
+            // 0xFFFFFFFE (B1-556), with the fault status showing the vector read (B1-555). Here,
+            // so that every caller gets it.
+            self.record_fault_status(fault, crate::core::fault::FaultStatusContext::default());
+            self.execution_priority = -1;
+            self.lock_up(-1);
+            self.set_pc(0xffff_fffe);
+        }
+        result
+    }
+}
+
+impl Processor {
+    /// `TakeReset()` (B1.5.5): the state is reset first, then the vectors are read.
+    fn take_reset(&mut self) -> Result<(), Fault> {
         // All basic registers to zero.
         self.r0_12.fill(0);
 
-        // Main stack pointer is read via vector table
+        // VTOR is reset to the boot address (ResetSCSRegs, INITVTOR on the Cortex-M7)
+        self.vtor = self.boot_address & !0x7f;
         let vtor = self.vtor;
-        let sp = self.read32(vtor).map_err(Fault::on_vector_read)? & 0xffff_fffc;
-        self.set_msp(sp);
 
         // Process stack pointer to zero
         self.set_psp(0);
@@ -72,9 +88,17 @@ impl Reset for Processor {
         //self.event_reg.clear();
 
         self.itstate = 0;
-        // a reset leaves a lockup (B1-555)
-        self.locked_up = false;
+        // a reset leaves a lockup (B1-555), and the core runs again
+        if self.locked_up {
+            self.locked_up = false;
+            self.running = true;
+        }
         self.execution_priority = self.get_execution_priority();
+
+        // The vectors are read after the state is reset (TakeReset), so a reset that cannot read
+        // them has still cleared the active exceptions. Main stack pointer first.
+        let sp = self.read32(vtor).map_err(Fault::on_vector_read)? & 0xffff_fffc;
+        self.set_msp(sp);
 
         let reset_vector = self
             .read32(vtor.wrapping_add(4))
@@ -109,8 +133,9 @@ mod tests {
             0xffff_f000,
             0x1000,
         ))));
-        // VTOR keeps bits 31:7 (B3.2.5), so the table is at 0xffff_ff80
-        processor.write32(0xE000_ED08, 0xffff_ffff).unwrap();
+        // VTOR keeps bits 31:7 (B3.2.5), so the table is at 0xffff_ff80; reset loads it from the
+        // boot address
+        processor.boot_address = 0xffff_ffff;
         processor.write32(0xffff_ff80, 0x2000_0100).unwrap();
         processor.write32(0xffff_ff84, 0x0800_0001).unwrap();
 
@@ -244,9 +269,52 @@ mod tests {
     #[test]
     fn a_reset_leaves_a_lockup() {
         let mut processor = booted();
-        processor.lock_up();
+        processor.lock_up(-1);
         assert!(processor.is_locked_up());
         assert_eq!(processor.reset(), Ok(()));
         assert!(!processor.is_locked_up());
+    }
+
+    // VTOR is reset to the boot address (ResetSCSRegs), which is zero unless the embedder says.
+    #[test]
+    fn reset_loads_vtor_from_the_boot_address() {
+        let mut processor = booted();
+        processor.vtor = 0x1234_5600;
+        processor.reset().unwrap();
+        assert_eq!(processor.vtor, 0);
+        processor.boot_address = 0x1fff_ff80;
+        assert!(processor.reset().is_err());
+        assert_eq!(processor.vtor, 0x1fff_ff80);
+    }
+
+    // A reset that fails reading its vectors has still reset the exceptions: nothing stays active.
+    #[test]
+    fn a_failed_reset_leaves_no_exception_active() {
+        let mut processor = booted();
+        processor.test_set_active_exception(crate::core::exception::Exception::NMI);
+        processor.test_set_active_exception(crate::core::exception::Exception::HardFault);
+        processor.boot_address = 0x1fff_ff80;
+        assert!(processor.reset().is_err());
+        assert!(!processor.exception_active(crate::core::exception::Exception::NMI));
+        assert!(!processor.exception_active(crate::core::exception::Exception::HardFault));
+    }
+
+    // A reset that cannot read its vectors is a lockup at priority -1 at 0xFFFFFFFE with VECTTBL
+    // (B1-556), whoever calls it: the lockup it left is still there, and so is the stop.
+    #[test]
+    fn a_failed_reset_is_a_lockup_for_every_caller() {
+        for was_locked in [false, true] {
+            let mut processor = booted();
+            if was_locked {
+                processor.lock_up(-1);
+            }
+            processor.boot_address = 0x1fff_ff80;
+            assert_eq!(processor.reset(), Err(Fault::VectorTable));
+            assert!(processor.is_locked_up(), "{was_locked}");
+            assert!(!processor.running, "{was_locked}");
+            assert_eq!(processor.get_pc(), 0xffff_fffe, "{was_locked}");
+            assert_eq!(processor.execution_priority, -1, "{was_locked}");
+            assert_eq!(processor.hfsr & (1 << 1), 1 << 1, "VECTTBL");
+        }
     }
 }

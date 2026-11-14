@@ -302,11 +302,34 @@ The firmware needs a few things zmu does not do, so I changed the following.
     lockup address of B1-556; one from an instruction keeps the PC of that instruction. A pending
     Reset whose initial SP and PC cannot be read is a lockup at priority -1 at that address
     (B1-556), reported as one, with HFSR.VECTTBL and no FORCED, and counts 1. (`Processor::
-    entry_cycles` is the one place that decides what a step counts.) cmm2-core's `run_loop` stops with a fault ("core locked up") when `is_locked_up()`,
-    instead of stepping a core that executes nothing, so for it only a reset leaves a lockup. On silicon the stacking writes that came before a failed vector read did
-    happen and are not charged here. `reset()` keeps VTOR where TakeReset's ResetSCSRegs would
-    clear it (TBLOFF resets to zero): cmm2-core sets VTOR to the flash base before the first
-    reset to boot from it, so VTOR is kept.
+    entry_cycles` is the one place that decides what a step counts.)
+    Lockup priorities follow B1-556 to B1-558: a vector read error at NMI entry locks up at -2
+    whatever the running priority, at HardFault entry and at reset at -1; INVPC on a return from
+    the NMI handler to an execution priority of -1 at -2; a stacking failure on NMI entry at -1 or
+    -2 (IMPLEMENTATION DEFINED, -2 here, so that the NMI is not entered again); the rest at the
+    priority the core runs at. `lock_up(priority)` sets it. What leaves a lockup is what can
+    preempt its priority: an NMI from one at -1 (B1-555 names the HardFault handler; FAULTMASK and
+    the reset handler are at -1 as well), a reset from either, nothing from one at -2 but a
+    reset (`lockup_can_end()` says so; cmm2-core's `run_loop` steps a lockup that can end and
+    stops with a fault ("core locked up") otherwise; the machine pends no NMI today). The lockup
+    address is 0xFFFFFFFE for a failed stacking or vector read, INVPC and a bus or MemManage
+    fault on unstacking (the PC is set to it: `bx lr` is where it was before), and the PC of the
+    instruction otherwise. A reset (`reset()`) leaves the lockup and sets `running` again, so the
+    GDB `monitor reset` recovers a locked core. A pending Reset taken from lockup (or at all) is
+    charged like an entry, 12 cycles: it is not an exception entry, and I have no figure for the
+    reset sequence, so this is an approximation.
+    VTOR is reset to `Processor::boot_address` (zero by default; INITVTOR on the Cortex-M7, set
+    from the BOOT_ADD pins on the STM32H7) by every `reset()`, as ResetSCSRegs resets it; cmm2-core
+    sets it to the flash base instead of writing VTOR before each reset. A reset that cannot read
+    its vectors has still reset the exceptions first (TakeReset reads them after), so nothing
+    stays active. A sleeping step counts its cycle in `cycle_count`, DWT and SysTick alike (before
+    it counted only the last two). That is not what the STM32H7 does for the DWT: its CPU clock
+    is stopped in CSleep (RM0433 §6.7.5) and rcc_c_ck, which clocks the DWT, runs only in CRun
+    (§8.5.12), so CYCCNT does not count through a WFI sleep unless DBGMCU_CR.DBGSLEEP_D1 is set.
+    SysTick keeps counting, since it has to wake the core. The ARMv7-M manual says nothing about
+    the cycle counter in sleep. The emulator's DWT still counts in sleep; that is to change.
+    A GDB `continue` on a locked core spins, stepping the 1-cycle fetch and
+    reporting nothing further, as the hardware core does; it used to report Finalized.
     The GDB simulation steps a core with running and sleeping both set (what a WFI leaves, as in
     `system/simulation.rs`) with `step_sleep`; it used to run its instructions.
   - the HardFault-vector-fails-too branch is reached when the vector words of the exception to take

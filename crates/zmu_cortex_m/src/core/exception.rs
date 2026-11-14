@@ -381,6 +381,14 @@ impl Processor {
         let derived = self.fault_delivery_exception(fault);
         let escalated = derived != fault.exception();
 
+        // The priority of a lockup here: -2 when the original is an NMI (a stacking failure on NMI
+        // entry is -1 or -2, IMPLEMENTATION DEFINED, B1-557; -2 is taken so that the NMI is not
+        // taken again on top of the lockup), else the priority the core was running at (below 0).
+        let mut lockup_priority = if original == Exception::NMI {
+            -2
+        } else {
+            self.get_execution_priority().min(-1)
+        };
         let mut entry = DerivedEntry {
             fault,
             derived,
@@ -424,17 +432,25 @@ impl Processor {
                     || self.is_lockup(Exception::HardFault)
                 {
                     entry.lockup = true;
+                    // a vector read error at NMI entry locks up at -2 whatever the running
+                    // priority, at HardFault entry at -1 (B1-556)
+                    lockup_priority = match taken {
+                        Exception::NMI => -2,
+                        Exception::HardFault => -1,
+                        _ => lockup_priority,
+                    };
                 } else {
                     self.pend_after_failed_entry(taken, taken == derived, source);
                     entry.taken = Exception::HardFault;
                     if self.exception_taken(Exception::HardFault).is_err() {
                         entry.lockup = true;
+                        lockup_priority = -1;
                     }
                 }
             }
         }
         if entry.lockup {
-            self.lock_up();
+            self.lock_up(lockup_priority);
             // the lockup address of a failed stacking or vector read is 0xFFFFFFFE (B1-556)
             self.set_pc(0xffff_fffe);
         }
@@ -1117,8 +1133,8 @@ impl ExceptionHandling for Processor {
                 // a pending Reset: it can fail reading the initial SP and PC, which is a lockup
                 // at priority -1 with the lockup address 0xFFFFFFFE (B1-556), and no entry
                 if let Err(fault) = self.reset() {
+                    // `reset()` has made the lockup; this only reports it
                     let active_exception = self.active_exception();
-                    self.record_fault_status(fault, FaultStatusContext::default());
                     self.queue_fault_trap(
                         fault,
                         Exception::HardFault,
@@ -1126,9 +1142,6 @@ impl ExceptionHandling for Processor {
                         active_exception,
                         crate::core::fault::FaultTrapReason::Lockup,
                     );
-                    self.execution_priority = -1;
-                    self.lock_up();
-                    self.set_pc(0xffff_fffe);
                 }
             } else {
                 match self.enter_exception(exception, pc, None, EntrySource::Pending) {
@@ -3663,5 +3676,20 @@ mod tests {
         let cycles = processor.execute(&decode_16(0xbe00), 2);
         assert_eq!(processor.psr.get_isr_number(), 12);
         assert_eq!(cycles, 12);
+    }
+
+    // A stacking failure on NMI entry at an execution priority of -1 is a lockup at -1 or -2,
+    // IMPLEMENTATION DEFINED (B1-557); it is taken at -2, so that the NMI is not entered again.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_stacking_failure_on_nmi_entry_locks_up_at_minus_two() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        set_active_exception(&mut processor, Exception::HardFault);
+        processor.set_msp(0x2002_0004);
+        processor.execution_priority = processor.get_execution_priority();
+        processor.exception_entry(Exception::NMI, 0x100).unwrap();
+        assert!(processor.is_locked_up());
+        assert_eq!(processor.execution_priority, -2);
     }
 }
