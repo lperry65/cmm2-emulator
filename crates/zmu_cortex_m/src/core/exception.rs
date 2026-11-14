@@ -17,7 +17,7 @@ use crate::core::reset::Reset;
 #[cfg(feature = "has-fp")]
 use crate::executor::FloatingPointChecks;
 use crate::peripheral::nvic::NVIC;
-use crate::peripheral::scb::CCR_STKALIGN;
+use crate::peripheral::scb::{CCR_NONBASETHRDENA, CCR_STKALIGN};
 #[cfg(feature = "has-fp")]
 use crate::peripheral::scb::{
     DEMCR_MON_EN, FPCCR_BFRDY, FPCCR_HFRDY, FPCCR_LSPACT, FPCCR_LSPEN, FPCCR_MMRDY, FPCCR_MONRDY,
@@ -191,7 +191,7 @@ pub trait ExceptionHandling {
     /// Get the configured priority of an exception.
     ///
     /// For configurable exceptions this corresponds to the stored SHPRx/IPR
-    /// priority, for example BusFault -> `SHPR1.PRI_5`.
+    /// priority, for example `BusFault` -> `SHPR1.PRI_5`.
     ///
     fn get_exception_priority(&self, exception: Exception) -> i16;
 
@@ -231,7 +231,7 @@ trait ExceptionHandlingHelpers {
     fn is_activatable(&self, exception_number: usize) -> bool;
 }
 
-/// The fields of the xPSR that PushStack stacks: N Z C V Q (31:27), IT/ICI (26:25 and 15:10), T
+/// The fields of the xPSR that `PushStack` stacks: N Z C V Q (31:27), IT/ICI (26:25 and 15:10), T
 /// (24), GE (19:16, only with the DSP extension) and the IPSR (8:0). Bit 9, the alignment of the
 /// frame, is the frame's own.
 #[cfg(feature = "has-dsp-ext")]
@@ -290,7 +290,19 @@ pub enum Exception {
 }
 
 impl Processor {
-    /// A HardFault can not be taken when the execution priority is already below 0 (HardFault or
+    /// CCR.NONBASETHRDENA. ARMv6-M has no such bit.
+    fn nonbasethrdena(&self) -> bool {
+        #[cfg(not(feature = "armv6m"))]
+        {
+            self.ccr.get_bit(CCR_NONBASETHRDENA)
+        }
+        #[cfg(feature = "armv6m")]
+        {
+            false
+        }
+    }
+
+    /// A `HardFault` can not be taken when the execution priority is already below 0 (`HardFault` or
     /// NMI running, or FAULTMASK set): the core locks up. A fault and a failed entry share this.
     pub(crate) fn is_lockup(&self, exception: Exception) -> bool {
         exception == Exception::HardFault && self.get_execution_priority() < 0
@@ -309,8 +321,13 @@ impl Processor {
             if let Exception::Interrupt { n } = exception {
                 self.nvic_unpend_interrupt(n);
             }
-            self.push_stack(return_address, refused)
-                .map_err(Fault::on_exception_entry_stack)?;
+            // ExceptionReturn() refuses a bad EXC_RETURN before the pop with no PushStack
+            if refused.is_none_or(|refused| refused.pushes_frame) {
+                self.push_stack(return_address, refused)
+                    .map_err(Fault::on_exception_entry_stack)?;
+            } else if let Some(refused) = refused {
+                self.lr = refused.handler_lr;
+            }
             self.exception_taken(exception)
         }
     }
@@ -358,6 +375,13 @@ impl ExceptionHandlingHelpers for Processor {
             self.control.fpca = false;
         }
         self.control.sp_sel = false;
+        // EPSR.IT<7:0> = Zeros(8) (ExceptionTaken(), B1.5.6, p. B1-533)
+        self.itstate = 0;
+        // DEMCR.MON_PEND stays set until the DebugMonitor exception is taken (C1-693)
+        #[cfg(not(feature = "armv6m"))]
+        if exception == Exception::DebugMonitor {
+            self.demcr &= !(1 << 17);
+        }
         self.exceptions.get_mut(&exception.into()).unwrap().active = true;
         self.set_shcsr_exception_active(exception, true);
         self.execution_priority = self.get_execution_priority();
@@ -391,12 +415,14 @@ impl ExceptionHandlingHelpers for Processor {
         exc_return: u32,
         popped_xpsr: Option<u32>,
     ) -> Result<(), Fault> {
-        // The frame of the UsageFault keeps the LR as it is (the popped one, after a pop) and the
-        // popped xPSR, and the handler's LR is the EXC_RETURN that was refused. The fault carries
-        // them to the entry, where push_stack uses them.
+        // After a pop the frame of the UsageFault keeps the LR as it is (the popped one) and the
+        // popped xPSR (PushStack negating PopStack, B1.5.8), and the handler's LR is the
+        // EXC_RETURN that was refused. Before a pop (`popped_xpsr` is None) there is no frame. The
+        // fault carries this to the entry, where push_stack uses it.
         let refused = (0b1111 << 28) + exc_return;
         self.pending_fault_status = Some(FaultStatusContext {
             refused_return: Some(RefusedReturn {
+                pushes_frame: popped_xpsr.is_some(),
                 frame_lr: self.lr,
                 handler_lr: refused,
                 frame_xpsr: popped_xpsr,
@@ -457,7 +483,7 @@ impl ExceptionHandlingHelpers for Processor {
                 self.set_psp((self.psp.wrapping_sub(frame_size)) & spmask);
                 (self.psp, align)
             } else {
-                let align = u32::from(self.msp.get_bit(2));
+                let align = u32::from(self.msp.get_bit(2) & forcealign);
                 self.set_msp((self.msp.wrapping_sub(frame_size)) & spmask);
                 (self.msp, align)
             };
@@ -480,7 +506,8 @@ impl ExceptionHandlingHelpers for Processor {
         // and the handler starts without an IT block.
         let it = u32::from(self.itstate);
         let xpsr = match refused.and_then(|refused| refused.frame_xpsr) {
-            // a refused return stacks the xPSR it popped, as it is
+            // PushStack negating a PopStack (B1.5.8) stacks the xPSR that was popped, with the bad
+            // IPSR and only the fields the xPSR has
             Some(popped) => (popped & XPSR_IMPLEMENTED) | frameptralign << 9,
             None => {
                 (self.psr.value & !(IT_XPSR_MASK | 1 << 9))
@@ -494,7 +521,9 @@ impl ExceptionHandlingHelpers for Processor {
 
         #[cfg(feature = "has-fp")]
         if self.control.fpca {
-            if !self.fpccr.get_bit(FPCCR_LSPEN) {
+            if self.fpccr.get_bit(FPCCR_LSPEN) {
+                self.update_fpccr(frameptr)?;
+            } else {
                 self.check_vfp_enabled()?;
                 for i in 0..16 {
                     let reg = SingleReg::from(i as u8);
@@ -503,8 +532,6 @@ impl ExceptionHandlingHelpers for Processor {
                 }
                 // write FPSCR:
                 self.write32(frameptr.wrapping_add(0x60), self.fpscr)?;
-            } else {
-                self.update_fpccr(frameptr)?;
             }
         }
 
@@ -593,10 +620,10 @@ impl ExceptionHandlingHelpers for Processor {
 
     fn pop_stack(&mut self, frameptr: u32, exc_return: u32) -> Result<(), Fault> {
         #[cfg(feature = "has-fp")]
-        let (frame_size, forcealign): (u32, bool) = if !exc_return.get_bit(4) {
-            (0x68, true)
-        } else {
+        let (frame_size, forcealign): (u32, bool) = if exc_return.get_bit(4) {
             (0x20, self.ccr.get_bit(CCR_STKALIGN))
+        } else {
+            (0x68, true)
         };
 
         #[cfg(not(feature = "has-fp"))]
@@ -659,8 +686,8 @@ impl ExceptionHandlingHelpers for Processor {
         #[cfg(feature = "has-dsp-ext")]
         self.psr.value.set_bits(16..20, psr.get_bits(16..20));
 
-        // What the popped xPSR says is checked after the pop, as I remember the manual: the pop is
-        // done when it is found wrong. The IPSR against the mode is the check of the return itself,
+        // What the popped xPSR says is checked after the pop (B1.5.8, ExceptionReturn()): the pop
+        // is done when it is found wrong, and PushStack negates it. The IPSR against the mode is the check of the return itself,
         // so it comes first: zero for Thread mode, an exception the core has for Handler mode. A
         // refused IPSR is not written to the xPSR, so that it never holds an exception that does
         // not exist. EPSR.T = 0 is only INVSTATE once the IPSR has passed.
@@ -780,7 +807,7 @@ impl ExceptionHandling for Processor {
     }
 
     fn exception_return(&mut self, exc_return: u32) -> Result<(), Fault> {
-        assert!(self.mode == ProcessorMode::HandlerMode);
+        assert_eq!(self.mode, ProcessorMode::HandlerMode);
 
         let returning_exception_number = self.psr.get_isr_number();
         let nested_activation = self.exception_active_bit_count();
@@ -793,20 +820,15 @@ impl ExceptionHandling for Processor {
             let frameptr;
             match exc_return.get_bits(0..4) {
                 0b0001 => {
-                    // return to handler
-                    if nested_activation == 1 {
-                        return self
-                            .invalid_exception_return(returning_exception_number, exc_return);
-                    }
+                    // return to handler: the manual has no nesting check here, the popped IPSR
+                    // is checked after the pop
                     frameptr = self.get_msp();
                     self.mode = ProcessorMode::HandlerMode;
                     self.control.sp_sel = false;
                 }
                 0b1001 => {
                     // returning to thread using main stack
-                    if nested_activation != 1
-                    /*&& !self.ccr.nonbasethreadena*/
-                    {
+                    if nested_activation != 1 && !self.nonbasethrdena() {
                         return self
                             .invalid_exception_return(returning_exception_number, exc_return);
                     } else {
@@ -817,9 +839,7 @@ impl ExceptionHandling for Processor {
                 }
                 0b1101 => {
                     // returning to thread using process stack
-                    if nested_activation != 1
-                    /*&& !self.ccr.nonbasethreadena*/
-                    {
+                    if nested_activation != 1 && !self.ccr.get_bit(CCR_NONBASETHRDENA) {
                         return self
                             .invalid_exception_return(returning_exception_number, exc_return);
                     } else {
@@ -1417,20 +1437,6 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "armv6m"))]
-    fn test_exception_return_rejects_handler_return_without_nested_activation() {
-        let mut processor = Processor::new();
-
-        set_active_exception(&mut processor, Exception::SysTick);
-
-        let result = processor.exception_return(EXC_RETURN_HANDLER);
-
-        assert_eq!(result, Err(Fault::InvPc));
-        assert_eq!(processor.get_r(Reg::LR), 0xF000_0000 + EXC_RETURN_HANDLER);
-        assert!(!processor.exception_active(Exception::SysTick));
-    }
-
-    #[test]
-    #[cfg(not(feature = "armv6m"))]
     fn test_exception_return_rejects_thread_return_with_other_active_exception() {
         const FRAMEPTR: u32 = 0x2000_00e0;
 
@@ -1631,7 +1637,9 @@ mod tests {
         let mut processor = Processor::new();
         processor.set_msp(FRAMEPTR);
         processor.write32(FRAMEPTR + 0x18, 0x0800_0001).unwrap();
-        processor.write32(FRAMEPTR + 0x1c, (1 << 24) | 300).unwrap();
+        processor
+            .write32(FRAMEPTR + 0x1c, (1 << 24) | 0x12c)
+            .unwrap();
         set_active_exception(&mut processor, Exception::HardFault);
         processor
             .exceptions
@@ -1698,7 +1706,7 @@ mod tests {
         processor.set_msp(0x2000_0200);
         let frame = processor.get_msp();
         processor.write32(frame + 0x14, 0xcdcd_cdcd).unwrap();
-        processor.write32(frame + 0x1c, (1 << 24) | 300).unwrap();
+        processor.write32(frame + 0x1c, (1 << 24) | 0x12c).unwrap();
         // HardFault and NMI are active, the NMI is running, and UsageFault is disabled
         set_active_exception(&mut processor, Exception::HardFault);
         set_active_exception(&mut processor, Exception::NMI);
@@ -1718,7 +1726,7 @@ mod tests {
         assert_eq!(processor.get_r(Reg::LR), 0xffff_fff9);
     }
 
-    // The frame of a refused return holds the popped xPSR as it is, bad IPSR and all, and that
+    // The frame of a refused return holds the popped xPSR, bad IPSR and all, and that
     // IPSR is never the current one: handing the same EXC_RETURN back is refused again.
     #[test]
     #[cfg(not(feature = "armv6m"))]
@@ -1754,7 +1762,7 @@ mod tests {
 
     // A synchronous fault is escalated to HardFault when it is disabled or when its priority is
     // not higher than the execution priority, which includes PRIMASK, BASEPRI and FAULTMASK as
-    // the manual's ExecutionPriority() has them (as I remember it). A HardFault at an execution
+    // the manual's ExecutionPriority() has them (B1.5.4, B1.5.5). A HardFault at an execution
     // priority below 0 cannot be taken: it is a lockup.
     #[cfg(not(feature = "armv6m"))]
     fn run_udf_with_usage_fault_enabled(processor: &mut Processor) {
@@ -1906,7 +1914,7 @@ mod tests {
 
     // BKPT with nothing to serve it is a debug event: DFSR.BKPT is set, and with the DebugMonitor
     // enabled (DEMCR.MON_EN) and able to preempt it is taken, and otherwise it is escalated to
-    // HardFault with HFSR.DEBUGEVT. This is from my memory of the manual. BKPT #0xab with no
+    // HardFault with HFSR.DEBUGEVT (C1.5, B1.5.14). BKPT #0xab with no
     // semihosting handler is the same, there being no host to take it.
     #[test]
     #[cfg(not(feature = "armv6m"))]
@@ -2360,17 +2368,17 @@ mod tests {
     fn test_push_stack_saves_it_state_in_xpsr() {
         // ITSTATE[7:2] goes to xPSR[15:10], ITSTATE[1:0] to xPSR[26:25]
         let (core, xpsr) = stacked_xpsr_after_entry(0x18);
-        assert_eq!(xpsr.get_bits(10..16), 0b000110);
+        assert_eq!(xpsr.get_bits(10..16), 0b00_0110);
         assert_eq!(xpsr.get_bits(25..27), 0b00);
         assert_eq!(core.itstate, 0);
 
         let (core, xpsr) = stacked_xpsr_after_entry(0xa4);
-        assert_eq!(xpsr.get_bits(10..16), 0b101001);
+        assert_eq!(xpsr.get_bits(10..16), 0b10_1001);
         assert_eq!(xpsr.get_bits(25..27), 0b00);
         assert_eq!(core.itstate, 0);
 
         let (_, xpsr) = stacked_xpsr_after_entry(0xa7);
-        assert_eq!(xpsr.get_bits(10..16), 0b101001);
+        assert_eq!(xpsr.get_bits(10..16), 0b10_1001);
         assert_eq!(xpsr.get_bits(25..27), 0b11);
     }
 
@@ -2396,10 +2404,10 @@ mod tests {
 
     #[test]
     fn test_pop_stack_restores_it_state_from_xpsr() {
-        let core = pop_frame_with_xpsr((1 << 24) | (0b101001 << 10));
+        let core = pop_frame_with_xpsr((1 << 24) | (0b10_1001 << 10));
         assert_eq!(core.itstate, 0xa4);
 
-        let core = pop_frame_with_xpsr((1 << 24) | (0b000110 << 10) | (0b11 << 25));
+        let core = pop_frame_with_xpsr((1 << 24) | (0b00_0110 << 10) | (0b11 << 25));
         assert_eq!(core.itstate, 0x1b);
 
         let core = pop_frame_with_xpsr(1 << 24);
@@ -2414,5 +2422,305 @@ mod tests {
             let core = pop_frame_with_xpsr(xpsr & !0x1ff);
             assert_eq!(core.itstate, itstate);
         }
+    }
+
+    // B1.5.8 ExceptionReturn(): when EXC_RETURN is refused before the pop (inactive handler, an
+    // illegal value, a Thread return with other exceptions active) there is no PushStack: the
+    // fault is entered with the stack pointer where it was and LR = '1111':EXC_RETURN.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_return_refused_before_the_pop_pushes_no_frame() {
+        for exc_return in [0xffff_fff0_u32, 0xffff_ffe3, 0xffff_fff5] {
+            let mut processor = Processor::new();
+            processor.set_msp(0x2000_0200);
+            set_active_exception(&mut processor, Exception::SysTick);
+            processor.write32(0x2000_01f8, 0xdead_beef).unwrap();
+            processor.set_r(Reg::LR, exc_return);
+
+            processor.execute(&decode_16(0x4770), 2); // bx lr
+
+            assert_eq!(processor.get_msp(), 0x2000_0200, "{exc_return:#x}");
+            assert_eq!(processor.read32(0x2000_01f8), Ok(0xdead_beef));
+            assert_eq!(processor.get_r(Reg::LR), exc_return, "{exc_return:#x}");
+            assert_eq!(processor.psr.get_isr_number(), 3, "UsageFault is disabled");
+            assert_eq!(processor.cfsr & (1 << 18), 1 << 18, "INVPC");
+            assert!(!processor.exception_active(Exception::SysTick));
+        }
+        // an inactive handler: IPSR names an exception that is not active
+        let mut processor = Processor::new();
+        processor.set_msp(0x2000_0200);
+        processor.test_set_active_exception(Exception::SysTick);
+        processor
+            .exceptions
+            .get_mut(&usize::from(Exception::SysTick))
+            .unwrap()
+            .active = false;
+        processor.set_r(Reg::LR, 0xffff_fff9);
+        processor.execute(&decode_16(0x4770), 2);
+        assert_eq!(processor.get_msp(), 0x2000_0200);
+        assert_eq!(processor.get_r(Reg::LR), 0xffff_fff9);
+    }
+
+    // The same refusal with UsageFault enabled enters UsageFault, also without a frame.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_return_refused_before_the_pop_enters_an_enabled_usagefault_without_a_frame() {
+        let mut processor = Processor::new();
+        processor.set_msp(0x2000_0200);
+        processor.write32(0xE000_ED24, 1 << 18).unwrap(); // SHCSR.USGFAULTENA
+        set_active_exception(&mut processor, Exception::SysTick);
+        processor.set_r(Reg::LR, 0xffff_fff0);
+
+        processor.execute(&decode_16(0x4770), 2);
+
+        assert_eq!(processor.psr.get_isr_number(), 6);
+        assert_eq!(processor.get_msp(), 0x2000_0200);
+        assert_eq!(processor.get_r(Reg::LR), 0xffff_fff0);
+    }
+
+    // A return to Handler mode has no nesting check in the manual: only the popped IPSR is
+    // checked (zero is refused, after the pop). With nothing else active, a frame whose IPSR names
+    // an exception is accepted.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_return_to_handler_is_checked_by_the_popped_ipsr_and_not_by_the_nesting() {
+        const FRAMEPTR: u32 = 0x2000_00e0;
+        let mut processor = Processor::new();
+        processor.set_msp(FRAMEPTR);
+        processor.write32(FRAMEPTR + 0x18, 0x0800_0001).unwrap();
+        processor.write32(FRAMEPTR + 0x1c, (1 << 24) | 15).unwrap();
+        set_active_exception(&mut processor, Exception::SysTick);
+
+        assert_eq!(processor.exception_return(EXC_RETURN_HANDLER), Ok(()));
+        assert_eq!(processor.psr.get_isr_number(), 15);
+        assert_eq!(processor.get_msp(), FRAMEPTR + 0x20);
+
+        // IPSR zero for Handler mode is refused after the pop, and the new frame negates the pop
+        let mut processor = Processor::new();
+        processor.set_msp(FRAMEPTR);
+        processor.write32(FRAMEPTR + 0x18, 0x0800_0001).unwrap();
+        processor.write32(FRAMEPTR + 0x1c, 1 << 24).unwrap();
+        set_active_exception(&mut processor, Exception::SysTick);
+        processor.set_r(Reg::LR, EXC_RETURN_HANDLER | 0xffff_ffe0);
+        processor.execute(&decode_16(0x4770), 2);
+        assert_eq!(processor.get_msp(), FRAMEPTR, "PushStack negates PopStack");
+        assert_eq!(processor.cfsr & (1 << 18), 1 << 18, "INVPC");
+    }
+
+    // CCR.NONBASETHRDENA lets a return to Thread mode happen with other exceptions active.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_nonbasethrdena_allows_a_thread_return_with_other_exceptions_active() {
+        const FRAMEPTR: u32 = 0x2000_00e0;
+        for (ccr, accepted) in [(0, false), (1, true)] {
+            let mut processor = Processor::new();
+            processor.set_msp(FRAMEPTR);
+            processor.write32(FRAMEPTR + 0x18, 0x0800_0001).unwrap();
+            processor.write32(FRAMEPTR + 0x1c, 1 << 24).unwrap();
+            processor.write32(0xE000_ED14, ccr).unwrap();
+            set_active_exception(&mut processor, Exception::HardFault);
+            processor
+                .exceptions
+                .get_mut(&usize::from(Exception::SysTick))
+                .unwrap()
+                .active = true;
+
+            let result = processor.exception_return(EXC_RETURN_THREAD_MSP);
+
+            assert_eq!(result.is_ok(), accepted, "CCR {ccr}");
+            assert_eq!(processor.mode == ProcessorMode::ThreadMode, accepted);
+        }
+    }
+
+    // PushStack: frameptralign is SP<2> AND forcealign, for the main stack too (B1.5.6).
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_frame_alignment_bit_is_only_stacked_when_the_stack_is_aligned_by_the_core() {
+        for (ccr, expected) in [(0_u32, 0_u32), (1 << 9, 1 << 9)] {
+            let mut processor = Processor::new();
+            processor.write32(0xE000_ED14, ccr).unwrap();
+            processor.set_msp(0x2000_0204); // bit 2 set
+            processor.set_pc(0x100);
+            processor.execute(&decode_16(0xdf00), 2); // svc #0
+
+            let frame = processor.get_msp();
+            assert_eq!(processor.read32(frame + 0x1c).unwrap() & (1 << 9), expected);
+        }
+    }
+
+    // B1.5.6 ReturnAddress() (p. B1-534): an SVC escalated to HardFault keeps the return address of SVCall,
+    // the next instruction.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_an_escalated_svc_stacks_the_next_instruction() {
+        let mut processor = Processor::new();
+        processor.primask = true;
+        processor.set_msp(0x2000_0200);
+        processor.set_pc(0x100);
+
+        processor.execute(&decode_16(0xdf00), 2);
+
+        assert_eq!(processor.psr.get_isr_number(), 3);
+        let frame = processor.get_msp();
+        assert_eq!(processor.read32(frame + 0x18), Ok(0x102));
+        // while a fault keeps the faulting instruction
+        let mut processor = Processor::new();
+        processor.set_msp(0x2000_0200);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xde00), 2); // udf #0
+        let frame = processor.get_msp();
+        assert_eq!(processor.read32(frame + 0x18), Ok(0x100));
+    }
+
+    // C1.5, C1-693: a BKPT sets MON_PEND for the DebugMonitor it generates, and taking the
+    // exception clears it again; one that is escalated to HardFault never sets it.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_bkpt_that_takes_the_debug_monitor_leaves_mon_pend_clear() {
+        let mut processor = Processor::new();
+        processor.set_msp(0x2000_0200);
+        processor.set_pc(0x100);
+        processor.write32(0xE000_EDFC, 1 << 16).unwrap();
+        processor.execute(&decode_16(0xbe00), 2);
+        assert_eq!(processor.psr.get_isr_number(), 12);
+        assert_eq!(
+            processor.demcr & (1 << 17),
+            0,
+            "MON_PEND is cleared when taken"
+        );
+
+        // escalated to HardFault: no debug event exception, no MON_PEND
+        let mut processor = Processor::new();
+        processor.set_msp(0x2000_0200);
+        processor.execute(&decode_16(0xbe00), 2);
+        assert_eq!(processor.demcr & (1 << 17), 0);
+    }
+
+    // ARMv6-M has no DebugMonitor (exception 12) and no DEMCR: BKPT is a HardFault there.
+    #[test]
+    #[cfg(feature = "armv6m")]
+    fn test_bkpt_on_armv6m_is_a_hardfault_even_with_demcr_bits_stored() {
+        use crate::executor::Executor;
+        let mut processor = Processor::new();
+        processor.set_msp(0x2000_0200);
+        processor.set_pc(0x100);
+        processor.demcr = 1 << 16;
+        processor.execute(&crate::decoder::decode_16(0xbe00), 2);
+        assert_eq!(processor.psr.get_isr_number(), 3);
+    }
+
+    // ExceptionTaken() (B1.5.6, p. B1-533) clears EPSR.IT, so a return refused before the pop,
+    // which pushes no frame, does not leave the IT state live in the fault handler.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_return_refused_before_the_pop_enters_the_handler_without_it_state() {
+        let mut processor = Processor::new();
+        processor.set_msp(0x2000_0200);
+        set_active_exception(&mut processor, Exception::SysTick);
+        processor.set_r(Reg::LR, 0xffff_fff0);
+        processor.itstate = 0xe8; // IT AL, one instruction
+
+        processor.execute(&decode_16(0x4770), 2); // bx lr
+
+        assert_eq!(processor.psr.get_isr_number(), 3);
+        assert_eq!(processor.itstate, 0);
+    }
+
+    // DEMCR.MON_PEND stays set until the DebugMonitor exception is taken or a write clears it
+    // (C1-693), so it is clear once the BKPT has taken the DebugMonitor.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_mon_pend_stays_set_until_the_debug_monitor_is_taken() {
+        let mut processor = Processor::new();
+        processor.set_msp(0x2000_0200);
+        processor
+            .write32(0xE000_EDFC, (1 << 16) | (1 << 17))
+            .unwrap();
+        assert_eq!(processor.demcr & (1 << 17), 1 << 17, "pended, not taken");
+        processor
+            .exception_entry(Exception::DebugMonitor, 0x100)
+            .unwrap();
+        assert_eq!(processor.psr.get_isr_number(), 12);
+        assert_eq!(processor.demcr & (1 << 17), 0, "taken");
+        assert_eq!(
+            processor.demcr & (1 << 16),
+            1 << 16,
+            "MON_EN is not touched"
+        );
+    }
+
+    // A return to Handler mode with only that exception active is not refused for the nesting
+    // (B1.5.8); a popped IPSR of zero is refused after the pop, and the pop is not undone.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_handler_return_with_a_zero_popped_ipsr_is_refused_after_the_pop() {
+        const FRAMEPTR: u32 = 0x2000_00e0;
+        let mut processor = Processor::new();
+        processor.set_msp(FRAMEPTR);
+        processor.write32(FRAMEPTR + 0x18, 0x0800_0001).unwrap();
+        processor.write32(FRAMEPTR + 0x1c, 1 << 24).unwrap();
+        set_active_exception(&mut processor, Exception::SysTick);
+
+        let result = processor.exception_return(EXC_RETURN_HANDLER);
+
+        assert_eq!(result, Err(Fault::InvPc));
+        assert_eq!(processor.get_r(Reg::LR), 0xF000_0000 + EXC_RETURN_HANDLER);
+        assert!(!processor.exception_active(Exception::SysTick));
+        assert_eq!(processor.get_msp(), FRAMEPTR + 0x20, "popped");
+    }
+
+    // A BKPT that halts into a debugger does not advance the IT state: the PC stays on it.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_bkpt_halting_into_a_debugger_does_not_advance_the_it_state() {
+        let mut processor = Processor::new();
+        processor.debugger_attached = true;
+        processor.set_pc(0x100);
+        processor.itstate = 0xe4;
+        processor.execute(&decode_16(0xbe00), 2);
+        assert!(processor.debug_halt);
+        assert_eq!(processor.get_pc(), 0x100);
+        assert_eq!(processor.itstate, 0xe4);
+    }
+
+    // The IT state an SVC stacks is the one after the SVC, as ReturnAddress() is the next
+    // instruction (the note to PushStack, B1.5.6, p. B1-533).
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_an_svc_in_an_it_block_stacks_the_it_state_after_it() {
+        for primask in [false, true] {
+            let mut processor = Processor::new();
+            processor.primask = primask; // true: escalated to HardFault
+            processor.set_msp(0x2000_0200);
+            processor.set_pc(0x100);
+            processor.itstate = 0xe4; // ITT AL
+            processor.execute(&decode_16(0xdf00), 2);
+            let frame = processor.get_msp();
+            let xpsr = processor.read32(frame + 0x1c).unwrap();
+            assert_eq!(processor.read32(frame + 0x18), Ok(0x102));
+            // 0xe8 is ITSTATE after one instruction of ITT AL
+            assert_eq!((xpsr >> 10) & 0x3f, 0xe8 >> 2, "primask {primask}");
+            assert_eq!((xpsr >> 25) & 0x3, 0xe8 & 0x3);
+        }
+    }
+
+    // B3.2 CCR: STKALIGN resets to a value that is IMPLEMENTATION DEFINED, Arm recommends 1.
+    #[test]
+    #[cfg(feature = "armv7em")]
+    fn test_ccr_resets_with_stkalign_set_on_armv7em() {
+        let mut processor = Processor::new();
+        assert_eq!(processor.ccr & (1 << 9), 1 << 9);
+        processor.ccr = 0;
+        processor.reset().unwrap();
+        assert_eq!(processor.ccr & (1 << 9), 1 << 9);
+    }
+
+    // ARMv6-M has no NONBASETHRDENA: the CCR does not store it.
+    #[test]
+    #[cfg(feature = "armv6m")]
+    fn test_ccr_does_not_store_nonbasethrdena_on_armv6m() {
+        let mut processor = Processor::new();
+        processor.write32(0xE000_ED14, 1).unwrap();
+        assert_eq!(processor.ccr & 1, 0);
     }
 }

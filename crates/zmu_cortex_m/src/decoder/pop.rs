@@ -24,6 +24,12 @@ pub fn decode_POP_reg_t1(opcode: u16) -> Instruction {
 pub fn decode_POP_t2(opcode: u32) -> Instruction {
     let regs = get_reglist((opcode & 0b1101_1111_1111_1111) as u16);
 
+    // A7.7.99 T2: fewer than two registers, or PC and LR together, is UNPREDICTABLE (one register
+    // is T3, LDR with post-indexing)
+    if regs.len() < 2 || (regs.contains(&Reg::PC) && regs.contains(&Reg::LR)) {
+        return super::decode_UDF_t2(opcode);
+    }
+
     Instruction::POP {
         registers: regs,
         thumb32: true,
@@ -33,6 +39,12 @@ pub fn decode_POP_t2(opcode: u32) -> Instruction {
 #[allow(non_snake_case)]
 pub fn decode_POP_t3(opcode: u32) -> Instruction {
     let reg = opcode.get_bits(12..16);
+
+    // A7.7.99 T3: SP is UNPREDICTABLE (PC is a branch)
+    if reg == 13 {
+        return super::decode_UDF_t2(opcode);
+    }
+
     let mut regs: EnumSet<Reg> = EnumSet::new();
 
     regs.insert(Reg::from(reg as u8));

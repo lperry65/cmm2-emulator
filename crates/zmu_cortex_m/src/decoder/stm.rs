@@ -7,7 +7,7 @@ use crate::core::register::Reg;
 #[allow(non_snake_case)]
 #[inline(always)]
 pub fn decode_STM_t1(opcode: u16) -> Instruction {
-    let regs = get_reglist(opcode & 0b111_1111);
+    let regs = get_reglist(opcode & 0b_1111_1111);
 
     Instruction::STM {
         params: LoadAndStoreMultipleParams {

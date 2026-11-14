@@ -14,8 +14,8 @@ fn test_decode_b() {
     // BNE.N
     match decode_16(0xd1f8) {
         Instruction::B_t13 { params, thumb32 } => {
-            assert!(params.cond == Condition::NE);
-            assert!(params.imm32 == -16);
+            assert_eq!(params.cond, Condition::NE);
+            assert_eq!(params.imm32, -16);
             assert!(!thumb32);
         }
         _ => {
@@ -25,7 +25,7 @@ fn test_decode_b() {
     // B.N (PC + 8)
     match decode_16(0xE004) {
         Instruction::B_t24 { imm32, thumb32 } => {
-            assert!(imm32 == (4 << 1));
+            assert_eq!(imm32, (4 << 1));
             assert!(!thumb32);
         }
         _ => {
@@ -39,10 +39,10 @@ fn test_decode_bic() {
     // BICS R2,R2,R0
     match decode_16(0x4382) {
         Instruction::BIC_reg { params, thumb32 } => {
-            assert!(params.rd == Reg::R2);
-            assert!(params.rn == Reg::R2);
-            assert!(params.rm == Reg::R0);
-            assert!(params.setflags == SetFlags::NotInITBlock);
+            assert_eq!(params.rd, Reg::R2);
+            assert_eq!(params.rn, Reg::R2);
+            assert_eq!(params.rm, Reg::R0);
+            assert_eq!(params.setflags, SetFlags::NotInITBlock);
             assert!(!thumb32);
             assert_eq!(params.shift_t, SRType::LSL);
             assert_eq!(params.shift_n, 0);

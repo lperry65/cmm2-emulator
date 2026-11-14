@@ -5,96 +5,96 @@ use crate::core::instruction::Reg2FullParams;
 // destination field in the opcode. Putting PC (0b1111) in that field is UNPREDICTABLE, and so
 // it decodes as undefined. The decoder must not hand the executor a plain register write to PC.
 const WRITES_A_REGISTER: &[(&str, u32, usize)] = &[
-    ("adc.w r1, r2, r3", 0xeb420103, 8),
-    ("adc r1, r2, #1", 0xf1420101, 8),
-    ("add.w r1, r2, #1", 0xf1020101, 8),
-    ("addw r1, r2, #1", 0xf2020101, 8),
-    ("and.w r1, r2, r3", 0xea020103, 8),
-    ("and r1, r2, #1", 0xf0020101, 8),
-    ("asr.w r1, r2, #3", 0xea4f01e2, 8),
-    ("asr.w r1, r2, r3", 0xfa42f103, 8),
-    ("bfc r1, #4, #4", 0xf36f1107, 8),
-    ("bfi r1, r2, #4, #4", 0xf3621107, 8),
-    ("bic.w r1, r2, r3", 0xea220103, 8),
-    ("bic r1, r2, #1", 0xf0220101, 8),
-    ("clz r1, r2", 0xfab2f182, 8),
-    ("eor.w r1, r2, r3", 0xea820103, 8),
-    ("eor r1, r2, #1", 0xf0820101, 8),
-    ("ldrb r1, [r2, #4]!", 0xf8121f04, 12),
-    ("ldrh r1, [r2, #4]!", 0xf8321f04, 12),
-    ("ldrsb r1, [r2, #4]!", 0xf9121f04, 12),
-    ("ldrsh r1, [r2, #4]!", 0xf9321f04, 12),
-    ("ldrd r1, r4, [r2, #8]", 0xe9d21402, 12),
-    ("ldrd r4, r1, [r2, #8]", 0xe9d24102, 8),
-    ("ldrex r1, [r2]", 0xe8521f00, 12),
-    ("ldrexb r1, [r2]", 0xe8d21f4f, 12),
-    ("ldrexh r1, [r2]", 0xe8d21f5f, 12),
-    ("lsl.w r1, r2, #3", 0xea4f01c2, 8),
-    ("lsl.w r1, r2, r3", 0xfa02f103, 8),
-    ("lsr.w r1, r2, #3", 0xea4f01d2, 8),
-    ("lsr.w r1, r2, r3", 0xfa22f103, 8),
-    ("ror.w r1, r2, #3", 0xea4f01f2, 8),
-    ("ror.w r1, r2, r3", 0xfa62f103, 8),
-    ("mla r1, r2, r3, r4", 0xfb024103, 8),
-    ("mls r1, r2, r3, r4", 0xfb024113, 8),
-    ("movt r1, #1234", 0xf2c041d2, 8),
-    ("mov.w r1, #0x12000", 0xf44f3190, 8),
-    ("movw r1, #0x1234", 0xf2412134, 8),
-    ("mrs r1, apsr", 0xf3ef8100, 8),
-    ("mvn r1, #1", 0xf06f0101, 8),
-    ("mvn.w r1, r2", 0xea6f0102, 8),
-    ("mul r1, r2, r3", 0xfb02f103, 8),
-    ("orn r1, r2, r3", 0xea620103, 8),
-    ("orn r1, r2, #1", 0xf0620101, 8),
-    ("orr.w r1, r2, r3", 0xea420103, 8),
-    ("orr r1, r2, #1", 0xf0420101, 8),
-    ("rbit r1, r2", 0xfa92f1a2, 8),
-    ("rev.w r1, r2", 0xfa92f182, 8),
-    ("rev16.w r1, r2", 0xfa92f192, 8),
-    ("revsh.w r1, r2", 0xfa92f1b2, 8),
-    ("rrx r1, r2", 0xea4f0132, 8),
-    ("rsb r1, r2, #1", 0xf1c20101, 8),
-    ("rsb r1, r2, r3", 0xebc20103, 8),
-    ("sbc r1, r2, #1", 0xf1620101, 8),
-    ("sbc.w r1, r2, r3", 0xeb620103, 8),
-    ("sbfx r1, r2, #4, #4", 0xf3421103, 8),
-    ("sdiv r1, r2, r3", 0xfb92f1f3, 8),
-    ("smlal r4, r1, r2, r3", 0xfbc24103, 8),
-    ("smlal r1, r4, r2, r3", 0xfbc21403, 12),
-    ("smull r4, r1, r2, r3", 0xfb824103, 8),
-    ("smull r1, r4, r2, r3", 0xfb821403, 12),
-    ("ssat r1, #8, r2", 0xf3020107, 8),
-    ("strex r1, r2, [r3]", 0xe8432100, 8),
-    ("strexb r1, r2, [r3]", 0xe8c32f41, 0),
-    ("strexh r1, r2, [r3]", 0xe8c32f51, 0),
-    ("sub.w r1, r2, #1", 0xf1a20101, 8),
-    ("subw r1, r2, #1", 0xf2a20101, 8),
-    ("sub.w r1, r2, r3", 0xeba20103, 8),
-    ("sxtb.w r1, r2", 0xfa4ff182, 8),
-    ("sxth.w r1, r2", 0xfa0ff182, 8),
-    ("ubfx r1, r2, #4, #4", 0xf3c21103, 8),
-    ("udiv r1, r2, r3", 0xfbb2f1f3, 8),
-    ("umlal r4, r1, r2, r3", 0xfbe24103, 8),
-    ("umlal r1, r4, r2, r3", 0xfbe21403, 12),
-    ("umull r4, r1, r2, r3", 0xfba24103, 8),
-    ("umull r1, r4, r2, r3", 0xfba21403, 12),
-    ("usat r1, #8, r2", 0xf3820108, 8),
-    ("uxtb.w r1, r2", 0xfa5ff182, 8),
-    ("uxth.w r1, r2", 0xfa1ff182, 8),
+    ("adc.w r1, r2, r3", 0xeb42_0103, 8),
+    ("adc r1, r2, #1", 0xf142_0101, 8),
+    ("add.w r1, r2, #1", 0xf102_0101, 8),
+    ("addw r1, r2, #1", 0xf202_0101, 8),
+    ("and.w r1, r2, r3", 0xea02_0103, 8),
+    ("and r1, r2, #1", 0xf002_0101, 8),
+    ("asr.w r1, r2, #3", 0xea4f_01e2, 8),
+    ("asr.w r1, r2, r3", 0xfa42_f103, 8),
+    ("bfc r1, #4, #4", 0xf36f_1107, 8),
+    ("bfi r1, r2, #4, #4", 0xf362_1107, 8),
+    ("bic.w r1, r2, r3", 0xea22_0103, 8),
+    ("bic r1, r2, #1", 0xf022_0101, 8),
+    ("clz r1, r2", 0xfab2_f182, 8),
+    ("eor.w r1, r2, r3", 0xea82_0103, 8),
+    ("eor r1, r2, #1", 0xf082_0101, 8),
+    ("ldrb r1, [r2, #4]!", 0xf812_1f04, 12),
+    ("ldrh r1, [r2, #4]!", 0xf832_1f04, 12),
+    ("ldrsb r1, [r2, #4]!", 0xf912_1f04, 12),
+    ("ldrsh r1, [r2, #4]!", 0xf932_1f04, 12),
+    ("ldrd r1, r4, [r2, #8]", 0xe9d2_1402, 12),
+    ("ldrd r4, r1, [r2, #8]", 0xe9d2_4102, 8),
+    ("ldrex r1, [r2]", 0xe852_1f00, 12),
+    ("ldrexb r1, [r2]", 0xe8d2_1f4f, 12),
+    ("ldrexh r1, [r2]", 0xe8d2_1f5f, 12),
+    ("lsl.w r1, r2, #3", 0xea4f_01c2, 8),
+    ("lsl.w r1, r2, r3", 0xfa02_f103, 8),
+    ("lsr.w r1, r2, #3", 0xea4f_01d2, 8),
+    ("lsr.w r1, r2, r3", 0xfa22_f103, 8),
+    ("ror.w r1, r2, #3", 0xea4f_01f2, 8),
+    ("ror.w r1, r2, r3", 0xfa62_f103, 8),
+    ("mla r1, r2, r3, r4", 0xfb02_4103, 8),
+    ("mls r1, r2, r3, r4", 0xfb02_4113, 8),
+    ("movt r1, #1234", 0xf2c0_41d2, 8),
+    ("mov.w r1, #0x12000", 0xf44f_3190, 8),
+    ("movw r1, #0x1234", 0xf241_2134, 8),
+    ("mrs r1, apsr", 0xf3ef_8100, 8),
+    ("mvn r1, #1", 0xf06f_0101, 8),
+    ("mvn.w r1, r2", 0xea6f_0102, 8),
+    ("mul r1, r2, r3", 0xfb02_f103, 8),
+    ("orn r1, r2, r3", 0xea62_0103, 8),
+    ("orn r1, r2, #1", 0xf062_0101, 8),
+    ("orr.w r1, r2, r3", 0xea42_0103, 8),
+    ("orr r1, r2, #1", 0xf042_0101, 8),
+    ("rbit r1, r2", 0xfa92_f1a2, 8),
+    ("rev.w r1, r2", 0xfa92_f182, 8),
+    ("rev16.w r1, r2", 0xfa92_f192, 8),
+    ("revsh.w r1, r2", 0xfa92_f1b2, 8),
+    ("rrx r1, r2", 0xea4f_0132, 8),
+    ("rsb r1, r2, #1", 0xf1c2_0101, 8),
+    ("rsb r1, r2, r3", 0xebc2_0103, 8),
+    ("sbc r1, r2, #1", 0xf162_0101, 8),
+    ("sbc.w r1, r2, r3", 0xeb62_0103, 8),
+    ("sbfx r1, r2, #4, #4", 0xf342_1103, 8),
+    ("sdiv r1, r2, r3", 0xfb92_f1f3, 8),
+    ("smlal r4, r1, r2, r3", 0xfbc2_4103, 8),
+    ("smlal r1, r4, r2, r3", 0xfbc2_1403, 12),
+    ("smull r4, r1, r2, r3", 0xfb82_4103, 8),
+    ("smull r1, r4, r2, r3", 0xfb82_1403, 12),
+    ("ssat r1, #8, r2", 0xf302_0107, 8),
+    ("strex r1, r2, [r3]", 0xe843_2100, 8),
+    ("strexb r1, r2, [r3]", 0xe8c3_2f41, 0),
+    ("strexh r1, r2, [r3]", 0xe8c3_2f51, 0),
+    ("sub.w r1, r2, #1", 0xf1a2_0101, 8),
+    ("subw r1, r2, #1", 0xf2a2_0101, 8),
+    ("sub.w r1, r2, r3", 0xeba2_0103, 8),
+    ("sxtb.w r1, r2", 0xfa4f_f182, 8),
+    ("sxth.w r1, r2", 0xfa0f_f182, 8),
+    ("ubfx r1, r2, #4, #4", 0xf3c2_1103, 8),
+    ("udiv r1, r2, r3", 0xfbb2_f1f3, 8),
+    ("umlal r4, r1, r2, r3", 0xfbe2_4103, 8),
+    ("umlal r1, r4, r2, r3", 0xfbe2_1403, 12),
+    ("umull r4, r1, r2, r3", 0xfba2_4103, 8),
+    ("umull r1, r4, r2, r3", 0xfba2_1403, 12),
+    ("usat r1, #8, r2", 0xf382_0108, 8),
+    ("uxtb.w r1, r2", 0xfa5f_f182, 8),
+    ("uxth.w r1, r2", 0xfa1f_f182, 8),
 ];
 
 // These are there only with the DSP extension, and are undefined without it.
 #[cfg(feature = "has-dsp-ext")]
 const DSP_WRITES_A_REGISTER: &[(&str, u32, usize)] = &[
-    ("pkhbt r1, r2, r3", 0xeac20103, 8),
-    ("smlabb r1, r2, r3, r4", 0xfb124103, 8),
-    ("smulbb r1, r2, r3", 0xfb12f103, 8),
-    ("sxtab r1, r2, r3", 0xfa42f183, 8),
-    ("sxtah r1, r2, r3", 0xfa02f183, 8),
-    ("uadd8 r1, r2, r3", 0xfa82f143, 8),
-    ("sel r1, r2, r3", 0xfaa2f183, 8),
-    ("uxtab r1, r2, r3", 0xfa52f183, 8),
-    ("uxtah r1, r2, r3", 0xfa12f183, 8),
+    ("pkhbt r1, r2, r3", 0xeac2_0103, 8),
+    ("smlabb r1, r2, r3, r4", 0xfb12_4103, 8),
+    ("smulbb r1, r2, r3", 0xfb12_f103, 8),
+    ("sxtab r1, r2, r3", 0xfa42_f183, 8),
+    ("sxtah r1, r2, r3", 0xfa02_f183, 8),
+    ("uadd8 r1, r2, r3", 0xfa82_f143, 8),
+    ("sel r1, r2, r3", 0xfaa2_f183, 8),
+    ("uxtab r1, r2, r3", 0xfa52_f183, 8),
+    ("uxtah r1, r2, r3", 0xfa12_f183, 8),
 ];
 
 fn is_udf(instruction: &Instruction) -> bool {
@@ -498,4 +498,149 @@ fn test_base_register_rules_decode_as_udf() {
     ] {
         assert!(!is_udf(&decode_32(opcode)), "{opcode:#010x}");
     }
+}
+
+// SP or PC as the offset register Rm of a register form (T2) is UNPREDICTABLE for every load and
+// store (A7.7.45 LDR, .48 LDRB, .57 LDRH, .61 LDRSB, .65 LDRSH, .162 STR, .164 STRB, .171 STRH).
+#[test]
+fn test_offset_register_of_sp_or_pc_decodes_as_udf() {
+    for opcode in [
+        0xf850_1002, // ldr.w r1, [r0, r2]
+        0xf810_1002, // ldrb.w
+        0xf830_1002, // ldrh.w
+        0xf910_1002, // ldrsb.w
+        0xf930_1002, // ldrsh.w
+        0xf840_1002, // str.w
+        0xf800_1002, // strb.w
+        0xf820_1002, // strh.w
+        0xf850_1012, // ldr.w r1, [r0, r2, lsl #1]
+        0xf840_1032, // str.w r1, [r0, r2, lsl #3]
+    ] {
+        assert!(!is_udf(&decode_32(opcode)), "{opcode:#010x} should decode");
+        for register in [13, 15] {
+            let patched = opcode & !0xf | register;
+            assert!(
+                is_udf(&decode_32(patched)),
+                "{patched:#010x} (Rm = {register})"
+            );
+        }
+    }
+}
+
+// PUSH T3 (STR Rt, [SP, #-4]!, A7.7.101) and POP T3 (LDR Rt, [SP], #4, A7.7.99) are UNPREDICTABLE
+// for Rt = SP, and PUSH also for Rt = PC; POP {PC} is a branch and is allowed.
+#[test]
+fn test_push_and_pop_of_one_register_forbid_sp() {
+    assert!(!is_udf(&decode_32(0xf84d_1d04))); // push {r1}
+    assert!(is_udf(&decode_32(0xf84d_dd04))); // push {sp}
+    assert!(is_udf(&decode_32(0xf84d_fd04))); // push {pc}
+    assert!(!is_udf(&decode_32(0xf85d_1b04))); // pop {r1}
+    assert!(is_udf(&decode_32(0xf85d_db04))); // pop {sp}
+    assert!(!is_udf(&decode_32(0xf85d_fb04))); // pop {pc}
+}
+
+// TBB and TBH: Rn = SP, and Rm = SP or PC, are UNPREDICTABLE (A7.7.185). Rn = PC is the usual form.
+#[test]
+fn test_table_branch_forbids_sp_as_base_and_sp_or_pc_as_index() {
+    for opcode in [0xe8df_f001, 0xe8d0_f001, 0xe8df_f011, 0xe8d0_f011] {
+        assert!(!is_udf(&decode_32(opcode)), "{opcode:#010x}");
+    }
+    for opcode in [
+        0xe8dd_f001, // tbb [sp, r1]
+        0xe8dd_f011, // tbh [sp, r1, lsl #1]
+        0xe8d0_f00d, // tbb [r0, sp]
+        0xe8d0_f00f, // tbb [r0, pc]
+        0xe8d0_f01d, // tbh [r0, sp, lsl #1]
+        0xe8d0_f01f, // tbh [r0, pc, lsl #1]
+    ] {
+        assert!(is_udf(&decode_32(opcode)), "{opcode:#010x}");
+    }
+}
+
+// The multiple-register forms (A7.7.41 LDM, .42 LDMDB, .99 POP, .101 PUSH, .159 STM, .160 STMDB):
+// the 32-bit forms need at least two registers (one register is the single-register LDR/STR),
+// Rn = PC is UNPREDICTABLE, LDM and POP may not list PC and LR together, and the 32-bit LDM, STM
+// and STMDB may not write back to a base that is in the list. The 16-bit forms need one register.
+#[test]
+fn test_register_lists_follow_the_manual() {
+    for opcode in [
+        0xe890_0006, // ldm.w r0, {r1, r2}
+        0xe8b0_0006, // ldm.w r0!, {r1, r2}
+        0xe890_8002, // ldm.w r0, {r1, pc}
+        0xe890_4002, // ldm.w r0, {r1, lr}
+        0xe880_0006, // stm.w r0, {r1, r2}
+        0xe8a0_0006, // stm.w r0!, {r1, r2}
+        0xe900_0006, // stmdb r0, {r1, r2}
+        0xe8bd_8006, // pop.w {r1, r2, pc}
+        0xe92d_4006, // push.w {r1, r2, lr}
+        0xe8bd_0006, // pop.w {r1, r2}
+    ] {
+        assert!(!is_udf(&decode_32(opcode)), "{opcode:#010x} should decode");
+    }
+    for opcode in [
+        0xe89f_0006, // ldm.w pc, {r1, r2}
+        0xe88f_0006, // stm.w pc, {r1, r2}
+        0xe8af_0006, // stm.w pc!, {r1, r2}
+        0xe90f_0006, // stmdb pc, {r1, r2}
+        0xe890_c002, // ldm.w r0, {r1, lr, pc}
+        0xe8bd_c002, // pop.w {r1, lr, pc}
+        0xe880_0002, // stm.w r0, {r1}
+        0xe900_0002, // stmdb r0, {r1}
+        0xe92d_0002, // push.w {r1} (T2)
+        0xe8bd_0002, // pop.w {r1} (T2)
+        0xe8a0_0003, // stm.w r0!, {r0, r1}
+        0xe920_0003, // stmdb r0!, {r0, r1}
+    ] {
+        assert!(is_udf(&decode_32(opcode)), "{opcode:#010x} should be UDF");
+    }
+    // the 16-bit forms with an empty list
+    for opcode in [0xb400, 0xbc00, 0xc000, 0xc800] {
+        assert!(is_udf_16(&decode_16(opcode)), "{opcode:#06x}");
+    }
+    for opcode in [0xb402, 0xbc02, 0xc002, 0xc802, 0xb500, 0xbd00] {
+        assert!(!is_udf_16(&decode_16(opcode)), "{opcode:#06x}");
+    }
+    // r7 is in the 8-bit register_list of the 16-bit forms (A7.7.159 T1, A7.7.41 T1, A7.7.99 T1,
+    // A7.7.101 T1)
+    for (opcode, rn) in [(0xc080_u16, Reg::R0), (0xc1f0, Reg::R1)] {
+        let Instruction::STM { params, .. } = decode_16(opcode) else {
+            panic!("{opcode:#06x} should be STM");
+        };
+        assert_eq!(params.rn, rn);
+        assert!(params.registers.contains(&Reg::R7), "{opcode:#06x}");
+    }
+    assert!(
+        matches!(decode_16(0xc8f0), Instruction::LDM { params, .. } if params.registers.contains(&Reg::R7))
+    );
+    assert!(
+        matches!(decode_16(0xb480), Instruction::PUSH { registers, .. } if registers.contains(&Reg::R7))
+    );
+    assert!(
+        matches!(decode_16(0xbc80), Instruction::POP { registers, .. } if registers.contains(&Reg::R7))
+    );
+    assert!(
+        matches!(decode_16(0xb5ff), Instruction::PUSH { registers, .. } if registers.len() == 9)
+    );
+    assert!(
+        matches!(decode_16(0xbdff), Instruction::POP { registers, .. } if registers.len() == 9)
+    );
+    // SP and PC cannot be in the list of the 32-bit STM and STMDB (A7.7.159, .160)
+    for opcode in [
+        0xe880_2002, // stm.w r0, {r1, sp}
+        0xe880_8002, // stm.w r0, {r1, pc}
+        0xe8a0_2002,
+        0xe8a0_8002,
+        0xe900_2002, // stmdb r0, {r1, sp}
+        0xe900_8002,
+        0xe920_2002,
+        0xe920_8002,
+    ] {
+        assert!(is_udf(&decode_32(opcode)), "{opcode:#010x}");
+    }
+    // a 16-bit STM with its base in the list is allowed
+    assert!(!is_udf_16(&decode_16(0xc001)));
+}
+
+fn is_udf_16(instruction: &Instruction) -> bool {
+    matches!(instruction, Instruction::UDF { thumb32: false, .. })
 }

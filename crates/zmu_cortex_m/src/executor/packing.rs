@@ -26,6 +26,8 @@ pub trait IsaPacking {
 impl Processor {
     // Rd = Rn + extend(Rm rotated), where `extend` takes the byte or halfword the instruction
     // names out of the rotated value and extends it to 32 bits.
+    // It cannot fail, but it returns what the executors that call it return.
+    #[allow(clippy::unnecessary_wraps)]
     fn extend_and_add(
         &mut self,
         params: &Reg3UsizeParams,

@@ -13,8 +13,7 @@ use crate::{FP_MVFR0_RESET, FP_MVFR1_RESET, FP_MVFR2_RESET};
 use crate::core::register::Ipsr;
 
 // Configuration Control Register bit positions
-#[allow(dead_code)]
-const CCR_NONBASETHRDENA: usize = 0;
+pub(crate) const CCR_NONBASETHRDENA: usize = 0;
 #[allow(dead_code)]
 const CCR_USERSETMPEND: usize = 1;
 #[allow(dead_code)]

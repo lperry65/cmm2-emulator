@@ -428,7 +428,12 @@ pub fn decode_32(opcode: u32) -> Instruction {
 
 /// Decode a 16-bit opcode.
 pub fn decode_16(opcode: u16) -> Instruction {
-    decode_16_table(opcode)
+    let instruction = decode_16_table(opcode);
+    if unpredictable::has_an_empty_register_list(&instruction) {
+        decode_undefined(opcode)
+    } else {
+        instruction
+    }
 }
 
 #[cfg(test)]

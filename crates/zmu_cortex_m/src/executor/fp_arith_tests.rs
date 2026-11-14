@@ -1,7 +1,7 @@
 //! The FPU's arithmetic against the host's own IEEE operations. The host rounds to nearest, and
 //! that is exact for add, subtract, multiply, divide, root and fused multiply-add, so it is the
 //! answer to compare with. For the directed roundings, and for the flags, the host's answer is
-//! used to find the sign of the error of the rounding (TwoSum for a sum, a fused multiply-add for
+//! used to find the sign of the error of the rounding (`TwoSum` for a sum, a fused multiply-add for
 //! the others), and that sign says which neighbour each direction picks and whether the result is
 //! inexact. Cases the host cannot be asked about are worked out by hand.
 
@@ -248,7 +248,7 @@ fn near<H: Host>(rng: &mut Rng, target: i64) -> u64 {
     type F<H> = <H as Host>::Fmt;
     let f = F::<H>::FRAC_BITS;
     let b = operand::<H>(rng);
-    if rng.next() % 2 == 0 {
+    if rng.next().is_multiple_of(2) {
         return b;
     }
     let max_exp = (1i64 << F::<H>::EXP_BITS) - 1;
@@ -286,7 +286,7 @@ fn nearest_flags<H: Host>(op: Op, a: H, b: H, r: H) -> Option<u32> {
 
 fn sweep<H: Host>(op: Op, iterations: u32) {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-    let bias = H::Fmt::BIAS as i64;
+    let bias = i64::from(H::Fmt::BIAS);
     for _ in 0..iterations {
         let a_bits = operand::<H>(&mut rng);
         let target = match op {
@@ -346,7 +346,7 @@ fn arithmetic_matches_the_host_and_its_error_sign_on_random_f32() {
 
 fn fma_sweep<H: Host>(iterations: u32) {
     let mut rng = Rng(0xD1B5_4A32_D192_ED03);
-    let bias = H::Fmt::BIAS as i64;
+    let bias = i64::from(H::Fmt::BIAS);
     for _ in 0..iterations {
         let a_bits = operand::<H>(&mut rng);
         let b_bits = near::<H>(&mut rng, bias);
@@ -930,6 +930,8 @@ fn convert<S: Host, D: Host>(fpscr: u32, bits: u64) -> (u64, u32) {
     (result.into(), raised)
 }
 
+// The host's exact answers are the ones compared.
+#[allow(clippy::float_cmp)]
 #[test]
 fn converting_a_double_to_a_single_rounds_like_the_host_and_flags_what_it_loses() {
     for &x in &F64_VALUES {
@@ -1014,6 +1016,7 @@ fn to_float<H: Host>(fpscr: u32, raw: u32, fraction_bits: usize, unsigned: bool)
     (result.into(), raised)
 }
 
+#[allow(clippy::float_cmp)]
 #[test]
 fn converting_an_integer_to_a_float_rounds_by_the_fpscr_mode() {
     let integers = [

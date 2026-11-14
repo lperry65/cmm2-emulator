@@ -37,10 +37,10 @@ fn test_decode_mul() {
     // MULS R4, R0, R4
     match decode_16(0x4344) {
         Instruction::MUL { params, thumb32 } => {
-            assert!(params.rd == Reg::R4);
-            assert!(params.rn == Reg::R0);
-            assert!(params.rm == Reg::R4);
-            assert!(params.setflags == SetFlags::NotInITBlock);
+            assert_eq!(params.rd, Reg::R4);
+            assert_eq!(params.rn, Reg::R0);
+            assert_eq!(params.rm, Reg::R4);
+            assert_eq!(params.setflags, SetFlags::NotInITBlock);
             assert!(!thumb32);
         }
         _ => {

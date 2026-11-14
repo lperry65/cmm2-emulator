@@ -29,7 +29,7 @@ fn test_decode_bx() {
     //BX LR
     match decode_16(0x4770) {
         Instruction::BX { rm } => {
-            assert!(rm == Reg::LR);
+            assert_eq!(rm, Reg::LR);
         }
         _ => {
             unreachable!();
@@ -38,7 +38,7 @@ fn test_decode_bx() {
     //BX R1
     match decode_16(0x4708) {
         Instruction::BX { rm } => {
-            assert!(rm == Reg::R1);
+            assert_eq!(rm, Reg::R1);
         }
         _ => {
             unreachable!();

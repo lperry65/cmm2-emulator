@@ -135,10 +135,10 @@ impl Processor {
     }
 
     fn preserve_fp_state(&mut self) -> Result<(), Fault> {
-        let acctype = if !self.fpccr.get_bit(FPCCR_USER) {
-            AccType::Normal
-        } else {
+        let acctype = if self.fpccr.get_bit(FPCCR_USER) {
             AccType::UnPriv
+        } else {
+            AccType::Normal
         };
 
         for i in 0..16 {
@@ -929,11 +929,11 @@ impl FloatingPointChecks for Processor {
                 Err(Fault::Nocp)
             }
             0b01 => {
-                if !self.current_mode_is_privileged() {
+                if self.current_mode_is_privileged() {
+                    Ok(())
+                } else {
                     self.cfsr.set_bit(19, true);
                     Err(Fault::Nocp)
-                } else {
-                    Ok(())
                 }
             }
             0b10 => {

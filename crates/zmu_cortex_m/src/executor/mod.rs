@@ -240,7 +240,10 @@ impl Processor {
             return 12;
         }
 
-        match self.enter_exception(exception, fault_pc, status.refused_return) {
+        // an escalated fault keeps the return address of the original (B1.5.6, p. B1-534)
+        let return_address = status.return_address.unwrap_or(fault_pc);
+
+        match self.enter_exception(exception, return_address, status.refused_return) {
             Ok(()) => {
                 if self.get_fault_trap_mode().should_trap(exception) {
                     self.queue_fault_trap(
@@ -876,7 +879,8 @@ impl Executor for Processor {
                 1
             }
             Ok(ExecuteSuccess::Branched { cycles }) => {
-                if in_it_block {
+                // a BKPT that halts into a debugger leaves the PC, and so the IT state, alone
+                if in_it_block && !self.debug_halt {
                     self.it_advance();
                 }
                 cycles
@@ -1594,5 +1598,29 @@ mod tests {
             resolve_addressing(1, 4, false, true),
             (u32::MAX - 2, u32::MAX - 2)
         );
+    }
+
+    // STM T1 (A7.7.159, p. A7-383) has an 8-bit register list: r4-r7 stores four words and writes
+    // the base back 16 higher.
+    #[test]
+    fn test_stm_t1_stores_r7_too() {
+        use crate::bus::Bus;
+        let mut processor = Processor::new();
+        for (n, reg) in [Reg::R4, Reg::R5, Reg::R6, Reg::R7].into_iter().enumerate() {
+            processor.set_r(reg, 0x100 + n as u32);
+        }
+        processor.set_r(Reg::R0, 0x2000_0100);
+        processor.set_pc(0x100);
+        // stmia r0!, {r4-r7}
+        processor.execute(&crate::decoder::decode_16(0xc0f0), 2);
+        assert_eq!(processor.get_r(Reg::R0), 0x2000_0110);
+        for n in 0..4_u32 {
+            assert_eq!(processor.read32(0x2000_0100 + 4 * n), Ok(0x100 + n));
+        }
+        // and ldmia reads four back
+        processor.set_r(Reg::R1, 0x2000_0100);
+        processor.execute(&crate::decoder::decode_16(0xc9f0), 2); // ldmia r1!, {r4-r7}
+        assert_eq!(processor.get_r(Reg::R1), 0x2000_0110);
+        assert_eq!(processor.get_r(Reg::R7), 0x103);
     }
 }

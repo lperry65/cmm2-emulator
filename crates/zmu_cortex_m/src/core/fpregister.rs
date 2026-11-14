@@ -17,7 +17,7 @@ pub enum FPSCRRounding {
     RoundTowardsZero,
 }
 
-/// The rounding modes of the pseudocode's FPRounding. The FPSCR names four of them; VRINTA and
+/// The rounding modes of the pseudocode's `FPRounding`. The FPSCR names four of them; VRINTA and
 /// VCVTA name the fifth, ties away from zero.
 #[derive(PartialEq, Debug, Copy, Clone)]
 pub enum FPRounding {

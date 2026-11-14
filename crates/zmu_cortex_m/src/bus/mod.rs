@@ -240,7 +240,12 @@ impl Bus for Processor {
                 }
             }
             0xE000_ED10 => self.write_scr(value),
-            0xE000_ED14 => self.ccr = value,
+            0xE000_ED14 => {
+                // ARMv6-M has no NONBASETHRDENA (bit 0)
+                #[cfg(feature = "armv6m")]
+                let value = value & !1;
+                self.ccr = value;
+            }
             0xE000_ED24 => self.write_shcsr(value),
             #[cfg(not(feature = "armv6m"))]
             0xE000_ED28 => self.write_cfsr(value),

@@ -20,9 +20,7 @@ pub trait Reset {
 impl Reset for Processor {
     fn reset(&mut self) -> Result<(), Fault> {
         // All basic registers to zero.
-        for r in &mut self.r0_12 {
-            *r = 0;
-        }
+        self.r0_12.fill(0);
 
         // Main stack pointer is read via vector table
         let vtor = self.vtor;
@@ -64,7 +62,8 @@ impl Reset for Processor {
         self.aircr = 0xFA05_0000;
         self.system_reset_requested = false;
         self.scr = 0;
-        self.ccr = 0;
+        // STKALIGN resets to an IMPLEMENTATION DEFINED value, Arm recommends 1 (B3.2, p. B3-605)
+        self.ccr = if cfg!(feature = "armv7em") { 1 << 9 } else { 0 };
         self.dwt_ctrl = 0x4000_0000;
         self.exceptions_reset();
         self.reset_scb_fault_state();
@@ -213,7 +212,10 @@ mod tests {
         assert_eq!(processor.read32(0xE000_ED18), Ok(0));
         assert_eq!(processor.read32(0xE000_ED24), Ok(0));
         assert_eq!(processor.read32(0xE000_ED10), Ok(0));
-        assert_eq!(processor.read32(0xE000_ED14), Ok(0));
+        assert_eq!(
+            processor.read32(0xE000_ED14),
+            Ok(if cfg!(feature = "armv7em") { 1 << 9 } else { 0 })
+        );
         #[cfg(feature = "has-fp")]
         assert_eq!(processor.read32(0xE000_ED88), Ok(0));
         assert_eq!(processor.read32(0xE000_1000), Ok(0x4000_0000));

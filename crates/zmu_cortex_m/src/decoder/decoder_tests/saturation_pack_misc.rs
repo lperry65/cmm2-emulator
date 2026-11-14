@@ -175,8 +175,8 @@ fn test_decode_extend_and_add() {
     for (opcode, name, rd, rn, rm, rotation) in cases {
         let params = Reg3UsizeParams {
             rd,
-            rn,
             rm,
+            rn,
             rotation,
         };
         let expected = match name {
@@ -278,10 +278,10 @@ fn test_decode_uxtb() {
     // UXTB R1,R1
     match decode_16(0xb2c9) {
         Instruction::UXTB { params, thumb32 } => {
-            assert!(params.rd == Reg::R1);
-            assert!(params.rm == Reg::R1);
+            assert_eq!(params.rd, Reg::R1);
+            assert_eq!(params.rm, Reg::R1);
             assert!(!thumb32);
-            assert!(params.rotation == 0);
+            assert_eq!(params.rotation, 0);
         }
         _ => {
             unreachable!();

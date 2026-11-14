@@ -40,15 +40,15 @@ impl IsaStatusRegister for Processor {
                         value.set_bits(24..27, 0);
                         value.set_bits(10..16, 0);
                     }
-                    if !params.sysm.get_bit(2) {
-                        // NZCVQ flags; with DSP extension also include GE[3:0].
-                        value.set_bits(27..32, self.psr.value.get_bits(27..32));
-                        #[cfg(feature = "has-dsp-ext")]
-                        value.set_bits(16..20, self.psr.value.get_bits(16..20));
-                    } else {
+                    if params.sysm.get_bit(2) {
                         // GE-only reads (e.g. APSR_g, SYSm bit 2 = 1).
                         // Meaningful only with the DSP extension; without DSP
                         // the GE field does not exist and reads as zero (default).
+                        #[cfg(feature = "has-dsp-ext")]
+                        value.set_bits(16..20, self.psr.value.get_bits(16..20));
+                    } else {
+                        // NZCVQ flags; with DSP extension also include GE[3:0].
+                        value.set_bits(27..32, self.psr.value.get_bits(27..32));
                         #[cfg(feature = "has-dsp-ext")]
                         value.set_bits(16..20, self.psr.value.get_bits(16..20));
                     }
@@ -177,18 +177,16 @@ impl IsaStatusRegister for Processor {
                             self.execution_priority = self.get_execution_priority();
                         }
                     }
-                    0b100 => {
-                        if self.current_mode_is_privileged() {
-                            //CONTROL
-                            self.control.n_priv = r_n.get_bit(0);
-                            if self.mode == ProcessorMode::ThreadMode {
-                                self.control.sp_sel = r_n.get_bit(1);
-                            }
-                            // if have_fp, set control.fpca to r[n]<2>
-                            #[cfg(feature = "has-fp")]
-                            {
-                                self.control.fpca = r_n.get_bit(2);
-                            }
+                    0b100 if self.current_mode_is_privileged() => {
+                        //CONTROL
+                        self.control.n_priv = r_n.get_bit(0);
+                        if self.mode == ProcessorMode::ThreadMode {
+                            self.control.sp_sel = r_n.get_bit(1);
+                        }
+                        // if have_fp, set control.fpca to r[n]<2>
+                        #[cfg(feature = "has-fp")]
+                        {
+                            self.control.fpca = r_n.get_bit(2);
                         }
                     }
                     _ => (),

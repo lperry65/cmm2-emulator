@@ -133,7 +133,7 @@ impl GdbServer {
                     );
                 } else if e.is_connection_error() {
                     let (e, kind) = e.into_connection_error().unwrap();
-                    println!("connection error: {kind:?} - {e}",);
+                    println!("connection error: {kind:?} - {e}");
                 } else {
                     println!("gdbstub encountered a fatal error: {e}");
                 }
@@ -165,7 +165,7 @@ impl run_blocking::BlockingEventLoop for EventLoop {
             // gdbstub takes ownership of the underlying connection, so the `borrow_conn`
             // method is used to borrow the underlying connection back from the stub to
             // check for incoming data.
-            conn.peek().map(|b| b.is_some()).unwrap_or(true)
+            conn.peek().map_or(true, |b| b.is_some())
         };
 
         match target.run(poll_incoming_data) {

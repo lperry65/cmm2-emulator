@@ -71,17 +71,43 @@ pub(super) fn uses_a_register_the_manual_forbids(instruction: &Instruction) -> b
         Instruction::LDRB_reg { params, .. }
         | Instruction::LDRH_reg { params, .. }
         | Instruction::LDRSB_reg { params, .. }
-        | Instruction::LDRSH_reg { params, .. } => params.rt == Reg::SP,
+        | Instruction::LDRSH_reg { params, .. } => params.rt == Reg::SP || is_bad(params.rm),
+        Instruction::LDR_reg { params, .. } => is_bad(params.rm),
         Instruction::STRB_imm { params, .. } | Instruction::STRH_imm { params, .. } => {
             is_bad(params.rt) || is_pc(params.rn) || clashes(params)
         }
         Instruction::STRB_reg { params, .. } | Instruction::STRH_reg { params, .. } => {
-            is_bad(params.rt) || is_pc(params.rn)
+            is_bad(params.rt) || is_bad(params.rm) || is_pc(params.rn)
         }
         Instruction::STR_imm { params, .. } => {
             is_pc(params.rt) || is_pc(params.rn) || clashes(params)
         }
-        Instruction::STR_reg { params, .. } => is_pc(params.rt) || is_pc(params.rn),
+        Instruction::STR_reg { params, .. } => {
+            is_pc(params.rt) || is_bad(params.rm) || is_pc(params.rn)
+        }
+        // A7.7.185: Rn = SP, and Rm = SP or PC, are UNPREDICTABLE; Rn = PC is the usual form.
+        Instruction::TBB { params } | Instruction::TBH { params } => {
+            params.rn == Reg::SP || is_bad(params.rm)
+        }
+        // The 32-bit multiple-register forms (A7.7.41, .159, .160). A list of one register is
+        // another instruction's encoding, and the 16-bit forms are checked by
+        // `has_an_empty_register_list`.
+        Instruction::LDM {
+            params,
+            thumb32: true,
+        } => {
+            is_pc(params.rn)
+                || (params.registers.contains(&Reg::PC) && params.registers.contains(&Reg::LR))
+        }
+        Instruction::STM {
+            params,
+            thumb32: true,
+        }
+        | Instruction::STMDB { params } => {
+            is_pc(params.rn)
+                || params.registers.len() < 2
+                || (params.wback && params.registers.contains(&params.rn))
+        }
         Instruction::LDRD_imm { params } => {
             is_bad(params.rt)
                 || is_bad(params.rt2)
@@ -220,6 +246,30 @@ pub(super) fn writes_pc_as_plain_register(instruction: &Instruction) -> bool {
         | Instruction::STM { params, .. }
         | Instruction::STMDB { params } => params.wback && is_pc(params.rn),
 
+        _ => false,
+    }
+}
+
+/// The 16-bit PUSH, POP, LDM and STM with no register in the list are UNPREDICTABLE (A7.7.99,
+/// .101, .41 and .159, encoding T1 of each).
+pub(super) fn has_an_empty_register_list(instruction: &Instruction) -> bool {
+    match instruction {
+        Instruction::PUSH {
+            registers,
+            thumb32: false,
+        }
+        | Instruction::POP {
+            registers,
+            thumb32: false,
+        } => registers.is_empty(),
+        Instruction::LDM {
+            params,
+            thumb32: false,
+        }
+        | Instruction::STM {
+            params,
+            thumb32: false,
+        } => params.registers.is_empty(),
         _ => false,
     }
 }

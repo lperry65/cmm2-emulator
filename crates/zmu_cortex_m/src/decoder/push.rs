@@ -23,6 +23,11 @@ pub fn decode_PUSH_t1(opcode: u16) -> Instruction {
 pub fn decode_PUSH_t2(opcode: u32) -> Instruction {
     let regs = get_reglist((opcode & 0b0101_1111_1111_1111) as u16);
 
+    // A7.7.101 T2: fewer than two registers is UNPREDICTABLE (one is T3, STR with write back)
+    if regs.len() < 2 {
+        return super::decode_UDF_t2(opcode);
+    }
+
     Instruction::PUSH {
         registers: regs,
         thumb32: true,
@@ -32,6 +37,11 @@ pub fn decode_PUSH_t2(opcode: u32) -> Instruction {
 #[allow(non_snake_case)]
 pub fn decode_PUSH_t3(opcode: u32) -> Instruction {
     let rt = opcode.get_bits(12..16);
+
+    // A7.7.101 T3: SP and PC are UNPREDICTABLE
+    if rt == 13 || rt == 15 {
+        return super::decode_UDF_t2(opcode);
+    }
 
     let mut regs: EnumSet<Reg> = EnumSet::new();
 

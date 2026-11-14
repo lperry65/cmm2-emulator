@@ -80,6 +80,7 @@ impl Simulation {
         processor.flash_memory(flash_size, code);
         processor.cache_instructions();
         processor.running = true;
+        processor.debugger_attached = true;
         match processor.reset() {
             Ok(()) => {}
             Err(fault) => {
@@ -98,7 +99,8 @@ impl Simulation {
     }
 
     /// Wrap a processor the caller has already built and reset.
-    pub fn from_processor(processor: Processor) -> Simulation {
+    pub fn from_processor(mut processor: Processor) -> Simulation {
+        processor.debugger_attached = true;
         Simulation {
             processor,
             exec_mode: SimulationExecMode::Step,
@@ -183,6 +185,10 @@ impl Simulation {
         if let Some(context) = self.processor.take_pending_fault_trap() {
             return SimulationEvent::FaultTrap(context);
         }
+        // a BKPT in the guest halts into the debugger
+        if std::mem::take(&mut self.processor.debug_halt) {
+            return SimulationEvent::Break;
+        }
         if self.breakpoints.contains(&self.processor.get_pc()) {
             return SimulationEvent::Break;
         }
@@ -205,4 +211,45 @@ pub enum SimulationRunEvent {
     IncomingData,
     /// A simulation event
     Event(SimulationEvent),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::register::Ipsr;
+
+    // vector table (SP, reset), then `bkpt #0`, `nop`, `bkpt #0xab`
+    fn simulation_with_a_bkpt() -> Simulation {
+        let mut code = Vec::new();
+        code.extend_from_slice(&0x2000_0100_u32.to_le_bytes());
+        code.extend_from_slice(&0x0000_0009_u32.to_le_bytes());
+        code.extend_from_slice(&[0x00, 0xbe, 0x00, 0xbf]);
+        let mut processor = Processor::new();
+        processor.flash_memory(code.len(), &code);
+        processor.cache_instructions();
+        processor.running = true;
+        processor.reset().unwrap();
+        Simulation::from_processor(processor)
+    }
+
+    // C1.5: with a debugger attached (Halting debug) a BKPT halts into the debugger instead of
+    // being a HardFault; the debugger sees a breakpoint stop and DFSR.BKPT is set. As on silicon
+    // the PC stays on the BKPT, so a continue or a step hits it again until the debugger moves the
+    // PC (GDB does, for a compiled-in breakpoint: `set $pc += 2`).
+    #[test]
+    fn test_a_bkpt_in_guest_code_halts_into_the_debugger_with_the_pc_on_it() {
+        let mut simulation = simulation_with_a_bkpt();
+
+        assert!(matches!(simulation.step(), SimulationEvent::Break));
+        assert_eq!(simulation.processor.dfsr & (1 << 1), 1 << 1);
+        assert_eq!(simulation.processor.psr.get_isr_number(), 0, "no HardFault");
+        assert_eq!(simulation.processor.get_pc(), 0x08, "the PC is on the BKPT");
+        // nothing moves it: the same BKPT halts again
+        assert!(matches!(simulation.step(), SimulationEvent::Break));
+        assert_eq!(simulation.processor.get_pc(), 0x08);
+        // the debugger writes the PC past it, and execution goes on
+        simulation.processor.set_pc(0x0a);
+        assert!(matches!(simulation.step(), SimulationEvent::DoneStep));
+        assert_eq!(simulation.processor.get_pc(), 0x0c);
+    }
 }

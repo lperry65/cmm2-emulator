@@ -1894,9 +1894,9 @@ mod tests {
     fn host_to_fixed(x: f64, size: u8, fraction_bits: u8, unsigned: bool) -> u64 {
         let scaled = (x * 2f64.powi(i32::from(fraction_bits))).trunc();
         match (size, unsigned) {
-            (16, false) => scaled as i16 as i64 as u64,
+            (16, false) => i64::from(scaled as i16) as u64,
             (16, true) => u64::from(scaled as u16),
-            (_, false) => scaled as i32 as i64 as u64,
+            (_, false) => i64::from(scaled as i32) as u64,
             (_, true) => u64::from(scaled as u32),
         }
     }

@@ -48,7 +48,7 @@ fn assert_udf_32(opcode: u32) {
 /// Decodes every halfword offset of a firmware image and writes one line each, to compare what a
 /// change to the decoder alters. `ZMU_DUMP_IMAGE` is the image, `ZMU_DUMP_OUT` the file to write.
 #[test]
-#[ignore]
+#[ignore = "run by hand: needs ZMU_DUMP_IMAGE and ZMU_DUMP_OUT"]
 fn dump_the_decode_of_an_image() {
     use std::io::Write;
     let (Ok(image), Ok(out)) = (

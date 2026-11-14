@@ -80,7 +80,8 @@ The firmware needs a few things zmu does not do, so I changed the following.
   and 15) are reserved and read as zero, so every write goes through `Processor::write_fpscr`, and
   exception return restores the FPSCR through it. A trap enable restored from a stack frame used to
   reach a `todo!()` in the FP exception code; that branch is gone and the cumulative flag is always
-  set. I took the mask from my memory of the ARMv7-M manual's FPSCR layout, not from a copy of it.
+  set. Checked against DDI0403E.e A2.5.3 (pp. A2-37, A2-38): bits 31:28, 26:22, 7 and 4:0 are the
+  defined ones, bits 27, 21:8 and 6:5 are reserved, which gives `0xf7c0_009f`; it was right.
 - VMSR (write the FPSCR from a core register) was decoded as undefined; it runs now. VMRS with
   Rt = SP is undefined, and a VMRS in an IT block whose condition fails reports not taken.
 - The three VMOV forms that stopped the host with `unimplemented!()` run now: two core registers
@@ -124,21 +125,46 @@ The firmware needs a few things zmu does not do, so I changed the following.
     refused. That IPSR is never made the current one (so it never holds an exception that does not
     exist, and handing the same EXC_RETURN back is refused again), and what the refused return
     gives the entry travels with the fault, so a lockup or a reset leaves nothing behind. Whether
-    the core locks up is decided from the execution priority, not from an IPSR.
-    This is all from memory of DDI0403, not from a copy of it, and it may differ from the manual in
-    two places that need checking against it. (1) After the pop, my memory has LR =
-    '1111':EXC_RETURN set before ExceptionTaken, so that the new frame stacks it and the handler
-    gets the new entry's EXC_RETURN; the reviewers remember PushStack undoing the PopStack and LR
-    set afterwards, which is what is implemented. (2) Before the pop (EXC_RETURN invalid, or the
-    nesting wrong) I do DeActivate, set LR = '1111':EXC_RETURN and enter the UsageFault with that
-    LR stacked; a reviewer remembers no PushStack there, about 65% sure. That order is unchanged
-    for now. The exceptions the core lacks have no state: the registers that name them read as
-    zero and ignore writes.
+    the core locks up is decided from the execution priority, not from an IPSR. The exceptions the
+    core lacks have no state: the registers that name them read as zero and ignore writes.
+    Checked against ExceptionReturn() in DDI0403E.e B1.5.8 (p. B1-541), PopStack() and DeActivate()
+    (p. B1-542), PushStack() and ExceptionTaken() in B1.5.6 (pp. B1-532, B1-533). What was wrong or
+    missing, and is changed:
+    - A return refused before the pop (the handler is not active, EXC_RETURN is not one of 0x1,
+      0x9, 0xd in its low nibble, or a Thread return with other exceptions active) enters the
+      fault with no PushStack: the stack pointer is unchanged and nothing is stacked, and LR =
+      '1111':EXC_RETURN. I used to push a frame there. The reviewer was right.
+    - After the pop, a bad IPSR is a PushStack to negate the PopStack, then LR = '1111':EXC_RETURN
+      and ExceptionTaken, so the handler's LR is the refused EXC_RETURN and the frame holds the
+      popped registers and xPSR. That is what was implemented; my other recollection (LR set before
+      ExceptionTaken, so that the frame stacks it) was wrong.
+    - A return to Handler mode has no nesting check in the manual (only Thread mode does:
+      `NestedActivation != 1 && CCR.NONBASETHRDENA == '0'`). I refused it when only one exception
+      was active; now the popped IPSR is the only check (zero is refused, after the pop). On
+      silicon this case may be refused anyway, but the pseudocode does not say so.
+    - CCR.NONBASETHRDENA (bit 0, which the CCR already stored) is honoured: it allows the Thread
+      return with other exceptions active. ARMv6-M has no such bit, so on an armv6m build the CCR
+      does not store it and it is never honoured.
+    - ExceptionTaken() clears EPSR.IT (p. B1-533); only PushStack did, so a return refused before
+      the pop (no frame) left the IT state live in the fault handler. It is cleared on entry now.
+    - PushStack stacks `frameptralign = SP<2> AND forcealign` for the main stack as well; I had
+      left out the AND for MSP, so with CCR.STKALIGN clear bit 9 of the stacked xPSR could be set.
+    - Kept, and not in the manual: an IPSR above interrupt 239, Reset (1) or a reserved number
+      (7-10, 13) in the popped xPSR for a return to Handler mode is refused as INVPC, because the
+      core has no state for such an exception. The manual lets any value through. The INVSTATE check
+      (EPSR.T = 0) is made at the return, where the manual makes it when the next instruction
+      executes. Sleep-on-exit tests the nesting after DeActivate (the manual's text tests
+      NestedActivation, counted before it, against 0, which can never be true).
   - A synchronous fault is taken as itself when it is enabled and its priority is higher than the
-    execution priority (so PRIMASK, BASEPRI and FAULTMASK count, as the manual's
-    ExecutionPriority() has them, as I remember it), and is otherwise escalated to HardFault. A
-    HardFault at an execution priority below 0 (HardFault or NMI running, or FAULTMASK) is a
-    lockup. It used to be escalated only when disabled, and a lockup only when the IPSR said
+    execution priority (so PRIMASK, BASEPRI and FAULTMASK count), and is otherwise escalated to
+    HardFault. A HardFault at an execution priority below 0 (HardFault or NMI running, or
+    FAULTMASK) is a lockup. Checked against ExecutionPriority() (DDI0403E.e B1.5.4, pp. B1-528,
+    B1-529: PRIGROUP applied to the active exceptions and to BASEPRI, PRIMASK 0, FAULTMASK -1),
+    Priority escalation (p. B1-529: a synchronous fault or SVC whose group priority is not higher
+    than the execution priority, or a disabled configurable fault) and B1.5.15 (pp. B1-555,
+    B1-556: lockup is a fault at a priority below 0, HardFault, NMI or FAULTMASK); the code agrees
+    with them. A priority that is not a group priority compares the same, since the execution
+    priority is always a multiple of the group size. It used to be escalated only when disabled, and a lockup only when the IPSR said
     HardFault or NMI. The exception reported as running is the one in the IPSR when it is active,
     and otherwise the active one of the highest group priority, the lower number among equals.
   - `decode_imm_shift` reads the two type bits (it read three and had a `todo!()`); no decoder
@@ -205,18 +231,74 @@ The firmware needs a few things zmu does not do, so I changed the following.
   of them at once, which is asserted after it. (SBFX was in the table twice.)
 - SVC is taken as SVCall only when SVCall can preempt (its priority is higher than the execution
   priority, so PRIMASK, BASEPRI, FAULTMASK and a running handler count); otherwise it is a forced
-  HardFault, and a lockup below priority 0. BKPT with no semihosting host is a debug event, as I
-  remember the manual: DFSR.BKPT is set, the DebugMonitor is taken if DEMCR.MON_EN is set and it
-  can preempt, and otherwise it is a HardFault with HFSR.DEBUGEVT. BKPT #0xab with no host is the
-  same. A stacking failure on the entry of an exception is a lockup by the same rule as a fault
-  (execution priority below 0), not by the IPSR. The xPSR that a refused return stacks holds only
-  the fields the xPSR has (reserved bits 23:20, and GE without the DSP extension, are zero).
+  HardFault, and a lockup below priority 0 (B1.5.4 Priority escalation, p. B1-529, whose example is
+  an SVC with PRIMASK set). An SVC escalated to HardFault keeps the return address of SVCall, the
+  next instruction (ReturnAddress(), p. B1-534: "a fault that is escalated ... retains the
+  ReturnAddress() value of the original fault"; the note is repeated at p. B1-529); I stacked the
+  SVC itself. The IT state an SVC stacks (escalated or not) is the one after the SVC, to match
+  that return address (the note to PushStack, p. B1-533); it was the state before. BKPT with no
+  semihosting host is a debug event (C1.5, p. C1-694; B1.5.14, HardFault on breakpoint
+  escalation): DFSR.BKPT is set, the DebugMonitor is taken if DEMCR.MON_EN is set and its group
+  priority is higher than the execution priority, and the event sets DEMCR.MON_PEND, which stays set until
+  the exception is taken or a write clears it (C1-693), so it reads 0 after the BKPT has entered
+  the DebugMonitor, and taking the DebugMonitor clears it (I did not touch it); otherwise it is a HardFault with HFSR.DEBUGEVT, a lockup below priority 0. The return
+  address is the BKPT itself for both (ReturnAddress(), synchronous). DFSR bits are set when the event halts or
+  generates an exception (C1-694), so DFSR.BKPT is set on the HardFault path too; only whether
+  they are set for an event that is ignored or causes lockup is IMPLEMENTATION DEFINED. BKPT #0xab with no host is the same.
+  ARMv6-M has no DebugMonitor (exception 12) and no DEMCR, but the core stores every bit of DEMCR,
+  so on an armv6m build BKPT never enters exception 12 now. With a GDB server attached, a BKPT
+  (not #0xab when a semihosting function is installed, which it is for the servers built by
+  `GdbServer::new`; with none, #0xab halts too) halts into the debugger: the simulation reports a breakpoint
+  stop and DFSR.BKPT is set, and the PC stays on the BKPT, as it does when silicon halts in Debug
+  state. A plain continue or step from there hits the same BKPT again, as it does on hardware;
+  the debugger has to move the PC past it (GDB's `set $pc += 2`, which the server supports as a
+  register write), and then continue and step go on. A BKPT that halts does not advance the IT
+  state, as it does not move the PC. It used to be a HardFault under the server. A stacking failure on the
+  entry of an exception is a lockup by the same rule as a fault (execution priority below 0), not
+  by the IPSR. The xPSR that a refused return stacks holds only the fields the xPSR has (reserved
+  bits 23:20, and GE without the DSP extension, are zero).
+- CCR.STKALIGN (B3.2, p. B3-605; B1.5.7, p. B1-535): whether the bit is RW or RO (RAO) and its reset
+  value are IMPLEMENTATION DEFINED, and Arm recommends a reset of 1. On the armv7em build (the
+  Cortex-M7) the CCR now resets with STKALIGN = 1; it stays writable. That the real M7 resets it
+  to 1 (and whether it is RW or RAO) is from my memory of the Cortex-M7 TRM, which I do not have:
+  unverified. Other builds still reset the CCR to 0.
+- The 16-bit STM decoded only seven bits of its register list (`0b111_1111`), dropping r7 from
+  every `stmia Rn!, {..., r7}` (`{r4-r7}` stored three words and wrote back 12). A7.7.159 T1 (p.
+  A7-383) has an 8-bit list; fixed. The other list decoders (LDM T1, PUSH T1 with LR, POP T1 with
+  PC, the 32-bit forms) were checked and are right. STM.W and STMDB cannot have SP or PC in the
+  list (the decode patterns have 0 in bits 15 and 13).
+- VCVT between floating-point and fixed-point: checked against A7.7.229 (p. A7-463, A7-464) and
+  FixedToFP() (A2.5, FP conversions, pp. A2-58, A2-59): fixed to float rounds to nearest whatever
+  the FPSCR says (`round_nearest = TRUE`), float to fixed rounds towards zero; the integer VCVT
+  (A7.7.228) rounds by the FPSCR for integer to float (`round_nearest = FALSE`) and towards zero
+  unless R is given. The code did that already.
+- Checked against the encoding diagrams and decode pseudocode, per row of `decoder/unpredictable.rs`
+  (LDR A7.7.43 and .45, LDRB .46 to .48, LDRD .50 and .51, LDREX* .52 to .54, LDRH .55 to .57,
+  LDRSB .59 to .61, LDRSH .63 to .65, STR .161 and .162, STRB .163 and .164, STRD .166, STREX* .167
+  to .169, STRH .170 and .171, pp. A7-246 to A7-399): the rows I had were right, and these were
+  missing and are now undefined (UNPREDICTABLE in the manual): SP or PC as the offset register Rm
+  of the register forms of LDR, LDRB, LDRH, LDRSB, LDRSH, STR, STRB and STRH; PUSH of a single
+  register Rt = SP or PC and POP of Rt = SP (A7.7.101 T3, A7.7.99 T3; POP {PC} stays a branch);
+  TBB and TBH with Rn = SP, or Rm = SP or PC (A7.7.185, p. A7-416; Rn = PC is the usual form); the
+  32-bit PUSH and POP of fewer than two registers (T2) and POP of PC and LR together; LDM and POP
+  with PC and LR together, LDM, STM and STMDB with Rn = PC, STM and STMDB with fewer than two
+  registers, and STM and STMDB with write back and the base in the list (A7.7.41, .99, .101, .159,
+  .160, pp. A7-242, A7-319, A7-322, A7-383, A7-385); and the 16-bit PUSH, POP, LDM and STM with an
+  empty list. The manual makes SP as a destination UNPREDICTABLE for many data-processing encodings
+  too (for example UXTB.W, MUL); those still execute as a write to SP, which cannot hurt the host.
+  The UNPREDICTABLE conditions that depend on the IT state (PC in a load or POP outside the last
+  instruction of an IT block, TBB in an IT block) are not checked. LDMDB is still decoded as
+  undefined, as upstream has it.
 - GDB: `GdbServer`, `ZmuTarget` and `Simulation` can be built from a processor that has already
-  been set up and reset (`from_processor`).
+  been set up and reset (`from_processor`). Both mark the processor as having a debugger attached.
 - IT state: the IF-THEN state is now saved in the stacked xPSR on exception entry and restored on
   return. It was dropped, so an interrupt inside an IT block corrupted the handler.
 - Default features: `default` is now `["armv7em", "fpv5-d16"]`, the Cortex-M7 with the
   double-precision FPU. All other features are unchanged.
+
+`cargo clippy -p zmu_cortex_m --all-targets -- -D warnings` is clean (the crate denies
+`clippy::pedantic`; the test code had unseparated long literals, `assert!` with `==`, and a few
+casts).
 
 I also added tests for these changes and updated the one upstream test that expected a fault on a
 store to flash.

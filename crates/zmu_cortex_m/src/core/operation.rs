@@ -388,33 +388,33 @@ mod tests {
     fn test_shift_c() {
         {
             let (result, carry) = shift_c(0xFFFF_FFF8, SRType::ASR, 8, false);
-            assert!(result == 0xFFFF_FFFF);
+            assert_eq!(result, 0xFFFF_FFFF);
             assert!(carry);
         }
         {
             let (result, carry) = shift_c(0xef, SRType::ASR, 9, false);
-            assert!(result == 0);
+            assert_eq!(result, 0);
             assert!(!carry);
         }
         {
             let (result, carry) = shift_c(0xFFF_FFFC0, SRType::ASR, 1, false);
-            assert!(result == 0xFFFF_FFE0);
+            assert_eq!(result, 0xFFFF_FFE0);
             assert!(!carry);
         }
 
         {
             let (result, carry) = shift_c(0, SRType::ROR, 0, false);
-            assert!(result == 0x0);
+            assert_eq!(result, 0x0);
             assert!(!carry);
         }
         {
             let (result, carry) = shift_c(2, SRType::ROR, 1, false);
-            assert!(result == 0x1);
+            assert_eq!(result, 0x1);
             assert!(!carry);
         }
         {
             let (result, carry) = shift_c(1, SRType::ROR, 1, false);
-            assert!(result == 0x8000_0000);
+            assert_eq!(result, 0x8000_0000);
             assert!(carry);
         }
         {

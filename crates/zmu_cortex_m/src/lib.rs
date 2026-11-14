@@ -144,6 +144,10 @@ pub struct Processor {
     /// bit 1 : 1= processor sleeping, 0 : processor awake
     pub running: bool,
     pub sleeping: bool,
+    /// A debugger is attached with Halting debug on (the GDB server): a BKPT halts into it.
+    pub(crate) debugger_attached: bool,
+    /// A BKPT halted into the attached debugger and the debugger has not been told yet.
+    pub(crate) debug_halt: bool,
     pub exit_code: u32,
 
     ///
@@ -359,6 +363,8 @@ impl Processor {
             sram: RAM::new_with_fill(0x2000_0000, 128 * 1024, 0xcd),
             itm_file: None,
             sleeping: false,
+            debugger_attached: false,
+            debug_halt: false,
             running: true,
             exit_code: 0,
             cycle_count: 0,
@@ -373,7 +379,7 @@ impl Processor {
             aircr: 0xFA05_0000,
             system_reset_requested: false,
             scr: 0,
-            ccr: 0,
+            ccr: if cfg!(feature = "armv7em") { 1 << 9 } else { 0 },
             shcsr: 0,
             cfsr: 0,
             dfsr: 0,
@@ -522,7 +528,7 @@ impl Processor {
         }
         let base = self.code.base();
         let first = (addr.wrapping_sub(base) >> 1).saturating_sub(1) as usize;
-        let last = ((addr.wrapping_sub(base) + len) >> 1) as usize;
+        let last = u32::midpoint(addr.wrapping_sub(base), len) as usize;
         for idx in first..=last.min(self.instruction_cache.len() - 1) {
             let pc = base + (idx as u32) * 2;
             self.instruction_cache[idx] = match self.fetch(pc) {

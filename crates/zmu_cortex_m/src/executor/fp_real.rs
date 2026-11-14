@@ -290,6 +290,7 @@ mod tests {
 
     // The value of a real as a double, for a real whose significand fits one and whose
     // exponent is in range.
+    #[allow(clippy::cast_precision_loss)]
     fn value(real: Real) -> f64 {
         let magnitude = real.sig as f64 * 2f64.powi(real.exp);
         if real.sign { -magnitude } else { magnitude }
@@ -612,6 +613,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)] // 1 << 40 is exact in a double
     fn whole_numbers_and_significands_are_read_from_the_bits() {
         assert_eq!(significand::<u64>(1.0f64.to_bits()), (1 << 52, -52));
         assert_eq!(significand::<u64>(1), (1, -1074));

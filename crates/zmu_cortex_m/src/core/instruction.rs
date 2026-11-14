@@ -2164,8 +2164,8 @@ impl fmt::Display for Instruction {
                 }
             ),
             Self::CMN_imm { params } => write!(f, "cmn.W {}, #{}", params.r, params.imm32),
-            Self::CBZ { params } => write!(f, "cbz {}, #{}", params.rn, params.imm32,),
-            Self::CBNZ { params } => write!(f, "cbnz {}, #{}", params.rn, params.imm32,),
+            Self::CBZ { params } => write!(f, "cbz {}, #{}", params.rn, params.imm32),
+            Self::CBNZ { params } => write!(f, "cbnz {}, #{}", params.rn, params.imm32),
             Self::CLZ { params } => write!(f, "clz {},{}", params.rd, params.rm),
             Self::CMP_imm { params, thumb32 } => write!(
                 f,
@@ -3011,43 +3011,43 @@ impl fmt::Display for Instruction {
 
             #[cfg(feature = "has-fp")]
             Self::VADD_f32 { params } => {
-                write!(f, "vadd.f32 {}, {}, {}", params.sd, params.sn, params.sm,)
+                write!(f, "vadd.f32 {}, {}, {}", params.sd, params.sn, params.sm)
             }
             #[cfg(feature = "has-fp")]
             Self::VADD_f64 { params } => {
-                write!(f, "vadd.f64 {}, {}, {}", params.dd, params.dn, params.dm,)
+                write!(f, "vadd.f64 {}, {}, {}", params.dd, params.dn, params.dm)
             }
             #[cfg(feature = "has-fp")]
             Self::VFMA_f32 { params } => {
-                write!(f, "vfma.f32 {}, {}, {}", params.sd, params.sn, params.sm,)
+                write!(f, "vfma.f32 {}, {}, {}", params.sd, params.sn, params.sm)
             }
             #[cfg(feature = "has-fp")]
             Self::VFMA_f64 { params } => {
-                write!(f, "vfma.f64 {}, {}, {}", params.dd, params.dn, params.dm,)
+                write!(f, "vfma.f64 {}, {}, {}", params.dd, params.dn, params.dm)
             }
             #[cfg(feature = "has-fp")]
             Self::VFMS_f32 { params } => {
-                write!(f, "vfms.f32 {}, {}, {}", params.sd, params.sn, params.sm,)
+                write!(f, "vfms.f32 {}, {}, {}", params.sd, params.sn, params.sm)
             }
             #[cfg(feature = "has-fp")]
             Self::VFMS_f64 { params } => {
-                write!(f, "vfms.f64 {}, {}, {}", params.dd, params.dn, params.dm,)
+                write!(f, "vfms.f64 {}, {}, {}", params.dd, params.dn, params.dm)
             }
             #[cfg(feature = "has-fp")]
             Self::VFNMS_f32 { params } => {
-                write!(f, "vfnms.f32 {}, {}, {}", params.sd, params.sn, params.sm,)
+                write!(f, "vfnms.f32 {}, {}, {}", params.sd, params.sn, params.sm)
             }
             #[cfg(feature = "has-fp")]
             Self::VFNMS_f64 { params } => {
-                write!(f, "vfnms.f64 {}, {}, {}", params.dd, params.dn, params.dm,)
+                write!(f, "vfnms.f64 {}, {}, {}", params.dd, params.dn, params.dm)
             }
             #[cfg(feature = "has-fp")]
             Self::VFNMA_f32 { params } => {
-                write!(f, "vfnma.f32 {}, {}, {}", params.sd, params.sn, params.sm,)
+                write!(f, "vfnma.f32 {}, {}, {}", params.sd, params.sn, params.sm)
             }
             #[cfg(feature = "has-fp")]
             Self::VFNMA_f64 { params } => {
-                write!(f, "vfnma.f64 {}, {}, {}", params.dd, params.dn, params.dm,)
+                write!(f, "vfnma.f64 {}, {}, {}", params.dd, params.dn, params.dm)
             }
             #[cfg(feature = "has-fp")]
             Self::VSQRT_f32 { params } => write!(f, "vsqrt.f32 {}, {}", params.sd, params.sm),
@@ -3089,11 +3089,11 @@ impl fmt::Display for Instruction {
             ),
             #[cfg(feature = "has-fp")]
             Self::VSUB_f32 { params } => {
-                write!(f, "vsub.f32 {}, {}, {}", params.sd, params.sn, params.sm,)
+                write!(f, "vsub.f32 {}, {}, {}", params.sd, params.sn, params.sm)
             }
             #[cfg(feature = "has-fp")]
             Self::VSUB_f64 { params } => {
-                write!(f, "vsub.f64 {}, {}, {}", params.dd, params.dn, params.dm,)
+                write!(f, "vsub.f64 {}, {}, {}", params.dd, params.dn, params.dm)
             }
             #[cfg(feature = "has-fp")]
             Self::VCVT { params } => write!(f, "{}", fmt_vcvt(params)),
@@ -3121,27 +3121,27 @@ impl fmt::Display for Instruction {
             }
             #[cfg(feature = "has-fp")]
             Self::VDIV_f32 { params } => {
-                write!(f, "vdiv.f32 {}, {}, {}", params.sd, params.sn, params.sm,)
+                write!(f, "vdiv.f32 {}, {}, {}", params.sd, params.sn, params.sm)
             }
             #[cfg(feature = "has-fp")]
             Self::VDIV_f64 { params } => {
-                write!(f, "vdiv.f64 {}, {}, {}", params.dd, params.dn, params.dm,)
+                write!(f, "vdiv.f64 {}, {}, {}", params.dd, params.dn, params.dm)
             }
             #[cfg(feature = "has-fp")]
             Self::VMUL_f32 { params } => {
-                write!(f, "vmul.f32 {}, {}, {}", params.sd, params.sn, params.sm,)
+                write!(f, "vmul.f32 {}, {}, {}", params.sd, params.sn, params.sm)
             }
             #[cfg(feature = "has-fp")]
             Self::VMUL_f64 { params } => {
-                write!(f, "vmul.f64 {}, {}, {}", params.dd, params.dn, params.dm,)
+                write!(f, "vmul.f64 {}, {}, {}", params.dd, params.dn, params.dm)
             }
             #[cfg(feature = "has-fp")]
             Self::VNMUL_f32 { params } => {
-                write!(f, "vnmul.f32 {}, {}, {}", params.sd, params.sn, params.sm,)
+                write!(f, "vnmul.f32 {}, {}, {}", params.sd, params.sn, params.sm)
             }
             #[cfg(feature = "has-fp")]
             Self::VNMUL_f64 { params } => {
-                write!(f, "vnmul.f64 {}, {}, {}", params.dd, params.dn, params.dm,)
+                write!(f, "vnmul.f64 {}, {}, {}", params.dd, params.dn, params.dm)
             }
 
             Self::WFE { .. } => write!(f, "wfe"),

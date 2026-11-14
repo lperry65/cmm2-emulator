@@ -173,12 +173,12 @@ fn test_exception_returns_with_forged_frames_never_panic_the_host() {
         .unwrap_or(DEFAULT_OPCODES)
         / 20;
     let mut rng = Rng(0x0bad_f00d_dead_beef);
-    // BX LR, POP {PC}, LDR PC, [SP], #4 and LDM SP!, {PC}
+    // BX LR, POP {PC}, LDR PC, [SP], #4 and POP.W {R0, PC} (a list of one register is UNPREDICTABLE)
     let returns = [
         decode_16(0x4770),
         decode_16(0xbd00),
         decode_32(0xf85d_fb04),
-        decode_32(0xe8bd_8000),
+        decode_32(0xe8bd_8001),
     ];
     let numbers = [3_usize, 2, 4, 5, 6, 11, 12, 14, 15, 16, 17, 100, 255];
 
@@ -191,25 +191,32 @@ fn test_exception_returns_with_forged_frames_never_panic_the_host() {
         // BX takes the EXC_RETURN from LR and the frame is at SP. POP, LDR and LDM take it from the
         // word at SP, and the frame is the 32 bytes after it (the 104 of an FP frame, which is
         // bigger than the random words below, and are random too).
-        let frame = if form == 0 { sp } else { sp + 4 };
+        let frame = match form {
+            0 => sp,
+            3 => sp + 8,
+            _ => sp + 4,
+        };
         core.set_psp(frame);
         // a frame of random words, with the xPSR and the return address that are likely to be taken
         for word in 0..26 {
             core.write32(frame + word * 4, rng.value()).unwrap();
         }
-        let ipsr = if rng.next() % 3 == 0 {
+        let ipsr = if rng.next().is_multiple_of(3) {
             rng.next() & 0x1ff
         } else {
             numbers[rng.next() as usize % numbers.len()] as u32
         };
-        let thumb = (rng.next() % 4 != 0) as u32;
+        let thumb = u32::from(!rng.next().is_multiple_of(4));
         core.write32(frame + 0x18, rng.next()).unwrap();
         core.write32(frame + 0x1c, rng.next() & 0xf800_fc00 | thumb << 24 | ipsr)
             .unwrap();
 
         // the active exceptions: one or two, the first being the one that is running
         let running = numbers[rng.next() as usize % numbers.len()];
-        let other = (rng.next() % 2 == 0).then(|| numbers[rng.next() as usize % numbers.len()]);
+        let other = rng
+            .next()
+            .is_multiple_of(2)
+            .then(|| numbers[rng.next() as usize % numbers.len()]);
         if let Some(other) = other {
             core.test_set_active_exception(Exception::from(other));
         }
@@ -227,21 +234,23 @@ fn test_exception_returns_with_forged_frames_never_panic_the_host() {
             _ => 0xf000_0000 | (rng.next() & 0x0fff_ffff),
         };
         core.set_r(Reg::LR, exc_return);
-        core.write32(sp, exc_return).unwrap();
+        // POP.W {R0, PC} pops R0 first
+        core.write32(if form == 3 { sp + 4 } else { sp }, exc_return)
+            .unwrap();
         core.set_pc(START);
         core.cfsr = 0;
 
-        // what the manual says the return does: EXC_RETURN and the nesting first (INVPC), then
-        // after the pop the IPSR against the mode (INVPC), then the Thumb bit (INVSTATE)
+        // what the manual says the return does (B1.5.8): EXC_RETURN and, for Thread mode, the
+        // nesting first (INVPC, no frame), then after the pop the IPSR against the mode (INVPC),
+        // then the Thumb bit (INVSTATE). A return to Handler mode has no nesting check.
         let to_handler = exc_return & 0xf == 0x1;
         let to_thread = matches!(exc_return & 0xf, 0x9 | 0xd);
         let exists = matches!(ipsr, 2..=6 | 11 | 12 | 14 | 15 | 16..=255);
         let (invpc, invstate) = if !(to_handler || to_thread)
-            || (to_handler && active == 1)
             || (to_thread && active != 1)
+            || (to_handler && !exists)
+            || (to_thread && ipsr != 0)
         {
-            (true, false)
-        } else if (to_handler && !exists) || (to_thread && ipsr != 0) {
             (true, false)
         } else {
             (false, thumb == 0)

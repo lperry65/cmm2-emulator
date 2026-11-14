@@ -106,12 +106,12 @@ impl IsaMiscDataProcessing for Processor {
     ) -> ExecuteResult {
         if self.condition_passed() {
             let c = self.psr.get_c();
-            let operand = crate::core::operation::shift(
+            let operand = i64::from(crate::core::operation::shift(
                 self.get_r(params.rn),
                 params.shift_t,
                 params.shift_n as usize,
                 c,
-            ) as i32 as i64;
+            ) as i32);
             let n = u32::from(params.saturate_to);
             let (lo, hi) = if signed {
                 (-(1i64 << (n - 1)), (1i64 << (n - 1)) - 1)
