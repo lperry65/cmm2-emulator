@@ -128,6 +128,9 @@ const CFSR_BFARVALID: u32 = 1 << 15;
 const CFSR_UNDEFINSTR: u32 = 1 << 16;
 const CFSR_INVSTATE: u32 = 1 << 17;
 const CFSR_INVPC: u32 = 1 << 18;
+const CFSR_NOCP: u32 = 1 << 19;
+const CFSR_UNALIGNED: u32 = 1 << 24;
+const CFSR_DIVBYZERO: u32 = 1 << 25;
 
 // HardFault Status Register bit positions
 const HFSR_VECTTBL: u32 = 1 << 1;
@@ -339,6 +342,11 @@ impl Processor {
             Fault::UndefInstr => self.cfsr |= CFSR_UNDEFINSTR,
             Fault::Invstate => self.cfsr |= CFSR_INVSTATE,
             Fault::InvPc => self.cfsr |= CFSR_INVPC,
+            // UFSR bits (B3.2.15): set whether or not UsageFault is enabled, so also when the fault
+            // is escalated to HardFault
+            Fault::Nocp => self.cfsr |= CFSR_NOCP,
+            Fault::Unaligned => self.cfsr |= CFSR_UNALIGNED,
+            Fault::DivByZero => self.cfsr |= CFSR_DIVBYZERO,
             Fault::Forced => self.set_hfsr_forced(),
             Fault::DebugEvt => self.hfsr |= HFSR_DEBUGEVT_BIT,
             Fault::VectorTable => self.hfsr |= HFSR_VECTTBL,

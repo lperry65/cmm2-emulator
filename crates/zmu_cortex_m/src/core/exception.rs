@@ -413,6 +413,10 @@ impl Processor {
                 self.record_fault_status(vector_fault, FaultStatusContext::default());
                 entry.fault = vector_fault;
                 entry.derived = Exception::HardFault;
+                // `is_lockup` is the manual's rule (B1.5.15) for a HardFault at a priority below 0;
+                // an exception other than NMI cannot be taken from there, so it only matters if
+                // that changes, and no test reaches it. The inner branch below (the HardFault's
+                // own vector cannot be read) is reached with a table that is unmapped as a whole.
                 if matches!(taken, Exception::HardFault | Exception::NMI)
                     || self.is_lockup(Exception::HardFault)
                 {
@@ -1093,6 +1097,7 @@ impl ExceptionHandling for Processor {
                 self.sleeping = true;
             }
 
+            self.exception_returned = true;
             Ok(())
         } else {
             self.invalid_exception_return(returning_exception_number, exc_return)
@@ -3385,6 +3390,31 @@ mod tests {
         assert!(processor.exception_pending(Exception::SVCall));
         let trap = processor.take_pending_fault_trap().expect("a trap");
         assert_eq!(trap.trap_reason, FaultTrapReason::Fault);
+        assert_eq!(trap.fault, Fault::VectorTable);
+        assert_eq!(trap.exception, Exception::HardFault);
+    }
+
+    // P1 with a table that cannot be read at all: SVCall's vector fails, and then so does
+    // HardFault's: a lockup (B1-556), with VECTTBL set and the vector read named by the trap. This
+    // reaches the HardFault-vector-fails-too branch; with a contiguous table it needs the whole of
+    // it unmapped.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_an_original_and_a_hardfault_with_unreadable_vectors_lock_up() {
+        let mut processor = Processor::new();
+        processor.ccr = 0;
+        processor.write32(0xE000_ED08, 0x1fff_ff80).unwrap(); // below SRAM, unmapped
+        processor.write32(0xE000_ED24, 1 << 16).unwrap();
+        processor.set_exception_priority(Exception::MemoryManagementFault, 0x40);
+        processor.set_exception_priority(Exception::SVCall, 0);
+        processor.set_msp(0x2002_0004);
+        processor.set_pc(0x100);
+        processor.execute(&decode_16(0xdf00), 2);
+        assert!(!processor.running);
+        assert_eq!(processor.hfsr & (1 << 1), 1 << 1, "VECTTBL");
+        let trap = processor.take_pending_fault_trap().expect("a trap");
+        assert_eq!(trap.trap_reason, FaultTrapReason::Lockup);
+        assert_eq!(trap.fault, Fault::VectorTable);
     }
 
     // P2: the derived MemManage (vector 4) has the higher priority and is taken, and its vector
@@ -3489,5 +3519,61 @@ mod tests {
         let trap = processor.take_pending_fault_trap().expect("a trap");
         assert_eq!(trap.pc, 0x100);
         assert_eq!(processor.read32(processor.get_msp() + 0x18), Ok(0x102));
+    }
+
+    // ---- the UsageFault status bits (B3.2.15) --------------------------------------------------
+
+    // Division by zero with CCR.DIV_0_TRP: UFSR.DIVBYZERO, CFSR bit 25.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_divide_by_zero_sets_divbyzero() {
+        for (opcode, name) in [(0xfb92_f1f3_u32, "sdiv"), (0xfbb2_f1f3, "udiv")] {
+            let mut processor = Processor::new();
+            processor.write32(0xE000_ED24, 1 << 18).unwrap(); // USGFAULTENA
+            processor.write32(0xE000_ED14, 1 << 4).unwrap(); // DIV_0_TRP
+            processor.set_msp(0x2000_0200);
+            processor.set_r(Reg::R2, 7);
+            processor.set_r(Reg::R3, 0);
+            processor.execute(&crate::decoder::decode_32(opcode), 4);
+            assert_eq!(processor.cfsr & (1 << 25), 1 << 25, "{name}");
+            assert_eq!(processor.psr.get_isr_number(), 6, "{name}: UsageFault");
+        }
+    }
+
+    // With UsageFault disabled the fault is escalated to HardFault (FORCED), and the UFSR bit is
+    // set all the same: the status is recorded in every case (B1.5.14, p. B1-551).
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_the_usage_fault_bits_are_set_when_the_fault_is_escalated() {
+        let mut processor = Processor::new();
+        processor.write32(0xE000_ED14, 1 << 4).unwrap();
+        processor.set_msp(0x2000_0200);
+        processor.set_r(Reg::R3, 0);
+        processor.execute(&crate::decoder::decode_32(0xfb92_f1f3), 4);
+        assert_eq!(processor.psr.get_isr_number(), 3);
+        assert_eq!(processor.cfsr & (1 << 25), 1 << 25);
+        assert_eq!(processor.hfsr & (1 << 30), 1 << 30, "FORCED");
+    }
+
+    // FP with the coprocessors off: UFSR.NOCP, bit 19.
+    #[test]
+    #[cfg(feature = "has-fp")]
+    fn test_an_fp_instruction_with_cpacr_off_sets_nocp() {
+        let mut processor = Processor::new();
+        processor.write32(0xE000_ED24, 1 << 18).unwrap();
+        processor.set_msp(0x2000_0200);
+        processor.execute(&crate::decoder::decode_32(0xee00_0a10), 4); // vmov s0, r0
+        assert_eq!(processor.cfsr & (1 << 19), 1 << 19);
+        assert_eq!(processor.psr.get_isr_number(), 6);
+    }
+
+    // UFSR.UNALIGNED, bit 24. The core checks no alignment, so it never raises Fault::Unaligned
+    // itself (NOTICE.md); a fault that is raised is recorded.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_an_unaligned_fault_sets_unaligned() {
+        let mut processor = Processor::new();
+        processor.record_fault_status(Fault::Unaligned, FaultStatusContext::default());
+        assert_eq!(processor.cfsr & (1 << 24), 1 << 24);
     }
 }

@@ -148,6 +148,9 @@ pub struct Processor {
     pub(crate) debugger_attached: bool,
     /// A BKPT halted into the attached debugger and the debugger has not been told yet.
     pub(crate) debug_halt: bool,
+    /// An exception return was made in the current step: an exception taken at its end is
+    /// tail-chained.
+    pub(crate) exception_returned: bool,
     pub exit_code: u32,
 
     ///
@@ -365,6 +368,7 @@ impl Processor {
             sleeping: false,
             debugger_attached: false,
             debug_halt: false,
+            exception_returned: false,
             running: true,
             exit_code: 0,
             cycle_count: 0,

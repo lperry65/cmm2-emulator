@@ -99,10 +99,17 @@ pub trait Executor {
 }
 
 /// The cycles of an exception entry: the 12 cycles of interrupt latency ARM gives for the
-/// Cortex-M7 with zero-wait-state memory (as for the M3 and M4). Every path that
-/// enters an exception counts them: SVC, a fault, an exception taken after an instruction or from
-/// sleep, and the entry that starts the debugger's step after a halt.
+/// Cortex-M7 with zero-wait-state memory (as for the M3 and M4). Every path that actually enters
+/// an exception counts them: SVC, BKPT, a fault, an exception taken after an instruction or from
+/// sleep, and the entry that starts the debugger's step after a halt; one taken straight after an
+/// exception return counts the tail-chain cycles instead. A lockup, and a failed reset, enter
+/// nothing and count the one cycle of the step.
 pub(crate) const EXCEPTION_ENTRY_CYCLES: u32 = 12;
+
+/// The cycles of an exception taken straight after an exception return: tail-chaining, which
+/// skips the unstacking and the stacking. 6 is the figure ARM gives for the Cortex-M3 and M4; I
+/// have found no authoritative figure for the Cortex-M7 (NOTICE.md).
+pub(crate) const EXCEPTION_TAIL_CHAIN_CYCLES: u32 = 6;
 
 type ExecuteResult = Result<ExecuteSuccess, Fault>;
 #[derive(PartialEq, Debug, Copy, Clone)]
@@ -256,7 +263,8 @@ impl Processor {
             );
             self.running = false;
             self.sleeping = false;
-            return 12;
+            // a lockup enters no exception: the step takes the one cycle of the fetch
+            return 1;
         }
 
         // an escalated fault keeps the return address of the original (B1.5.6, p. B1-534)
@@ -302,6 +310,8 @@ impl Processor {
                 );
                 self.running = false;
                 self.sleeping = false;
+                // nothing was entered: no entry cycles
+                return 1;
             }
         }
 
@@ -859,6 +869,7 @@ impl Executor for Processor {
 
     #[inline(always)]
     fn step(&mut self) {
+        self.exception_returned = false;
         let pc = self.get_pc();
         let mapped_pc = (self.map_address(pc).wrapping_sub(self.code.base()) >> 1) as usize;
         let count = match self.instruction_cache.get(mapped_pc).copied() {
@@ -883,7 +894,12 @@ impl Executor for Processor {
             && !self.debug_halt
             && self.check_exceptions()
         {
-            self.account_cycles(EXCEPTION_ENTRY_CYCLES);
+            // straight after an exception return it is tail-chained
+            self.account_cycles(if self.exception_returned {
+                EXCEPTION_TAIL_CHAIN_CYCLES
+            } else {
+                EXCEPTION_ENTRY_CYCLES
+            });
         }
     }
 
@@ -1137,7 +1153,7 @@ mod tests {
 
         let cycles = core.handle_fault(Fault::Forced, 0x0800_0100);
 
-        assert_eq!(cycles, 12);
+        assert_eq!(cycles, 1);
         let trap = core
             .take_pending_fault_trap()
             .expect("lockup trap expected");
@@ -1648,5 +1664,18 @@ mod tests {
         processor.execute(&crate::decoder::decode_16(0xc9f0), 2); // ldmia r1!, {r4-r7}
         assert_eq!(processor.get_r(Reg::R1), 0x2000_0110);
         assert_eq!(processor.get_r(Reg::R7), 0x103);
+    }
+
+    // A lockup enters no exception, so it costs no entry cycles: the step that finds it takes the
+    // one cycle of the fetch. (The core then keeps fetching the lockup address; here it stops.)
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_a_lockup_costs_one_cycle_and_no_exception_entry() {
+        let mut core = Processor::new();
+        core.test_set_active_exception(Exception::HardFault);
+        core.execution_priority = core.get_execution_priority();
+        let cycles = core.handle_fault(Fault::UndefInstr, 0x100);
+        assert!(!core.running);
+        assert_eq!(cycles, 1);
     }
 }

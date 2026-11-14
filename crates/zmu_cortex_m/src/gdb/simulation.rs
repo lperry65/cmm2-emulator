@@ -324,7 +324,8 @@ mod tests {
         code[0x38..0x3c].copy_from_slice(&0x0000_004d_u32.to_le_bytes());
         code[0x0c..0x10].copy_from_slice(&0x0000_004d_u32.to_le_bytes());
         code[0x40..0x46].copy_from_slice(&[0x00, 0xbe, 0x72, 0xb6, 0x00, 0xbf]);
-        code[0x4c..0x4e].copy_from_slice(&[0x00, 0xbf]);
+        code[0x3c..0x40].copy_from_slice(&0x0000_004d_u32.to_le_bytes());
+        code[0x4c..0x4e].copy_from_slice(&[0x70, 0x47]); // bx lr
         let mut processor = Processor::new();
         processor.flash_memory(code.len(), &code);
         processor.cache_instructions();
@@ -417,5 +418,58 @@ mod tests {
         simulation.step();
         assert_eq!(simulation.processor.psr.get_isr_number(), 14);
         assert_eq!(simulation.processor.cycle_count, cycles + 1 + 12);
+    }
+
+    // The same from sleep.
+    #[test]
+    fn test_an_exception_taken_from_sleep_counts_its_entry_cycles() {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation.processor.running = false;
+        simulation.processor.sleeping = true;
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        let cycles = simulation.processor.cycle_count;
+        simulation.step();
+        assert_eq!(simulation.processor.psr.get_isr_number(), 14);
+        assert_eq!(simulation.processor.cycle_count, cycles + 12);
+    }
+
+    // The cycles of the step that returns from PendSV (`bx lr`), with and without SysTick pending
+    // behind it.
+    fn cycles_of_a_return_from_pendsv(systick_pending: bool) -> (u64, u32) {
+        let mut simulation = simulation_with_a_pendsv_handler();
+        simulation
+            .processor
+            .set_exception_priority(Exception::PendSV, 0);
+        simulation
+            .processor
+            .set_exception_priority(Exception::SysTick, 0x40);
+        simulation.processor.set_pc(0x44);
+        simulation
+            .processor
+            .set_exception_pending(Exception::PendSV);
+        simulation.step();
+        assert_eq!(simulation.processor.psr.get_isr_number(), 14);
+        if systick_pending {
+            simulation
+                .processor
+                .set_exception_pending(Exception::SysTick);
+        }
+        let cycles = simulation.processor.cycle_count;
+        simulation.step();
+        let isr = simulation.processor.psr.get_isr_number();
+        (simulation.processor.cycle_count - cycles, isr as u32)
+    }
+
+    // An exception taken straight after an exception return is tail-chained: it costs 6 cycles,
+    // not the 12 of a full entry.
+    #[test]
+    fn test_a_tail_chained_exception_costs_the_tail_chain_cycles() {
+        let (plain, isr) = cycles_of_a_return_from_pendsv(false);
+        assert_eq!(isr, 0, "back in Thread mode");
+        let (chained, isr) = cycles_of_a_return_from_pendsv(true);
+        assert_eq!(isr, 15, "SysTick is tail-chained");
+        assert_eq!(chained - plain, 6);
     }
 }

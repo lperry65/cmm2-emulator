@@ -107,10 +107,12 @@ fn run_line_with_keys(boot: &mut UsbBoot, line: &str, events: &[(u64, [u8; 8])])
 fn real_firmware_enumerates_a_usb_keyboard() {
     let boot = boot_with_usb_keyboard();
     // Measured: the first boot's questions end with the UK keyboard, so the message says UK.
-    // Whether the next prompt has arrived yet depends on the exact timing, so it is not asserted.
+    // The message comes first and whole. The prompt after it may or may not have arrived yet, which
+    // depends on the exact timing, so only a prefix of "> " may follow it.
+    let message = "UK USB Keyboard Connected on channel 1\r\n";
+    let rest = boot.connect_output.strip_prefix(message);
     assert!(
-        boot.connect_output
-            .contains("UK USB Keyboard Connected on channel 1\r\n"),
+        rest.is_some_and(|rest| "> ".starts_with(rest)),
         "{:?}",
         boot.connect_output
     );

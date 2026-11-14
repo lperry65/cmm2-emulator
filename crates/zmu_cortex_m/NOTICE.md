@@ -284,6 +284,25 @@ The firmware needs a few things zmu does not do, so I changed the following.
     and now an exception taken after an instruction or from sleep (it counted 0), and the
     after-halt entry. 12 is the interrupt latency ARM gives for the Cortex-M7 with zero-wait-state
     memory (the same as the Cortex-M3 and M4); wait states in the real memories add to it.
+    An exception taken straight after an exception return in the same step is tail-chained and
+    counts 6 cycles (`EXCEPTION_TAIL_CHAIN_CYCLES`). 6 is the figure ARM gives for the Cortex-M3
+    and M4 (their TRMs and the Generic User Guides); I have not found an authoritative figure for
+    the Cortex-M7 and do not have its TRM, so it is the M3/M4 one, unverified for the M7. The
+    emulator still does the unstacking and stacking, only the count is the tail-chain's. A lockup
+    and a failed reset enter nothing and count the one cycle of the step, not an entry.
+  - the HardFault-vector-fails-too branch is reached only with a vector table that is unmapped as
+    a whole (the table is contiguous: a lower vector cannot fail while a higher one is read); the
+    test `test_an_original_and_a_hardfault_with_unreadable_vectors_lock_up` puts VTOR below SRAM.
+    The `is_lockup(HardFault)` test next to it is the manual's rule (B1.5.15), but no exception
+    but NMI can be taken at a priority below 0, and NMI is handled by the first part of the
+    condition, so no test reaches it.
+  - CFSR.DIVBYZERO (bit 25), UNALIGNED (24) and NOCP (19) are recorded by `record_fault_status`
+    (issue 67; the UFSR bits of B3.2.15), also when UsageFault is disabled and the fault is
+    escalated to HardFault (FORCED): B1.5.14 (p. B1-551) has the status bit set in every case.
+    DIVBYZERO is raised by SDIV and UDIV with CCR.DIV_0_TRP and NOCP by an FP instruction with
+    the coprocessors off. The core never raises UNALIGNED: it checks no alignment (above), so the
+    CCR.UNALIGN_TRP trap and the instructions that always fault on an unaligned address (LDM, STM,
+    LDRD, STRD, exclusives, VLDM, VSTM) do not fault. The bit is recorded when a fault is raised.
   - with FPCA set, a failed stacking leaves an extended frame whose FP registers, and
     FPCCR.LSPACT, were never written. The manual allows the stacking to be abandoned (the note to
     PushStack, p. B1-532), and the contents of what was not stacked are UNKNOWN; the handler does
