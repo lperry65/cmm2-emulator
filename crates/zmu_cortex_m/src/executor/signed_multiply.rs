@@ -42,8 +42,8 @@ impl IsaSignedMultiply for Processor {
 
     fn exec_smull(&mut self, params: &Reg643232Params) -> ExecuteResult {
         if self.condition_passed() {
-            let rn = i64::from(self.get_r(params.rn));
-            let rm = i64::from(self.get_r(params.rm));
+            let rn = i64::from(self.get_r(params.rn) as i32);
+            let rm = i64::from(self.get_r(params.rm) as i32);
             let result = rn.wrapping_mul(rm) as u64;
 
             self.set_r(params.rdlo, result.get_bits(0..32) as u32);
@@ -319,6 +319,77 @@ mod tests {
 
         assert_eq!(core.get_r(Reg::R2), 0xFFFF_FFF9);
         assert_eq!(core.get_r(Reg::R3), 0xFFFF_FFFF);
+    }
+
+    // SMULL is a signed 32x32 -> 64 multiply. I run it on a fresh core and hand back (RdHi, RdLo).
+    fn run_smull(rn: u32, rm: u32) -> (u32, u32) {
+        let mut core = Processor::new();
+        core.psr.value = 0;
+        core.set_r(Reg::R0, rn);
+        core.set_r(Reg::R1, rm);
+        let instruction = Instruction::SMULL {
+            params: Reg643232Params {
+                rm: Reg::R1,
+                rdlo: Reg::R2,
+                rdhi: Reg::R3,
+                rn: Reg::R0,
+            },
+        };
+        core.execute_internal(&instruction).unwrap();
+        (core.get_r(Reg::R3), core.get_r(Reg::R2))
+    }
+
+    #[test]
+    fn test_smull_mmbasic_divide_by_63() {
+        // The compiler's divide-by-63 magic number. Issue 64: the unsigned product gave the wrong
+        // high word.
+        let product = i64::from(0x8208_2083_u32 as i32) * 23;
+        let (hi, lo) = run_smull(0x8208_2083, 23);
+        assert_eq!(hi, 0xFFFF_FFF4);
+        assert_eq!(lo, product as u64 as u32);
+    }
+
+    #[test]
+    fn test_smull_negative_times_negative() {
+        assert_eq!(run_smull(0xFFFF_FFFF, 0xFFFF_FFFF), (0, 1));
+    }
+
+    #[test]
+    fn test_smull_min_times_min() {
+        assert_eq!(run_smull(0x8000_0000, 0x8000_0000), (0x4000_0000, 0));
+    }
+
+    #[test]
+    fn test_smull_positive_times_negative() {
+        // 3 * -4 = -12
+        assert_eq!(run_smull(3, 0xFFFF_FFFC), (0xFFFF_FFFF, 0xFFFF_FFF4));
+        // -4 * 3, the other way round
+        assert_eq!(run_smull(0xFFFF_FFFC, 3), (0xFFFF_FFFF, 0xFFFF_FFF4));
+    }
+
+    #[test]
+    fn test_smull_positive_times_positive() {
+        assert_eq!(run_smull(0x7FFF_FFFF, 0x7FFF_FFFF), (0x3FFF_FFFF, 1));
+    }
+
+    #[test]
+    fn test_smull_destination_overlaps_sources() {
+        // RdLo = Rn and RdHi = Rm is allowed, the sources have to be read before either is written.
+        let mut core = Processor::new();
+        core.psr.value = 0;
+        core.set_r(Reg::R0, 0xFFFF_FFFE); // -2
+        core.set_r(Reg::R1, 0x0000_0005);
+        let instruction = Instruction::SMULL {
+            params: Reg643232Params {
+                rm: Reg::R1,
+                rdlo: Reg::R0,
+                rdhi: Reg::R1,
+                rn: Reg::R0,
+            },
+        };
+        core.execute_internal(&instruction).unwrap();
+        assert_eq!(core.get_r(Reg::R1), 0xFFFF_FFFF);
+        assert_eq!(core.get_r(Reg::R0), 0xFFFF_FFF6);
     }
 
     #[cfg(feature = "has-dsp-ext")]

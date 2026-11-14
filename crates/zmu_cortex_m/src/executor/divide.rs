@@ -23,7 +23,7 @@ impl IsaDivide for Processor {
                 0
             } else {
                 let rn = self.get_r(params.rn);
-                (rn as i32) / (rm as i32)
+                (rn as i32).wrapping_div(rm as i32)
             };
             self.set_r(params.rd, result as u32);
             return Ok(ExecuteSuccess::Taken { cycles: 2 });
@@ -73,6 +73,42 @@ mod tests {
 
         assert_eq!(core.get_r(Reg::R0), 0x29a);
         assert_eq!(core.get_r(Reg::R1), 0x3);
+    }
+
+    #[test]
+    fn test_sdiv_min_by_minus_one_does_not_panic() {
+        // i32::MIN / -1 overflows in Rust and would panic; the architecture says the result is
+        // i32::MIN.
+        let mut core = Processor::new();
+        core.psr.value = 0;
+        core.set_r(Reg::R0, 0x8000_0000);
+        core.set_r(Reg::R1, 0xFFFF_FFFF);
+        let instruction = Instruction::SDIV {
+            params: Reg3NoSetFlagsParams {
+                rd: Reg::R2,
+                rn: Reg::R0,
+                rm: Reg::R1,
+            },
+        };
+        core.execute_internal(&instruction).unwrap();
+        assert_eq!(core.get_r(Reg::R2), 0x8000_0000);
+    }
+
+    #[test]
+    fn test_sdiv_signed() {
+        let mut core = Processor::new();
+        core.psr.value = 0;
+        core.set_r(Reg::R0, (-7i32) as u32);
+        core.set_r(Reg::R1, 2);
+        let instruction = Instruction::SDIV {
+            params: Reg3NoSetFlagsParams {
+                rd: Reg::R2,
+                rn: Reg::R0,
+                rm: Reg::R1,
+            },
+        };
+        core.execute_internal(&instruction).unwrap();
+        assert_eq!(core.get_r(Reg::R2) as i32, -3);
     }
 
     #[test]

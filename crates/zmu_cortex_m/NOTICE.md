@@ -363,6 +363,10 @@ The firmware needs a few things zmu does not do, so I changed the following.
   The UNPREDICTABLE conditions that depend on the IT state (PC in a load or POP outside the last
   instruction of an IT block, TBB in an IT block) are not checked. LDMDB is still decoded as
   undefined, as upstream has it.
+- SMULL and SDIV (`executor/signed_multiply.rs`, `executor/divide.rs`): SMULL zero-extended its two
+  operands, so it was an unsigned multiply (SMLAL already sign-extended); it now sign-extends both,
+  as A7.7.136 says (issue 64). SDIV of i32::MIN by -1 panicked on the host; it now wraps to
+  i32::MIN, as the manual's result for that case is. Tests added for both.
 - GDB: `GdbServer`, `ZmuTarget` and `Simulation` can be built from a processor that has already
   been set up and reset (`from_processor`). Both mark the processor as having a debugger attached.
 - IT state: the IF-THEN state is now saved in the stacked xPSR on exception entry and restored on

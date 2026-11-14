@@ -94,6 +94,48 @@ fn real_firmware_lists_saves_and_runs_a_program_on_a_card() {
     assert!(String::from_utf8_lossy(&file).contains("PRINT \"FROM THE CARD\""));
 }
 
+// Issue 64: MMBasic ranks identifiers, and from rank 63 up it builds the code with a divide by 63
+// that the compiler turned into a SMULL by 0x82082083. The core ran SMULL unsigned, so a program
+// with more than about 85 distinct names got corrupt tokens, and RUN stopped with "Program damaged:
+// symbol table". Before the fix that was all RUN printed.
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_runs_a_program_with_a_hundred_identifiers() {
+    let firmware = firmware();
+    let irqs = Irqs::new();
+    let memory = cmm2_memory(&irqs);
+    let console = memory.console();
+    let sd = memory.sd_slot();
+    sd.insert(fat32_image("identifiers")).unwrap();
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
+    boot_to_second_prompt(&mut cpu, &console);
+
+    let mut lines: Vec<String> = (0..100).map(|n| format!("CONST C{n:03} = {n}")).collect();
+    lines.extend(["PRINT \"SUM\"; C099", "END", "SUB SUBA", "END SUB"].map(String::from));
+
+    // The console's input buffer is small, so I feed AUTOSAVE a line at a time and let the firmware
+    // catch up before the next. Each line ends in LF. That is the firmware's doing, not the
+    // emulator's: the console passes a CR through unchanged, AUTOSAVE stores a bare CR as it is,
+    // and the firmware's own loader does not take that as a line end, so RUN says "Line is too
+    // long".
+    console.push_input(b"AUTOSAVE \"IDS.BAS\"\r");
+    cpu.run(10_000_000);
+    for line in &lines {
+        console.push_input(format!("{line}\n").as_bytes());
+        cpu.run(300_000);
+        console.take_output();
+    }
+    console.push_input(b"\x1bOP");
+    run_until(&mut cpu, &console, 2_000_000_000, |output| {
+        output.contains("Saved to SDcard\r\n> ")
+    });
+    let mut say = |keys: &str| type_keys(&mut cpu, &console, keys).0;
+
+    let ran = say("RUN \"IDS.BAS\"\r");
+    assert!(!ran.contains("damaged"), "{ran:?}");
+    assert!(ran.contains("SUM 99"), "{ran:?}");
+}
+
 // A card with its write-protect switch on is read, and the firmware refuses a write to it, with
 // its own message; the image is left as it was and the card is not marked as written to.
 #[test]
