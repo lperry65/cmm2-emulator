@@ -66,6 +66,8 @@ struct Shared {
     /// every 6 ms of machine time while there is nothing to send, and about every 25 ms while
     /// there is (docs/usb-host.md section 12).
     polls: Cell<u32>,
+    /// How many times the keyboard has been reset.
+    resets: Cell<u32>,
     /// What `polls` and `led_updates` were when a report was last handed to the firmware.
     report_polls: Cell<u32>,
     report_led_updates: Cell<u32>,
@@ -117,6 +119,12 @@ impl KeyReport {
     /// How many times the firmware has polled since the keyboard was reset.
     pub fn polls(&self) -> u32 {
         self.0.polls.get()
+    }
+
+    /// How many times the keyboard has been reset (by a bus reset), which a front end that counts
+    /// `polls()` and `led_updates()` can tell from them going back to 0 only if it looks in time.
+    pub fn resets(&self) -> u32 {
+        self.0.resets.get()
     }
 
     /// `polls()` as it was when the keyboard last handed the firmware a report, which is when the
@@ -229,6 +237,8 @@ impl UsbDevice for HidKeyboard {
         self.keys.0.leds.set(0);
         self.keys.0.led_updates.set(0);
         self.keys.0.polls.set(0);
+        let shared = &self.keys.0;
+        shared.resets.set(shared.resets.get().saturating_add(1));
         self.keys.0.report_polls.set(0);
         self.keys.0.report_led_updates.set(0);
         *self = HidKeyboard::new(self.keys.clone());
@@ -724,6 +734,15 @@ mod tests {
             kb.out(0, &[leds]);
         }
         assert_eq!(report.led_updates(), 2);
+    }
+
+    #[test]
+    fn every_bus_reset_is_counted() {
+        let (mut kb, report) = configured();
+        assert_eq!(report.resets(), 0);
+        kb.reset();
+        kb.reset();
+        assert_eq!(report.resets(), 2);
     }
 
     #[test]

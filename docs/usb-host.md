@@ -645,7 +645,7 @@ then the report without it, as on hardware. What cannot share a report waits for
  - the same key again (it is reported, then let go for a poll, then reported again, so `ll` types
    two);
  - a key that went down with different modifiers than one still waiting (`a` and then a quick
-Shift with `B` are two reports, so `a` is not typed as `A`);
+   Shift with `B` are two reports, so `a` is not typed as `A`);
  - a seventh key at once (taps over six in one go are six and then the rest, in order);
  - everything after the first of these that waits, so the order is kept.
 A modifier pressed after a waiting key is held back from the report with it, and appears in the
@@ -665,29 +665,55 @@ not in the one before in slot order. Nothing a user types is lost this way. What
 pressed and let go while the firmware is not polling is kept and typed late, six at a time, when it
 does (there is no bound on how many are kept; the firmware does not stop polling short of a reset,
 which drops them); and a modifier that is tapped on its own and held back stays until the key before
-it has gone. A key that goes down while six others are down is a seventh key, and a real keyboard
-sends the rollover error (`0x01` in every slot) for as long as it is down, with no key in the
-report. A seventh key that is let go while the error is the report is lost, as on a keyboard. One
-that is still held when a slot frees is reported then, and typed, as a keyboard does, in its turn:
-after the keys that went down before it and have not been reported yet. The emulator is polled more
-slowly than real time, so the error is sent whenever a seventh key went down with six others, until
-the firmware has had it once, whatever has come up since: a keyboard polled while the seven
-overlapped would have sent it, so the seventh key is lost when it is let go before then, even if the
-other six, or one of them, come up first. The firmware sees the error, then the keys that remain, as
-it would from the keyboard. Keys that were down when the error went out, and had not been in a
-report before, are not counted as seen by it: they are reported afterwards, and typed, even if they
-come up before the next poll. Nothing is left waiting for the lost key, so the window's lock
-following (below) is not held up by it, and it does not tap a lock while six keys are down, as the
-tap would be a seventh key and lost. A Caps Lock or Num Lock is waited for (the LED update the
-firmware answers it with) when it is first reported as a key, and not when it goes down, so one lost
-to the error is not waited for and one held through it is, counting its polls and LED updates from
-when it is reported. A seventh key that is held takes the modifiers that are down when it is
-reported, not those it went down with, as a keyboard reports them, and one that comes up after its
-report is set and before it is polled is still sent. The polls and LED updates of a lock key held
-through the error are counted as the keyboard handed over its report, so an answer that came before
-the window looked is not lost. A key that was already waiting when the seven were down, because it
-was tapped before the seventh key went down, was seen by the keyboard alone and is not lost: it is
-typed once there is room.
+it has gone. A key that goes down while six others are down is a seventh key. A real keyboard sends
+the rollover error (`0x01` in every slot) for as long as it is down, with no key in the report, and
+I made the window do the same. I checked what MMBasic does with it on the real firmware: it ignores
+a report with the error in its slots and goes on with the report it had. A key, the error and the
+same key types it once. Six keys, the error, and then five of the six with a new one types the new
+one only. A Shift in the report after the error does not retype the key. So the error is never seen
+as the keys coming up. A seventh key that is let go while the error is the report is lost, as on a
+keyboard. One that is still held when a slot frees is reported then, and typed, in its turn: after
+the keys that went down before it and have not been reported yet.
+
+The window is polled more slowly than real time, so I send the error whenever a seventh key went
+down with six others, until the firmware has had it once, whatever has come up since: a keyboard
+polled while the seven overlapped would have sent it, so the seventh key is lost when it is let go
+before then, even if the other six, or one of them, come up first. Keys that were down when the
+error went out, and had not been in a report before, are not counted as seen by it: they are
+reported afterwards, and typed, even if they come up before the next poll. A seventh key takes the
+modifiers that are down when a slot frees and it is first put in a report that is not the error, as
+a keyboard polled every millisecond would have reported it, and keeps those if the modifiers change
+before the poll. I keep it until a report with it has been sent, even if that report is replaced by
+the error again, or the key is let go, before the poll. A key that was already waiting when the
+seven were down, because it was tapped before the seventh key went down, was seen by the keyboard
+alone and is not lost: it is typed once there is room.
+
+Nothing is left waiting for the lost key, so the window's lock following (below) is not held up by
+it, and it does not tap a lock while six keys are down, as the tap would be a seventh key and lost.
+A Caps Lock or Num Lock is waited for (the LED update the firmware answers it with) when it is first
+reported as a key, and not when it goes down, so one lost to the error is not waited for and one
+held through it is, counting its polls and LED updates from the keyboard handing over its report. I
+measured the first poll after the firmware starts: with Caps Lock in it, the firmware sets the LEDs
+twice, the first with its own state (all off) and the second with the lock on, so the window expects
+two updates for a lock key in that first poll. The count of lock keys is kept up to date whether or
+not the locks are being followed: what the firmware has answered is done with at the next lock key,
+the wait for one that has not been answered runs from its press, and a reset of the keyboard takes
+the count with it (a lock key reported first after a reset starts a new count).
+
+I property tested the keys against a keyboard polled after every change (`usb_keys.rs`): 20,000
+random runs of 60 changes of nine keys and two modifiers, with at most one key changing between two
+polls of the keys, no modifier changed twice and none pressed after a key changed, type exactly what
+a keyboard polled every millisecond gives a firmware that ignores the error, modifiers included.
+Outside those limits they do not, as they cannot: the window is polled less often than the keyboard.
+Counting the runs that differ of 20,000 with one limit lifted at a time, I got 5 for a modifier
+pressed after a key changed, 24 for a modifier changed twice and 10,764 for two key changes between
+polls. I traced the shrunk run the test prints for the last: a key let go and pressed again around
+the error is typed once where the keyboard types it twice, because the window compares it with the
+error report and not with the key the firmware still holds. That is one lost keystroke, and most of
+the 10,764 are lost keystrokes of that kind, but sorting them shows they are not all: 9,061 type a
+subset of the keys the keyboard gives (keys lost), 1,272 type the same keys with different
+modifiers, 131 differ in the order or in which keys, 117 type extra keys and 183 are a mixture. I
+have not fixed them yet.
 
 Property tested (`usb_keys.rs`, 3000 random sequences of presses and releases of three keys and
 three modifiers, with the firmware polling at random in between, and no more than one key going down
