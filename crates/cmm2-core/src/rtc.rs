@@ -30,6 +30,9 @@ const PRER: u32 = 0x10;
 const SSR: u32 = 0x28;
 
 const BYPSHAD: u32 = 1 << 5;
+const WUTE: u32 = 1 << 10;
+const ALRBE: u32 = 1 << 9;
+const ALRAE: u32 = 1 << 8;
 const ALRAWF: u32 = 1 << 0;
 const ALRBWF: u32 = 1 << 1;
 const WUTWF: u32 = 1 << 2;
@@ -163,17 +166,36 @@ struct Reading {
 /// RTC ignores writes to TR, DR and PRER outside initialisation mode, and so does this one.
 ///
 /// Unless BYPSHAD is set, a read of TR locks the date, and a read of SSR locks the time and
-/// the date, as they are then, and the read of DR lets go. That is as I remember RM0433 (not
-/// checked against the manual): reading SSR or TR locks the higher-order shadow registers
-/// until DR is read. So TR after TR is the current time with the date held, and SSR is always
-/// the current value, so that a guest that waits on either is not stuck. A read of DR with
-/// nothing locked gets the current value. A system reset lets go of the lock.
+/// the date, as they are then, and the read of DR lets go. RM0433 46.3.9 (p. 1915) has it that
+/// a read of either SSR or TR locks the higher-order shadow registers (TR and DR for SSR, DR
+/// for TR) until DR is read. So TR after TR is the current time with the date held, and SSR is
+/// always the current value (a read of SSR or TR does not lock SSR), so that a guest that waits
+/// on either is not stuck.
+/// A read of DR with nothing locked gets the current value. With BYPSHAD set the reads are taken
+/// from the counters directly and nothing is locked (46.6.3, p. 1929). A system reset lets go of
+/// the lock (it resets the shadow registers, 46.3.10). The model does not have the shadow
+/// registers' lag of one or two RTCCLK cycles (the manual says both, 46.3.9 and the BYPSHAD
+/// description): what a read returns is the time at that read, and the clock never reads
+/// incoherently with BYPSHAD set.
 ///
-/// RTC_ISR is worked out on every read, and only INIT is stored. The alarm and wake-up
-/// registers are always writable (nothing is enabled) and the shadow registers are always in
-/// sync, so those flags read as set and a write of 0 to RSF, which the HAL does before it
-/// waits, has no visible effect. INITS is set once the year is not 0. The shift and event
-/// flags read 0: nothing ever sets them.
+/// RTC_ISR is worked out on every read, and only INIT is stored. INITF follows INIT at once
+/// (the manual has it take about 2 RTCCLK cycles, 46.3.8, p. 1914). RSF is 0 in initialization
+/// mode and while BYPSHAD is set, and otherwise 1: the shadow registers are always in sync, so
+/// a write of 0 to RSF, which the HAL does before it waits, is set again at once (the manual
+/// has it set at the next copy, 46.6.4, p. 1931). ALRAWF and ALRBWF are set while the alarm is
+/// not enabled (ALRAE, ALRBE = 0) and cleared in initialization mode, and WUTWF while the
+/// wake-up timer is not enabled (WUTE = 0): 46.6.4, p. 1932. INITS is set once the year is not
+/// 0. The shift and event flags read 0: nothing ever sets them. A system reset clears INIT, INITF
+/// and RSF (46.6.4, p. 1930), and with BYPSHAD = 0 resets the TR and DR shadows to 0 and 0x2101
+/// (46.6.1, 46.6.2) until the next copy. The model clears INIT, so INITF reads 0 afterwards, but
+/// copies at once: RSF reads 1 straight after the reset and TR and DR read the live calendar (the
+/// calendar itself goes on from the value it stopped at). The firmware's waits for RSF cannot tell,
+/// and modelling the lag would only add a delay of two RTCCLK cycles.
+///
+/// TR, DR and PRER are written in initialisation mode only, as 46.6.1, 46.6.2 and 46.6.5 say.
+/// PRER's two fields have to be written in separate accesses on the chip; the model takes either.
+/// TR bit 22 (PM, "AM or 24-hour format" when clear) is kept as written and never changes: only
+/// the 24-hour format is modelled, CR.FMT is stored and ignored.
 ///
 /// At rest RTC_ISR reads 0x27. The real board reads 0 at the prompt, because by then the
 /// firmware has finished with the internal clock and uses the external one.
@@ -267,7 +289,10 @@ impl RtcRegisters {
 impl Registers for RtcRegisters {
     // The backup domain keeps the time and the registers through a system reset, but what the
     // reads had locked is not part of that.
+    // A system reset also clears INIT (so INITF and RSF with it, RM0433 46.6.4, p. 1930); the
+    // counting goes on from the stopped value.
     fn reset(&mut self, _cause: ResetCause) {
+        self.write_isr(0, u32::MAX);
         self.lock = None;
     }
 
@@ -305,13 +330,15 @@ impl Registers for RtcRegisters {
             },
             ISR => {
                 let init = self.stored.read(ISR) & INIT;
-                let initf = if init != 0 { INITF } else { 0 };
-                let inits = if self.reading().dr >> 16 & 0xFF != 0 {
-                    INITS
-                } else {
-                    0
-                };
-                ALRAWF | ALRBWF | WUTWF | RSF | initf | init | inits
+                let cr = self.stored.read(CR);
+                let flag = |set: bool, bit: u32| if set { bit } else { 0 };
+                flag(init == 0 && cr & ALRAE == 0, ALRAWF)
+                    | flag(init == 0 && cr & ALRBE == 0, ALRBWF)
+                    | flag(cr & WUTE == 0, WUTWF)
+                    | flag(init == 0 && !bypass, RSF)
+                    | flag(init != 0, INITF)
+                    | init
+                    | flag(self.reading().dr >> 16 & 0xFF != 0, INITS)
             }
             _ => self.stored.read(offset),
         }
@@ -544,7 +571,7 @@ mod tests {
     fn initf_follows_init_both_ways() {
         let mut m = machine();
         m.write32(ISR_ADDR, 0x80);
-        assert_eq!(m.read32(ISR_ADDR), 0xE7);
+        assert_eq!(m.read32(ISR_ADDR), 0xC4);
         m.write32(ISR_ADDR, 0);
         assert_eq!(m.read32(ISR_ADDR), 0x27);
     }
@@ -553,11 +580,11 @@ mod tests {
     fn init_by_byte_and_halfword_writes() {
         let mut m = machine();
         m.write8(ISR_ADDR, 0x80);
-        assert_eq!(m.read32(ISR_ADDR), 0xE7);
+        assert_eq!(m.read32(ISR_ADDR), 0xC4);
         m.write16(ISR_ADDR, 0);
         assert_eq!(m.read32(ISR_ADDR), 0x27);
         m.write16(ISR_ADDR, 0x80);
-        assert_eq!(m.read32(ISR_ADDR), 0xE7);
+        assert_eq!(m.read32(ISR_ADDR), 0xC4);
     }
 
     #[test]
@@ -568,17 +595,65 @@ mod tests {
     }
 
     #[test]
-    fn rsf_cannot_be_cleared() {
+    fn rsf_is_set_again_at_once_when_the_software_clears_it() {
+        // RM0433 46.6.4 (p. 1931): the software can clear RSF and the hardware sets it at the next
+        // copy into the shadow registers, 2 RTCCLK cycles on (46.3.9, 46.6.3). The model copies
+        // at once, so the HAL's clear and wait finds it set.
         let mut m = machine();
         m.write32(ISR_ADDR, 0xFFFF_FF5F);
         assert_eq!(m.read32(ISR_ADDR) & RSF, RSF);
         // Bit 7 of the HAL's pattern is clear, so INIT and INITF are too.
         assert_eq!(m.read32(ISR_ADDR) & (INIT | INITF), 0);
-        m.write32(ISR_ADDR, 0xFFFF_FFDF);
-        assert_eq!(m.read32(ISR_ADDR) & (INIT | INITF), INIT | INITF);
-        assert_eq!(m.read32(ISR_ADDR) & RSF, RSF);
+    }
+
+    #[test]
+    fn rsf_is_clear_in_init_mode_and_while_the_shadow_registers_are_bypassed() {
+        // RM0433 46.6.4 (p. 1931): the hardware clears RSF in initialization mode and when
+        // BYPSHAD = 1.
+        let mut m = machine();
+        m.write32(ISR_ADDR, INIT);
+        assert_eq!(m.read32(ISR_ADDR) & RSF, 0);
         m.write32(ISR_ADDR, 0);
         assert_eq!(m.read32(ISR_ADDR) & RSF, RSF);
+        m.write32(CR, BYPSHAD);
+        assert_eq!(m.read32(ISR_ADDR) & RSF, 0);
+        m.write32(CR, 0);
+        assert_eq!(m.read32(ISR_ADDR) & RSF, RSF);
+    }
+
+    #[test]
+    fn the_write_flags_say_when_the_alarms_and_the_wake_up_timer_can_be_changed() {
+        // RM0433 46.6.4 (p. 1932): ALRAWF and ALRBWF are set once ALRAE and ALRBE are 0 and are
+        // cleared in initialization mode; WUTWF is set once WUTE is 0. (The manual gives a delay of
+        // up to 2 RTCCLK cycles, which the model does not have.)
+        let mut m = machine();
+        let flags = |m: &mut MemoryMap| m.read32(ISR_ADDR) & (ALRAWF | ALRBWF | WUTWF);
+        assert_eq!(flags(&mut m), ALRAWF | ALRBWF | WUTWF);
+        m.write32(CR, 1 << 8);
+        assert_eq!(flags(&mut m), ALRBWF | WUTWF);
+        m.write32(CR, 1 << 9);
+        assert_eq!(flags(&mut m), ALRAWF | WUTWF);
+        m.write32(CR, 1 << 10);
+        assert_eq!(flags(&mut m), ALRAWF | ALRBWF);
+        m.write32(CR, 0);
+        m.write32(ISR_ADDR, INIT);
+        assert_eq!(flags(&mut m), WUTWF);
+    }
+
+    #[test]
+    fn a_system_reset_clears_init() {
+        // RM0433 46.6.4 (p. 1930): a system reset clears INIT, INITF and RSF; the calendar keeps
+        // counting from the value it had.
+        let mut m = machine();
+        set_clock(&mut m, 0x0012_0000, 0x0026_9112);
+        m.clock().set(10 * SECOND);
+        m.write32(ISR_ADDR, INIT);
+        m.clock().set(20 * SECOND);
+        m.reset_peripherals(ResetCause::Software);
+        assert_eq!(m.read32(ISR_ADDR) & (INIT | INITF), 0);
+        assert_eq!(m.read32(TR_ADDR), 0x0012_0010);
+        m.clock().set(21 * SECOND);
+        assert_eq!(m.read32(TR_ADDR), 0x0012_0011);
     }
 
     #[test]
@@ -620,13 +695,13 @@ mod tests {
     #[test]
     fn a_reset_does_not_touch_the_rtc() {
         let mut m = machine();
-        m.write32(PRER, 0x007F_00FF);
         m.write32(ISR_ADDR, INIT);
+        m.write32(PRER, 0x0063_0171);
         m.reset_peripherals(ResetCause::Software);
-        assert_eq!(m.read32(PRER), 0x007F_00FF);
-        assert_eq!(m.read32(ISR_ADDR), 0xE7);
+        assert_eq!(m.read32(PRER), 0x0063_0171);
+        assert_eq!(m.read32(ISR_ADDR), 0x27);
         m.reset_peripherals(ResetCause::PowerOn);
-        assert_eq!(m.read32(PRER), 0x007F_00FF);
+        assert_eq!(m.read32(PRER), 0x0063_0171);
     }
 
     #[test]
@@ -737,7 +812,7 @@ mod tests {
         assert_eq!(m.read32(ISR_ADDR), 0x27 | INITS);
         // In init mode too, from the stored date.
         m.write32(ISR_ADDR, INIT);
-        assert_eq!(m.read32(ISR_ADDR), 0xE7 | INITS);
+        assert_eq!(m.read32(ISR_ADDR), 0xC4 | INITS);
         m.write32(DR_ADDR, 0x0000_2101);
         assert_eq!(m.read32(ISR_ADDR) & INITS, 0);
         // The year turning over from 99 to 00 clears it again.

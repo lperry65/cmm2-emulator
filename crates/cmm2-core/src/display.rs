@@ -6,40 +6,58 @@
 //! shadowed. The colour tables are written straight through.
 //!
 //! The picture starts as the background colour, and each layer in turn, layer 1 then layer 2,
-//! is blended over what is there. This is the layer blending as I remember it from RM0433, and
-//! I have not checked any of it against the manual yet (it is not on this machine), so all of
-//! it is to be checked against RM0433:
+//! is blended over what is there, as RM0433 32.4.2 (Layer blending, p. 1211) and 32.7.21 (LxBFCR,
+//! p. 1227) give it:
 //!
-//!   result = BF1 x C + BF2 x Cs
+//!   BC = BF1 x C + BF2 x Cs
 //!
 //! where C is the layer's pixel, Cs is the colour below it (the background, for layer 1), and
-//! the two blending factors are chosen in the layer's BFCR. BF1 is the constant alpha (CACR)
-//! or the pixel's alpha times it, and BF2 is one minus whichever the layer uses for BF1,
-//! as the firmware programs it (the other pairings are worked out as written). A pixel
-//! format without an alpha channel has alpha 255. Outside the window of a layer that is on, its
-//! default colour (DCCR, which has an alpha of its own) stands for its pixel; so it does for the
-//! window's lines past the CFBLNR the layer fetches.
+//! the two blending factors are chosen in the layer's BFCR: BF1 is 4 (constant alpha) or 6
+//! (pixel alpha x constant alpha), and BF2 is 5 (1 - constant alpha) or 7 (1 - pixel alpha x
+//! constant alpha); the other codes are reserved. The constant alpha (CACR) is divided by 255
+//! by the hardware (32.7.19, p. 1226). A pixel format without an alpha channel has alpha 255.
+//! Outside the window of a layer, its default colour (DCCR, which has an alpha of its own) is
+//! used for the pixel; so it is when the layer is disabled, and the blending is done then too
+//! (32.4.2, p. 1212; 32.7.20, p. 1226), so a disabled layer blends its default colour over the
+//! whole active area, with the factors in its BFCR. The manual says to keep a disabled layer's
+//! factors at their reset value (0x0607, with a default colour of 0, which is transparent) so
+//! that nothing shows.
 //!
-//! Three things in that are my choices, not what I have read in the manual:
+//! What RM0433 does not say, and this model chooses:
 //!
-//! - A layer that is off adds nothing. That is my reading, and I chose it because of what the
-//!   firmware does: leaving the 12-bit depth it sets layer 2's LEN to 0 and its BFCR to 0, which
-//!   is a reserved code, so it cannot expect a layer that is off to be blended. RM0433's wording
-//!   for DCCR may be that the default colour is used outside the defined layer window or when
-//!   the layer is disabled, which would mean a disabled layer still blends its default colour.
-//! - The blend rounds to the nearest level (the sum is divided by 255 and rounded). The chip may
-//!   round another way, so a mid-range level can be one out; 0 and full intensity are exact.
-//! - The line a layer fetches is CFBLL - 7 bytes. That is the H7 HAL's rule (CFBLL is the line
-//!   length plus 7, where the F4 and F7 had 3), and the firmware writes exactly the window's
-//!   bytes plus 7 for every mode; I have not checked it against RM0433. A window wider than
-//!   that is not drawn. A window taller than CFBLNR shows its default colour for the lines that
-//!   are not fetched. A window is fetched from its own first pixel: the part of it before the
-//!   active area is not shown, so the first pixel shown is further on in the framebuffer.
+//! - The rounding. The manual says only that the constant alpha is divided by 255; this blends
+//!   to the nearest level (the sum is divided by 255 and rounded), so a mid-range level may be
+//!   one out on the chip; 0 and full intensity are exact. The manual's own example (32.7.21:
+//!   constant alpha 240, C 128, Cs 48, BC 123) comes out the same either way.
+//! - A disabled layer with reserved factor codes. The firmware leaves layer 2 like that when it
+//!   leaves the 12-bit depth (LEN 0, BFCR 0). The manual gives those codes no meaning, so such a
+//!   layer adds nothing.
+//! - What shows for the lines of a window past CFBLNR. The manual only says that the prefetch
+//!   stops at the end of the frame buffer (32.4.2, p. 1211); the model shows the default colour.
+//!
+//! The line a layer fetches is CFBLL - 7 bytes: CFBLL is the line length in bytes plus 7 on the
+//! H7 (32.7.23, p. 1229; the F4 and F7 had 3), and the firmware writes exactly the window's
+//! bytes plus 7 for every mode. A line length longer than the window needs is harmless (the
+//! rest is discarded and not displayed, 32.4.2); a shorter one makes the chip raise a FIFO
+//! underrun and shows something the manual does not say, so a window wider than the line is
+//! not drawn. A window taller than CFBLNR shows its default colour for the lines that
+//! are not fetched. A window is fetched from its own first pixel: the part of it before the
+//! active area is not shown, so the first pixel shown is further on in the framebuffer.
+//!
+//! The window registers count from the start of the sync, like the porch registers: the first
+//! pixel of the active area is AHBP + 1 and the last is AAW (32.7.15, p. 1223), the first
+//! line AVBP + 1 and the last AAH (32.7.16, p. 1224), and a window's WHSPPOS and WVSPPOS are
+//! its last pixel and line, not one past. The manual wants a window inside the active area; one
+//! that is not is drawn clipped.
+//!
+//! The pixel formats widen a channel of fewer than 8 bits to 8 by bit replication, the bits
+//! repeated until there are more than 8 and the top 8 taken (32.4.2, p. 1209), which is what
+//! `widen` does: 5 bits abcde become abcdeabc. ARGB1555's one alpha bit is 0 or 255.
 //!
 //! Only what the firmware uses is drawn: ARGB8888, RGB888, RGB565, ARGB1555 and ARGB4444, and
 //! L8 through the colour table. A frame that needs anything else (colour keying, AL44 and AL88,
-//! L8 without the colour table, blending factors that BFCR can name but the firmware never
-//! sets) is reported as unsupported instead of being drawn wrong.
+//! L8 without the colour table, the factor codes that the manual reserves) is reported as
+//! unsupported instead of being drawn wrong.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -86,6 +104,9 @@ pub(crate) struct Layer {
     pub(crate) cfblnr: u32,
 }
 
+/// CACR as a reset leaves it (RM0433 32.7.19, p. 1226): a constant alpha of 1.
+pub(crate) const CACR_RESET: u32 = 0xFF;
+
 /// BFCR as a reset leaves it: pixel alpha times constant alpha.
 const BFCR_RESET: u32 = 0x0607;
 
@@ -96,7 +117,7 @@ impl Default for Layer {
             whpcr: 0,
             wvpcr: 0,
             pfcr: 0,
-            cacr: 0,
+            cacr: CACR_RESET,
             dccr: 0,
             bfcr: BFCR_RESET,
             cfbar: 0,
@@ -464,13 +485,25 @@ fn blend_line(
     }
 }
 
-/// CFBLL is the number of bytes in a line, plus 7. That is the H7 HAL's rule, which the firmware
-/// follows for every mode (the F4 and F7 had 3); to be checked against RM0433.
+/// CFBLL is the number of bytes in a line, plus 7 (RM0433 32.7.23, p. 1229). The F4 and F7 had 3.
 const CFBLL_EXTRA: usize = 7;
 
-/// Blends one layer over `rgb`, the picture so far. A layer that is off adds nothing. Where the
-/// window of one that is on does not reach, its default colour stands for its pixel, and so it
-/// does for the window's lines past the CFBLNR that the layer fetches.
+/// The layer's default colour, ARGB in DCCR.
+fn default_colour(layer: &Layer) -> Argb {
+    Argb {
+        alpha: (layer.dccr >> 24) as u8,
+        rgb: [
+            (layer.dccr >> 16) as u8,
+            (layer.dccr >> 8) as u8,
+            layer.dccr as u8,
+        ],
+    }
+}
+
+/// Blends one layer over `rgb`, the picture so far. A layer that is off blends its default colour
+/// over the whole of it. Where the window of one that is on does not reach, its default colour
+/// stands for its pixel, and so it does for the window's lines past the CFBLNR that the layer
+/// fetches.
 fn composite<'a>(
     layer: &Layer,
     clut: &[u32; 256],
@@ -479,6 +512,16 @@ fn composite<'a>(
     ram: &impl Fn(u32, usize) -> Option<&'a [u8]>,
 ) -> Result<(), FrameError> {
     if layer.cr & LEN == 0 {
+        // RM0433 32.4.2 (p. 1212): the blending is done even when a layer is disabled, with the
+        // default colour in place of the pixels, so the default colour covers the whole active
+        // area. Factor codes that the manual reserves are not given a meaning there, and the
+        // layer adds nothing.
+        if let Ok(blending) = Blending::of(layer) {
+            let default = default_colour(layer);
+            blending
+                .mix(default.alpha)
+                .apply_to_all(default.rgb, rgb.as_chunks_mut::<3>().0);
+        }
         return Ok(());
     }
     if layer.cr & COLKEN != 0 {
@@ -487,14 +530,7 @@ fn composite<'a>(
     let blending = Blending::of(layer)?;
     let format = Format::of(layer)?;
     let bytes_per_pixel = format.bytes_per_pixel();
-    let default = Argb {
-        alpha: (layer.dccr >> 24) as u8,
-        rgb: [
-            (layer.dccr >> 16) as u8,
-            (layer.dccr >> 8) as u8,
-            layer.dccr as u8,
-        ],
-    };
+    let default = default_colour(layer);
     let window = active.window(layer);
     // What of the window is in the active area, and the part of it before the active area that is
     // fetched but not shown.
@@ -772,12 +808,37 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_layer_shows_the_background() {
+    fn a_disabled_layer_with_nothing_to_show_leaves_the_background() {
+        // A default colour with alpha 0 and the blending factors as a reset leaves them.
         let display = board(L8, CLUTEN);
-        display.update(|s| s.bccr = 0x0001_0203);
+        display.update(|s| {
+            s.bccr = 0x0001_0203;
+            s.layers[0].dccr = 0;
+            s.layers[0].bfcr = BF_PIXEL;
+        });
         let frame = display.frame(ram(&[])).unwrap();
         assert_eq!(frame.pixel(0, 0), [1, 2, 3]);
         assert_eq!(frame.pixel(799, 599), [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_disabled_layer_blends_its_default_colour_over_the_whole_active_area() {
+        // RM0433 32.4.2 (p. 1212) and 32.7.20 (p. 1226): the default colour is used outside the
+        // window and when the layer is disabled, and the blending is done whether it is or not.
+        // Here the board's layer 1 is off, with its opaque black default and constant alpha.
+        let display = board(L8, CLUTEN);
+        display.update(|s| s.bccr = 0x0001_0203);
+        let frame = display.frame(ram(&[])).unwrap();
+        assert_eq!(frame.pixel(0, 0), [0, 0, 0]);
+        assert_eq!(frame.pixel(799, 599), [0, 0, 0]);
+        // Half of it, by the pixel alpha of the default colour with the reset factors.
+        display.update(|s| {
+            s.layers[0].dccr = 0x80FF_FFFF;
+            s.layers[0].bfcr = BF_PIXEL;
+            s.bccr = 0;
+        });
+        let frame = display.frame(ram(&[])).unwrap();
+        assert_eq!(frame.pixel(400, 300), [128, 128, 128]);
     }
 
     #[test]
@@ -869,7 +930,7 @@ mod tests {
     }
 
     // The tests that round pin this model's rounding (to the nearest level), which is my choice
-    // and not measured on the chip: RM0433 is to be checked for it.
+    // and not measured on the chip: RM0433 only says the constant alpha is divided by 255.
     #[test]
     fn blending_rounds_to_the_nearest_level() {
         // 128/255 of 255 over 100 is 128 + 127/255 x 100 = 177.8.
@@ -977,16 +1038,21 @@ mod tests {
     }
 
     #[test]
-    fn a_layer_that_is_off_adds_nothing_whatever_its_other_registers_say() {
+    fn a_layer_that_is_off_with_reserved_blending_factors_adds_nothing() {
         // The firmware's layer 2 after the 12-bit depth: everything zero, blending factors too.
-        let display = board(L8, CLUTEN);
+        // RM0433 (p. 1227) reserves those codes and does not say what they do, so the layer is
+        // taken to add nothing.
+        let display = board(L8, CLUTEN | LEN);
         display.update(|s| {
             s.bccr = 0x0001_0203;
-            s.layers[0].dccr = 0xFF10_2030;
+            s.layers[0].dccr = 0;
+            s.layers[0].cacr = 0;
+            s.layers[0].cr = 0;
             s.layers[1] = Layer {
                 bfcr: 0,
                 ..Layer::default()
             };
+            s.layers[0].bfcr = 0;
         });
         let frame = display.frame(ram(&[])).unwrap();
         assert_eq!(frame.pixel(0, 0), [1, 2, 3]);
@@ -1239,15 +1305,13 @@ mod tests {
             for x in 0..width {
                 let mut c = [(s.bccr >> 16) as u8, (s.bccr >> 8) as u8, s.bccr as u8];
                 for (layer, clut) in s.layers.iter().zip(&s.clut) {
-                    if layer.cr & 1 == 0 {
-                        continue;
-                    }
                     let left = i64::from(layer.whpcr & 0xFFF) - (h_porch + 1);
                     let right = i64::from(layer.whpcr >> 16 & 0xFFF) - h_porch;
                     let top = i64::from(layer.wvpcr & 0x7FF) - (v_porch + 1);
                     let bottom = i64::from(layer.wvpcr >> 16 & 0x7FF) - v_porch;
                     let bytes = [4, 3, 2, 2, 2, 1][(layer.pfcr & 7) as usize];
-                    let inside = (left..right).contains(&x)
+                    let inside = layer.cr & 1 != 0
+                        && (left..right).contains(&x)
                         && (top..bottom).contains(&y)
                         && y - top < i64::from(layer.cfblnr & 0x7FF);
                     let (alpha, colour) = if inside {

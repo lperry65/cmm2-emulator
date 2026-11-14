@@ -29,7 +29,9 @@ pub const OTG_SIZE: u32 = 0x2_0000;
 const OTG_IRQ: u16 = 101;
 const CHANNELS: usize = 12;
 
-/// The frame number counts to 0x3FFF and starts again at 0, as RM0433 gives HFNUM.FRNUM.
+/// The frame number counts to 0x3FFF and starts again at 0, as RM0433 57.14.24 (p. 2653) gives
+/// HFNUM.FRNUM ("cleared to 0 when it reaches 0x3FFF"; the register resets to 0x3FFF, so 0x3FFF
+/// is a value it holds, and the model's period is 0x4000 frames).
 const FRNUM_MASK: u64 = 0x3FFF;
 
 const CYCLES_PER_US: u64 = CORE_HZ / 1_000_000;
@@ -64,6 +66,10 @@ const HPTXSTS: u32 = 0x410;
 const HAINT: u32 = 0x414;
 const HAINTMSK: u32 = 0x418;
 const HPRT: u32 = 0x440;
+const GCCFG: u32 = 0x38;
+const DCFG: u32 = 0x800;
+const DCTL: u32 = 0x804;
+const PCGCCTL: u32 = 0xE00;
 const CHANNEL0: u32 = 0x500;
 const CHANNEL_STRIDE: u32 = 0x20;
 const FIFO: u32 = 0x1000;
@@ -83,7 +89,11 @@ const RXFFLSH: u32 = 1 << 4;
 const TXFFLSH: u32 = 1 << 5;
 const TXFNUM_SHIFT: u32 = 6;
 const TXFNUM_MASK: u32 = 0x1F;
+// TXFNUM (RM0433 57.14.5, p. 2628): in host mode 0 is the non-periodic FIFO, 1 the periodic one,
+// 2 to 15 are device mode only, and 0x10 flushes all of them.
 const TXFNUM_ALL: u32 = 0x10;
+// Bit 29 is reserved in RM0433 (57.14.5, p. 2628), which has GRSTCTL reset to 0x80000000. The
+// firmware waits for it on one path (see GSNPSID_VALUE), so the model sets it.
 const CSRST_DONE: u32 = 1 << 29;
 const AHBIDL: u32 = 1 << 31;
 
@@ -120,10 +130,12 @@ const NAK: u32 = 1 << 4;
 const ACK: u32 = 1 << 5;
 const TXERR: u32 = 1 << 7;
 
-// GHWCFG1 to 4 are guesses: I have not read them from the board, and I do not know that the
-// reference manual describes them; the firmware reads only GHWCFG2. I picked them to describe
-// the H743's OTG with the embedded full-speed PHY by the Synopsys core's usual layout, and they
-// agree with how the firmware sets the core up.
+// GHWCFG1 to 4 and GSNPSID are not in RM0433: its register map (Table 523, pp. 2614 and 2615)
+// goes from OTG_GCCFG (0x38) and OTG_CID (0x3C) to OTG_GLPMCFG (0x54) and has nothing at 0x40 to
+// 0x50. They are the Synopsys core's own registers, which the firmware reads, and what they hold
+// is a guess: I have not read them from the board, and the firmware reads only GHWCFG2. I
+// picked them to describe the H743's OTG with the embedded full-speed PHY by the Synopsys
+// core's usual layout, and they agree with how the firmware sets the core up.
 //  - GHWCFG1: 0, every endpoint bidirectional.
 //  - GHWCFG2: slave mode only (OTG_ARCH 0), dedicated FS PHY (bits 9:8 = 1), 6 device
 //    endpoints (bits 13:10 = 5, the count after endpoint 0), 12 host channels (bits 17:14 = 11),
@@ -135,9 +147,9 @@ const TXERR: u32 = 1 << 7;
 //  - GHWCFG4: 0.
 const GHWCFG2_VALUE: u32 = 0x028E_D500;
 const GHWCFG3_VALUE: u32 = 0x0400_00E8;
-// GSNPSID is a guess too. The firmware wants the top half to be one of three Synopsys ids,
-// and for the low half not to be above 0x4209, or it waits for CSRST_DONE in GRSTCTL instead
-// of AHBIDL (which I answer as well).
+// GSNPSID is a guess too (see above). The firmware wants the top half to be one of three
+// Synopsys ids, and for the low half not to be above 0x4209, or it waits for CSRST_DONE in
+// GRSTCTL instead of AHBIDL (which I answer as well).
 const GSNPSID_VALUE: u32 = 0x4F54_310A;
 // The room in the non-periodic and periodic transmit queues, in words, and how many requests
 // they can hold. The model takes a packet as it is written, so they are never full.
@@ -145,11 +157,22 @@ const GNPTXSTS_VALUE: u32 = 0x0008_0200;
 const HPTXSTS_VALUE: u32 = 0x0008_0100;
 
 // What the silicon resets to, as far as I can tell from what the board reads after the firmware
-// has edited them; the SVD's values would give a different result.
+// has edited them; the SVD's values would give a different result. RM0433 gives other values
+// (GUSBCFG 0b0X00...0001 0100 0001 0000 in 57.14.4, p. 2625, that is 0x1410 with bit 30 undefined, with bit 4 where the board has PHYSEL, bit 6, and
+// HCFG 0 in 57.14.22, p. 2651), which would not leave what the board reads once the firmware
+// has edited them, so the board's wins.
 const GUSBCFG_RESET: u32 = 0x1440;
 const HCFG_RESET: u32 = 0x200;
-// HCFG.FSLSPCS, the clock for the speed of the PHY.
-const HCFG_FSLSPCS: u32 = 3;
+// What a core soft reset does not clear (RM0433 57.14.5, p. 2629), as register and mask:
+// HCFG.FSLSPCS, the clock for the speed of the PHY, DCFG.DSPD, DCTL.SDIS, PCGCCTL.GATEHCLK and
+// STPPCLK, and all of GCCFG.
+const CSRST_KEEPS: [(u32, u32); 5] = [
+    (HCFG, 3),
+    (DCFG, 3),
+    (DCTL, 1 << 1),
+    (PCGCCTL, 3),
+    (GCCFG, !0),
+];
 
 // HPRT: the bits the firmware can set and clear as it likes, and the bits that clear when a 1
 // is written to them.
@@ -356,22 +379,27 @@ impl OtgRegisters {
         self.port.with_device(|device| device.reset());
     }
 
-    // A core soft reset: the state machines go idle and the FIFOs empty, so the channels, the
-    // RX queue and the flags the core latched are cleared, and so are the registers, which go
-    // back to what a reset leaves except for the speed bits of HCFG. The port keeps its state,
-    // as the device stays connected. This is from my memory of RM0433, which I have not checked:
-    // I remember it keeping a few more bits (the power and clock gating of PCGCCTL, and
-    // DCFG.DSPD, which this core does not have). The firmware does it before it sets anything
-    // up, so it cannot tell.
+    // A core soft reset (RM0433 57.14.5, p. 2629): the interrupts and all the CSR bits are cleared
+    // except those the manual lists (kept below), the state machines go idle and the FIFOs are
+    // flushed. So the channels, the RX queue, the flags the core latched and the port's control
+    // and change bits (HPRT's) are cleared too: the port loses its power, as `sync_port` finds,
+    // and the firmware has to power it again, which it does after the reset, since it does the
+    // reset before it powers the port. What shows the line, PCSTS, is not a bit of the core's.
+    // The model has no GATEHCLK or STPPCLK, which are kept like the registers they are in.
     fn soft_reset(&mut self) {
-        let speed = self.stored.read(HCFG) & HCFG_FSLSPCS;
+        let kept = CSRST_KEEPS.map(|(offset, mask)| (offset, mask, self.stored.read(offset)));
         self.stored.reset(ResetCause::Software);
         self.stored.write(GUSBCFG, GUSBCFG_RESET, !0);
-        self.stored.write(HCFG, HCFG_RESET | speed, !0);
+        self.stored.write(HCFG, HCFG_RESET, !0);
+        for (offset, mask, value) in kept {
+            self.stored.write(offset, value, mask);
+        }
         let state = &mut self.state;
         state.rx.clear();
         state.latched = 0;
         state.channels = Default::default();
+        state.hprt &= PCSTS;
+        state.enable_at = None;
     }
 
     // The transmit FIFOs `fifo` names are emptied: 0 is the non-periodic one, which the control
@@ -509,8 +537,10 @@ impl OtgRegisters {
     }
 
     // What the firmware wrote to the FIFO window of channel n: the bytes of `word` that `mask`
-    // selects, as a byte or halfword write has them. The FIFO takes what it is given: a narrow
-    // write is not widened to a word.
+    // selects, as a byte or halfword write has them. RM0433 only says that the registers are to
+    // be accessed by words (57.13, p. 2614) and that an OUT channel's window is written (57.13.1,
+    // pp. 2618 and 2619); it does not say what a narrower write does. The FIFO takes what it is
+    // given: a narrow write is not widened to a word.
     fn stage(&mut self, n: usize, word: u32, mask: u32) {
         let Some(channel) = self.state.channels.get_mut(n) else {
             return;
@@ -2166,18 +2196,28 @@ mod tests {
     }
 
     #[test]
-    fn a_core_soft_reset_leaves_the_power_of_the_port() {
+    fn a_core_soft_reset_clears_the_port_control_bits_and_so_drops_the_power() {
+        // RM0433 57.14.5 (p. 2629): CSRST clears all the CSR bits but the ones it lists, which
+        // do not include HPRT's. The port loses its power, and the device behind it its VBUS.
         let mut r = rig();
         r.port.attach(script(1, vec![]).0);
-        r.write(HPRT_ADDR, PPWR);
+        r.power();
+        r.write(HPRT_ADDR, PPWR | PSUSP);
+        assert_eq!(
+            r.read(HPRT_ADDR) & (PPWR | PSUSP | PCSTS),
+            PPWR | PSUSP | PCSTS
+        );
         r.write(GRSTCTL_ADDR, CSRST);
-        assert_eq!(r.read(HPRT_ADDR) & PPWR, PPWR);
-        r.advance_us(200);
+        assert_eq!(r.read(HPRT_ADDR) & (PPWR | PSUSP), 0);
+        r.advance_us(1_000);
+        assert_eq!(r.read(HPRT_ADDR) & (PCSTS | PENA), 0, "no power, no device");
+        // The firmware powers it again, and the device is found again.
+        r.power();
         assert_eq!(r.read(HPRT_ADDR) & PCSTS, PCSTS);
     }
 
     #[test]
-    fn a_core_soft_reset_clears_the_latched_flags_and_leaves_the_port() {
+    fn a_core_soft_reset_clears_the_latched_flags_and_the_port_change_flags() {
         let mut r = rig();
         r.port.attach(script(1, vec![]).0);
         r.enabled_port();
@@ -2186,11 +2226,39 @@ mod tests {
         assert_eq!(r.read(GINTSTS_ADDR) & DISCINT, DISCINT);
         r.write(GRSTCTL_ADDR, CSRST);
         assert_eq!(r.read(GINTSTS_ADDR) & DISCINT, 0);
-        let (device, _) = script(1, vec![]);
-        let mut r = Rig::with(device);
-        let hprt = r.read(HPRT_ADDR);
+        let mut r = rig();
+        r.port.attach(script(1, vec![]).0);
+        r.power();
+        assert_eq!(r.read(HPRT_ADDR) & PCDET, PCDET);
         r.write(GRSTCTL_ADDR, CSRST);
-        assert_eq!(r.read(HPRT_ADDR), hprt, "the device stays connected");
+        assert_eq!(r.read(HPRT_ADDR) & (PCDET | PENCHNG | POCCHNG), 0);
+    }
+
+    #[test]
+    fn a_core_soft_reset_keeps_what_the_manual_lists() {
+        // RM0433 57.14.5 (p. 2629): GATEHCLK and STPPCLK of OTG_PCGCCTL, FSLSPCS of OTG_HCFG, DSPD
+        // of OTG_DCFG, SDIS of OTG_DCTL, and the whole of OTG_GCCFG.
+        let mut r = rig();
+        for (offset, written) in [
+            (PCGCCTL, 0xFFFF_FFFF),
+            (HCFG, 0xFFFF_FFFF),
+            (DCFG, 0xFFFF_FFFF),
+            (DCTL, 0xFFFF_FFFF),
+            (GCCFG, 0xFFFF_FFFF),
+        ] {
+            r.write(OTG_BASE + offset, written);
+        }
+        let before = [PCGCCTL, HCFG, DCFG, DCTL, GCCFG].map(|offset| r.read(OTG_BASE + offset));
+        r.write(GRSTCTL_ADDR, CSRST);
+        let after = [PCGCCTL, HCFG, DCFG, DCTL, GCCFG].map(|offset| r.read(OTG_BASE + offset));
+        // The bits it keeps are as they were, and the others are as a reset leaves them.
+        assert_eq!(after[0] & 3, 3);
+        assert_eq!(after[0] & !3, 0);
+        assert_eq!(after[1], 0x200 | before[1] & 3);
+        assert_eq!(after[2] & 3, 3);
+        assert_eq!(after[3] & 2, 2);
+        assert_eq!(after[4], before[4]);
+        assert_ne!(after[4], 0, "GCCFG kept something");
     }
 
     #[test]

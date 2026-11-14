@@ -93,11 +93,14 @@ every mode and depth that the firmware accepts (all of the above) it writes `CFB
 with the pitch the window's bytes a line (`CFBLR` `0x03200327` for 800 L8 pixels: pitch `0x320` =
 800, `CFBLL` `0x327` = 807), and `CFBLNR` the lines of the active area (`0x258` = 600, `0x1E0` =
 480 for 640x480, doubled for the small modes), for layer 1 and, in 12 bits, for layer 2 too. When
-it turns layer 2 off on leaving the 12-bit depth it writes `CFBLR` = `0x00000007`. The +7 is the
-H7 HAL's rule for the line length (the F4 and F7 had +3), which is what the firmware uses; I
-have not checked it against RM0433. The model fetches `CFBLL` - 7 bytes a line, and a window
-wider than that is `FrameError::Unsupported`. A window is fetched from its own first pixel, so a
-window that starts before the active area has its first pixels fetched and not shown.
+it turns layer 2 off on leaving the 12-bit depth it writes `CFBLR` = `0x00000007`. The +7 is what
+RM0433 gives for the H7 (32.7.23, p. 1229: the line length in bytes plus 7, with the examples
+`0x02000207` for 256 RGB565 pixels and `0x03C003C7` for 320 RGB888); the F4 and F7 had 3. The
+model fetches `CFBLL` - 7 bytes a line. The manual says a line length longer than the window needs
+is harmless (the useless data is read and discarded, not displayed, 32.4.2, p. 1211) and a shorter
+one raises a FIFO underrun; a window wider than the fetched line is `FrameError::Unsupported`,
+because the manual does not say what is shown then. A window is fetched from its own first pixel,
+so a window that starts before the active area has its first pixels fetched and not shown.
 
 Memory layout (`MODE 8,12`, the game's): page n at `0xD0000000` + n x 614,400 (640 x 480 x 2),
 ARGB4444, page 0 is layer 1 and page 1 layer 2. At 800x600 12-bit the pages are 966,656 bytes
@@ -123,10 +126,23 @@ apart (page 1 at `0xD00EC000`).
   `PLLCFGR` (`DIVR3EN`, `PLL3FRACEN`), `PLL3DIVR` and `PLL3FRACR`, with HSE = 8 MHz as the only
   source (other sources, or `DIVM3` = 0, give 0). The VCO is worked out exactly (the reference is
   divided by `DIVM3` after it is multiplied, not before) and the clock is truncated to whole Hz.
-  PLL3 only locks, and `PLL3RDY` only sets, for a reference in the range `PLL3RGE` selects (1 to 2,
-  2 to 4, 4 to 8 or 8 to 16 MHz; the wide VCO needs 2 MHz or more, the medium one takes 1 to 2) and
-  a VCO of 192 to 836 MHz (wide, `PLL3VCOSEL` clear) or 150 to 420 MHz (medium), which I remember
-  from RM0433 and have not checked against it; otherwise there is no pixel clock. The LTDC runs
+  PLL3 only locks, and `PLL3RDY` only sets, for a reference (HSE / `DIVM3`) of 1 to 16 MHz, within
+  the range of the VCO that `PLL3VCOSEL` picks: the wide VCO (`PLL3VCOSEL` clear) takes a reference
+  of 2 to 16 MHz and makes 192 to 960 MHz, the medium one (set) takes 1 to 2 MHz and makes 150 to
+  420 MHz. That is RM0433 8.5.5 (PLL block diagram and text, pp. 346 to 348) and 8.7.17 (p. 410).
+  The manual does not say a PLL outside those ranges fails to lock (it says the output frequency is not
+  guaranteed); not locking there is my choice, and then there is no pixel clock. `PLL3RGE` is not a
+  condition: the manual only has it set to the reference's range for optimal performance
+  (8.7.12, p. 401), and the model ignores it. `DIVN3` is 4 to 512 (the register
+  field 3 to 0x1FF), which no VCO range can fall below, so the VCO range covers the lower limit;
+  `DIVR3` is 1 to 128. The fraction (`FRACN3`, 13 bits, 8.7.18, p. 411) only counts once
+  `PLL3FRACEN` goes from 0 to 1, which latches it into the sigma-delta modulator (8.5.5, p. 347);
+  a new `FRACN3` written with `PLL3FRACEN` still set, or `PLL3FRACEN` cleared, changes nothing
+  until the next 0 to 1, and a reset clears what was latched. The settings the manual locks while
+  the PLL is on (`DIVM3`, and `PLLSRC` while any PLL is on; `PLL3RGE`, `PLL3VCOSEL` and `DIVR3EN`;
+  `DIVN3` and the three dividers) are not written while `PLL3ON` is set (8.7.11, p. 398, 8.7.12 and
+  8.7.17); `FRACN3` and `PLL3FRACEN` can be written at any time. The model locks at once; the
+  manual says `PLL3RDY` is set when the output is within 2% of the target. The LTDC runs
   from the pixel clock as it is: the frame starts when it is enabled and the clock runs, and when
   the clock starts, stops or changes under an enabled LTDC the counters keep their position and go
   on at the new rate from that cycle (the clock logs each change with its cycle and wakes the LTDC,
@@ -136,29 +152,37 @@ apart (page 1 at `0xD00EC000`).
   cannot make the CPU stop for it at every instruction; the flags are still worked out as they are
   read.
 - Formats: ARGB8888, RGB888, RGB565, ARGB1555, ARGB4444 and L8 through the layer's own colour
-  table. Channels are widened by repeating the high bits (RGB565 and ARGB1555 5/6 bits, ARGB4444
-  nibbles); ARGB1555's alpha is 0 or 255; formats without alpha are opaque. Not drawn, and an
-  explicit `FrameError::Unsupported`: AL44 and AL88, L8 without `CLUTEN`, colour keying,
-  blending factors other than 4/6 for BF1 and 5/7 for BF2, and a window wider than the fetched line.
-- Blending (RM0433, LTDC layer blending, as I remember it; I have not got the manual here, so
-  all of this is to be checked against RM0433): start from `BCCR`, and for layer 1 then layer 2,
-  `BC = BF1 x C + BF2 x Cs` with the factors above and `Cs` the picture so far. Outside its
-  window the layer's default colour `DCCR` stands for C (with its own alpha). Things I chose that
-  RM0433 may say differently:
-  - A layer that is off adds nothing. That is my reading, chosen because of what the firmware
-    does: leaving the 12-bit depth it sets layer 2's `LEN` to 0 with `BFCR` = 0, which is a
-    reserved code. RM0433's wording for `DCCR` may be that it is used outside the defined layer
-    window or when the layer is disabled, in which case a disabled layer would still blend its
-    default colour.
-  - The rounding: I round to nearest, `(sum + 127) / 255`. The chip's rounding is not known, so a
-    mid-range level can be one out; 0 and full intensity are exact.
-  - The formula itself, and the pairings of BF1 and BF2 other than the firmware's, are as I
-    remember them.
-  - The line a layer fetches is `CFBLL` - 7 bytes (the H7 HAL's rule, as the firmware writes it),
-    and the lines it fetches are `CFBLNR`. A window wider than the fetched line is
-    `FrameError::Unsupported`, as the firmware never writes one; a window taller than `CFBLNR`
-    shows the default colour for the lines that are not fetched. What the chip shows there I do not
-    know.
+  table. A channel of fewer than 8 bits is widened by bit replication, as RM0433 32.4.2 gives it
+  (p. 1209: the bits are repeated until there are more than 8 and the top 8 taken; the red of
+  RGB565, abcde, becomes abcdeabc), so full intensity is 255 (RGB565 and ARGB1555 5/6 bits,
+  ARGB4444 nibbles); ARGB1555's alpha is its one bit repeated, 0 or 255; formats without alpha are
+  opaque. Not drawn, and an explicit `FrameError::Unsupported`: AL44 and AL88, L8 without
+  `CLUTEN`, colour keying, factor codes that BFCR reserves, and a window wider than the fetched
+  line.
+- Blending (RM0433 32.4.2, layer blending, p. 1211, and 32.7.19 to 32.7.21, pp. 1226 and 1227):
+  start from `BCCR`, and for layer 1 then layer 2, `BC = BF1 x C + BF2 x Cs` with `Cs` the picture
+  so far (the background colour, for layer 1). `BF1` is code 4 (constant alpha) or 6 (pixel alpha
+  x constant alpha) and `BF2` is 5 (1 - constant alpha) or 7 (1 - pixel alpha x constant alpha),
+  the other codes are reserved. The constant alpha in `CACR` is divided by 255 by the hardware; it
+  resets to 0xFF (ST's SVD says 0, the manual wins) and `BFCR` to 0x0607. The manual's example
+  (constant alpha 240, C 128, Cs 48, BC 123) is a test. Outside its window the layer's default
+  colour `DCCR` (with its own alpha, 0 at reset: transparent black) stands for C, and so it does
+  when the layer is disabled: the manual says the blending is always done, even for a layer that
+  is off, and to keep the factors of a disabled layer at their reset value so that the default
+  colour does not show (32.4.2, p. 1212). So a disabled layer blends its default colour over the
+  whole active area. What I chose where the manual is silent:
+  - A disabled layer with reserved factor codes adds nothing. The firmware leaves layer 2 so
+    (`LEN` 0 and `BFCR` 0) on leaving the 12-bit depth; the manual gives those codes no meaning.
+  - The rounding: I round to nearest, `(sum + 127) / 255`. The manual says only that the constant
+    alpha is divided by 255, so the chip's rounding is not known, and a mid-range level can be one
+    out; 0 and full intensity are exact.
+  - What is shown for the lines of a window past `CFBLNR`: the default colour. The manual only
+    says the prefetch stops at the end of the frame buffer.
+  - The window registers count from the start of the sync, like the porch registers, as the manual
+    has it (32.7.15 and 32.7.16, pp. 1223 and 1224): the first pixel of the active area is
+    `AHBP` + 1 and the last is `AAW`, the first line `AVBP` + 1 and the last `AAH`, and a window's
+    `WHSPPOS` and `WVSPPOS` are its last pixel and line. The manual wants a window inside the
+    active area; one that is not is drawn clipped.
 - An active area with no width or no height (`AWCR` at or before `BPCR`) is not a picture:
   `FrameError::Empty`. The window keeps the last good frame, and draws nothing for a frame or a
   window with no size.
@@ -174,10 +198,17 @@ apart (page 1 at `0xD00EC000`).
   prompt and about 38 ms for two layers at 1920x1080, a size this firmware does not have at 12 bits;
   I did not time it for the other cases.)
 - `SRCR`: IMR reloads at once. VBR is held to the next vertical blank (the line after `AWCR`'s
-  active height; if that is at or beyond the last line of the frame there is no such line, and I
-  take the blank to be line 0 of the next frame, which I have not checked against the chip) and
-  reads 1 until then; the display takes the registers as they are at that moment and `RRIF` is set
-  (interrupt if `IER.RRIE`). With the LTDC off it waits for the first blank after it is enabled.
+  active height; RM0433 32.7.6, p. 1218, puts it at the beginning of the first line after the active display area; if
+  that is at or beyond the last line of the frame there is no such line, and I take the blank to
+  be line 0 of the next frame, which the manual does not say) and reads 1 until then; the display
+  takes the registers as they are at that moment and `RRIF` is set (interrupt if `IER.RRIE`).
+  `IMR` reloads at once and clears. With the LTDC off it waits for the first blank after it is
+  enabled. Lines are counted from 0 at the first line of the vertical sync (32.4.1, p. 1207), so
+  `LIPCR` = `AAH` is the last active line and the firmware's `AAH` + 1 the first after it; the
+  manual does not say how far into the line the interrupt is, and the model flags it at the start
+  of the line. The layer registers are shadowed (32.4.1, p. 1208; 32.7.6): a write goes to a copy
+  and a read returns the value of the last reload, so the new value is only read back after the
+  reload (`CLUTWR` is not shadowed). The registers around the layers are not.
   The clock is woken at the blank so the frame is current without any register access.
 
 Tests: unit tests in `display.rs` (each format, layers, blending, default colour, errors),

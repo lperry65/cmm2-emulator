@@ -114,7 +114,7 @@ mod tests {
         let mut m = cmm2_memory(&Irqs::new());
         assert_eq!(m.read32(0x5800_400C), 0x27); // RTC_ISR
         m.write32(0x5800_400C, 0x80); // INIT
-        assert_eq!(m.read32(0x5800_400C), 0xE7);
+        assert_eq!(m.read32(0x5800_400C), 0xC4);
     }
 
     #[test]

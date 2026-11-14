@@ -117,9 +117,11 @@ says `GUSBCFG` 0xA00 and `HCFG` 0, which cannot be what the silicon resets to):
 
 - The firmware ends with `GUSBCFG` 0x20001A47 where the board reads 0x20001847. The extra bit (0x200) was already in the SVD reset value and
   the firmware only edits some of the fields. The silicon's reset value is probably 0x1440 (my
-  guess: that is the reference manual's value, and it explains the 0x1847 the board shows).
-- `HCFG` ends 6 where the board reads 0x206. The silicon's reset value is probably 0x200 (the
-  resume-valid field, my guess, same reasoning).
+  guess: it explains the 0x1847 the board shows). RM0433 57.14.4 (p. 2625) gives 0b0X00 0000 0000 0000 0001 0100 0001 0000, that is 0x1410 with bit 30
+  (`FDMOD`) undefined, which has bit 4, reserved in the manual, where the board shows `PHYSEL` (bit 6); that would not leave
+  0x1847 after the firmware's edits, so I keep 0x1440.
+- `HCFG` ends 6 where the board reads 0x206. The silicon's reset value is probably 0x200 (my
+  guess, same reasoning); RM0433 57.14.22 (p. 2651) gives 0, which would not leave 0x206 either.
 
 I would set both reset values to those and check against the board (see the open questions).
 
@@ -264,14 +266,14 @@ The smallest set I used, and the order the firmware expects. Offsets from 0x4008
 | Register | Offset | Behaviour |
 |---|---|---|
 | `GAHBCFG` | 0x08 | store; bit 0 gates the interrupt |
-| `GRSTCTL` | 0x10 | read 0x80000000 (`AHBIDL`); a write of `CSRST` and the flush bits completes at once |
+| `GRSTCTL` | 0x10 | read 0x80000000 (`AHBIDL`; the manual's reset value, 57.14.5, p. 2627) plus `CSRST_DONE`, bit 29, which the manual lists as reserved and the firmware's other path waits for; a write of `CSRST` and the flush bits completes at once |
 | `GINTSTS` | 0x14 | computed. Bit 0 `CMOD` always 1 (host). Bit 3 `SOF` latched each ms, write-one-to-clear. Bit 4 `RXFLVL` while the RX status queue is not empty. Bit 24 `HPRTINT` while `HPRT` has `PCDET`, `PENCHNG` or `POCCHNG` set. Bit 25 `HCINT` while `HAINT` is not zero. Bit 29 `DISCINT` latched, write-one-to-clear. Bits 5 and 26 (TX FIFO empty) set; they are masked |
 | `GINTMSK` | 0x18 | store |
 | `GRXSTSR`, `GRXSTSP` | 0x1C, 0x20 | peek and pop the RX status queue |
 | `GNPTXSTS` | 0x2C | 0x00080200: non-periodic queue space 8, FIFO space 0x200 |
-| `GSNPSID` | 0x40 | top 16 bits 0x4F54 (the low half is open) |
-| `GHWCFG2` | 0x48 | 0x028ED500 (a guess, see section 12): FS PHY, 12 host channels |
-| `HFNUM` | 0x408 | frame number from the clock, one per millisecond; the top half non-zero |
+| `GSNPSID` | 0x40 | top 16 bits 0x4F54 (the low half is open); not in RM0433 |
+| `GHWCFG2` | 0x48 | 0x028ED500 (a guess, see section 12): FS PHY, 12 host channels; not in RM0433 |
+| `HFNUM` | 0x408 | frame number from the clock, one per millisecond, counting 0 to 0x3FFF (57.14.24, p. 2653); the top half non-zero |
 | `HPTXSTS` | 0x410 | 0x00080100 |
 | `HAINT` | 0x414 | bit n set while channel n has `HCINT` and `HCINTMSK` bits in common |
 | `HPRT` | 0x440 | as in section 3; `PENA` is write-one-to-clear; `PCDET`, `PENCHNG` write-one-to-clear; `PSPD` 2 and `PLSTS` 2 for a low-speed device |
@@ -284,8 +286,11 @@ A channel number above the hardware's (0 to 11) can be ignored; the firmware use
 the fields above (the FS PHY type, 12 or more host channels, a recognised `GSNPSID`). The scratch
 model answered 0x0002C100 for `GHWCFG2`, which has those fields and not much else (and not the
 periodic support bit, which an interrupt endpoint needs); the core now answers 0x028ED500, the whole
-register laid out as I remember the Synopsys core's (section 12). I do not know that the reference
-manual documents it, and every field but the three the firmware needs is a guess.
+register laid out as I remember the Synopsys core's (section 12). RM0433 does not document it, nor
+`GSNPSID` or `GHWCFG1` to `GHWCFG4`: its register map (Table 523, pp. 2614 and 2615) goes from
+`GCCFG` (0x38) and `CID` (0x3C) straight to `GLPMCFG` (0x54), with nothing at 0x40 to 0x50. So
+there is nothing to check them against in the manual, and every field but the three the firmware
+needs is a guess.
 
 **An OUT or SETUP transfer** (the order the firmware does it):
 
@@ -536,23 +541,31 @@ slices of a million), at the same speed.
   toggle, so a device that did not toggle would go unnoticed.
 - `GUSBCFG` resets to 0x1440 and `HCFG` to 0x200 (the guesses of section 2, which make the registers
   read what the board does after the firmware has edited them), not the SVD's values.
-- `HFNUM.FRNUM` counts to 0x3FFF and starts again at 0, as the reference manual has it, not at
-  0xFFFF.
-- The FIFO windows take what they are given: a byte or halfword write adds only the bytes written
-  (the data of a packet written with narrow writes arrives in the order written). I do not know what
-  the chip does with a narrow write to the FIFO, and the firmware writes words; this is the one that
-  loses nothing.
-- `GRSTCTL.CSRST` resets the core: the channels (all their registers and what is staged for them),
-  the RX FIFO and the flags the core latched are cleared, any transaction waiting is dropped, the
-  registers (`GINTMSK`, `GAHBCFG`, `HAINTMSK`, `HFIR` and so on) go back to their reset values except
-  `HCFG.FSLSPCS`, and it is over at once. The port and its device stay as they are. This is from my
-  memory of RM0433 and I have not checked it against the manual: I remember it keeping a few more bits
-  (the power and clock gating of `PCGCCTL`), which this model does not have. I am also not sure that a reset leaves `HPRT` alone, power (`PPWR`) included: if the manual's "all CSR bits" includes it, a reset would drop the port, which the firmware would meet by powering it again. I kept it because the firmware does the reset before it powers the port. The firmware does the
-  reset early in its init and programs everything after it, so it cannot tell, and it boots as before
-  (612 million instructions to the second prompt).
+- `HFNUM.FRNUM` counts to 0x3FFF and starts again at 0, as the reference manual has it (57.14.24,
+  p. 2653), not at 0xFFFF. The register resets to 0x3FFF there, and the model's frame number comes
+  from the clock, so it reads 0 at the start; the frame counter reset (`GRSTCTL.FCRST`) is not
+  modelled.
+- The FIFO windows (0x1000 + 0x1000 n, Table 526, p. 2619: the window of channel n is written for
+  an OUT channel and read for an IN one, and every read pops the one RX FIFO) take what they are
+  given: a byte or halfword write adds only the bytes written (the data of a packet written with
+  narrow writes arrives in the order written). RM0433 says only that the registers are to be
+  accessed by words (57.13, p. 2614) and not what a narrower access does, and the firmware writes
+  words; this is the one that loses nothing.
+- `GRSTCTL.CSRST` resets the core, as RM0433 57.14.5 (p. 2629) gives it: it clears the
+  interrupts and all the CSR bits except `GATEHCLK` and `STPPCLK` of `PCGCCTL`, `HCFG.FSLSPCS`,
+  `DCFG.DSPD`, `DCTL.SDIS` and the whole of `GCCFG`, which the model keeps. The channels (all their
+  registers and what is staged for them), the RX FIFO and the flags the core latched are cleared,
+  any transaction waiting is dropped, the registers (`GINTMSK`, `GAHBCFG`, `HAINTMSK`, `HFIR` and so
+  on) go back to their reset values except those, and it is over at once. HPRT's control and change
+  bits are CSR bits that the manual does not list, so they are cleared too: the port loses its power
+  (`PPWR`), a device behind it goes (a disconnect, which latches `DISCINT` after the reset has
+  cleared it) and the firmware has to power the port again, which it does: it resets the core
+  before it powers the port, so it boots as before (612 million instructions to the second
+  prompt). (Before I checked the manual I had the port left alone through a core reset.)
   `TXFFLSH` drops the data staged for packets that have not gone, and a packet that was ready to go
-  with it, in the FIFO `TXFNUM` names (0 the non-periodic one, which control and bulk channels send
-  through, 1 the periodic one, for interrupt and isochronous channels, 0x10 both); an OUT transfer
+  with it, in the FIFO `TXFNUM` names (57.14.5, p. 2628: in host mode 0 is the non-periodic FIFO,
+  which control and bulk channels send through, 1 the periodic one, for interrupt and isochronous
+  channels, and 0x10 flushes both; 2 to 15 are device mode only); an OUT transfer
   with no data has nothing in the FIFO and is left alone. `RXFFLSH` empties the RX FIFO.
 - A system reset or the port losing its power (`PPWR` cleared with a device connected) resets the
   device too, as a chip reset or a power-down does to a device on the cable. It is what makes

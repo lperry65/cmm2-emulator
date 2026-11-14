@@ -22,6 +22,12 @@
 //! A tick is never asked for sooner than MIN_WAKE_GAP cycles ahead, so a frame of a few pixels
 //! cannot make the CPU stop for the controller at every instruction.
 //!
+//! Lines are counted from 0 at the first line of the vertical sync (RM0433 32.4.1, p. 1207: when
+//! the controller is enabled the timings start at X/Y = 0/0 as the first sync pixel), the way
+//! the porch registers count them, so LIPOS = AAH is the last line of the active area and the
+//! firmware's AAH + 1 the first line after it. The manual does not say how far into the line the
+//! interrupt comes: the model flags it at the start of the line.
+//!
 //! A write of IMR to SRCR reloads the shadow registers at once: the bit reads back 0 and
 //! ISR.RRIF is set, and the layer registers the display uses are those as of that write. A write
 //! of VBR (bit 1) holds the reload back to the next vertical blank, the first line after the
@@ -30,8 +36,11 @@
 //! controller off) has no blank, so the reload waits for the first one after it is enabled.
 //! The firmware uses VBR only once in each MODE command, to complete the layer registers it
 //! has cleared; its page flips (PAGE DISPLAY) write the layer's registers from the line
-//! interrupt and reload them with IMR. The registers read back as written, whether or not they
-//! have been reloaded. A write to CLUTWR goes into the layer's colour table at once. The other
+//! interrupt and reload them with IMR. The layer registers are shadowed, as RM0433 32.4.1
+//! (p. 1208) and 32.7.6 (p. 1218) have it: a write goes to a shadow copy, a read returns the
+//! active value, and the new one can only be read after the reload (CLUTWR is the one layer
+//! register that is not shadowed). LxCACR resets to 0xFF (32.7.19, p. 1226) although ST's SVD
+//! says 0. A write to CLUTWR goes into the layer's colour table at once. The other
 //! flags (FU, TERR) are never set, as nothing is fetched, so the error interrupt (IRQ 89) is
 //! never raised. CDSR and CPSR, the position the controller is at, are plain stored registers:
 //! the firmware does not read them.
@@ -40,7 +49,7 @@
 //! when a flag is set that is enabled, and when an enable is written for a flag that is set.
 
 use crate::clock::{CORE_HZ, Clock};
-use crate::display::{Display, Layer, Scanout};
+use crate::display::{CACR_RESET, Display, Layer, Scanout};
 use crate::irq::Irqs;
 use crate::peripheral::{ResetCause, StubRegisters};
 use crate::rcc::PixelClock;
@@ -93,7 +102,8 @@ const LIPOS_MASK: u32 = 0x7FF;
 const AAH_MASK: u32 = 0x7FF;
 
 /// The registers are stored, except ISR, which is worked out, and the display gets a copy of
-/// those it draws from. `pixel_hz` is the pixel clock the controller last saw. While it is
+/// those it draws from. The layer registers are shadowed (RM0433 32.4.1, p. 1208): `stored`
+/// has what was written, `active` what the last reload took, which is what a read returns. `pixel_hz` is the pixel clock the controller last saw. While it is
 /// enabled with a pixel clock, `frame_start` is the core cycle at which the frame was at pixel
 /// `anchor_pixel` (0 when the controller was enabled, and where the counters were when the clock
 /// last changed) and `next_line` the pixel, counted from the start, of the next line event that
@@ -104,6 +114,7 @@ const AAH_MASK: u32 = 0x7FF;
 #[derive(Debug)]
 pub struct LtdcRegisters {
     stored: StubRegisters,
+    active: StubRegisters,
     clock: Clock,
     irqs: Irqs,
     display: Display,
@@ -134,6 +145,24 @@ fn cycles_to_pixels(cycles: u64, hz: u64) -> u64 {
 /// The first whole cycle at which `pixels` pixels have been drawn, at `hz`.
 fn pixels_to_cycles(pixels: u64, hz: u64) -> u64 {
     (u128::from(pixels) * u128::from(CORE_HZ)).div_ceil(u128::from(hz)) as u64
+}
+
+/// The registers of a layer's block that are shadowed: all but CLUTWR (RM0433 32.4.1, p. 1208).
+fn shadowed(offset: u32) -> bool {
+    layer_register(offset).is_some_and(|(_, register)| register != CLUTWR)
+}
+
+/// The registers as a reset leaves them. ST's SVD has 0 for LxCACR, where RM0433 32.7.19
+/// (p. 1226) gives 0xFF, which the manual wins.
+fn reset_values() -> (StubRegisters, StubRegisters) {
+    let mut stored = StubRegisters::with_reset_values(LTDC_BASE, Svd::stm32h743());
+    let mut active = StubRegisters::with_reset_values(LTDC_BASE, Svd::stm32h743());
+    for layer in 0..LAYERS as u32 {
+        let cacr = LAYER_CR + LAYER_STRIDE * layer + CACR;
+        stored.write(cacr, CACR_RESET, !0);
+        active.write(cacr, CACR_RESET, !0);
+    }
+    (stored, active)
 }
 
 impl LtdcRegisters {
@@ -187,7 +216,8 @@ impl LtdcRegisters {
     /// The next time from `from` on that the vertical blank starts: the line after the last
     /// of the active area. If the active area ends at or beyond the last line there is no such
     /// line, and I take the blank to be the first line of the next frame (my reading of the
-    /// counters wrapping, not checked against the chip).
+    /// counters wrapping: RM0433 32.7.6 says only "the first line after the active display
+    /// area").
     fn blank_event_from(&mut self, from: u64) -> Option<u64> {
         let (_, height) = self.total_size();
         let after = u64::from(self.stored.read(AWCR) & AAH_MASK) + 1;
@@ -299,19 +329,25 @@ impl LtdcRegisters {
     /// The layer registers take effect: the display uses them from now on. The reload is
     /// done, which sets RRIF.
     fn reload(&mut self) {
+        for offset in (LAYER_CR..LAYER_CR + LAYER_STRIDE * LAYERS as u32).step_by(4) {
+            if shadowed(offset) {
+                let value = self.stored.read(offset);
+                self.active.write(offset, value, !0);
+            }
+        }
         let layers = std::array::from_fn(|layer| {
             let at = |register| LAYER_CR + LAYER_STRIDE * layer as u32 + register;
             Layer {
-                cr: self.stored.read(at(0)),
-                whpcr: self.stored.read(at(WHPCR)),
-                wvpcr: self.stored.read(at(WVPCR)),
-                pfcr: self.stored.read(at(PFCR)),
-                cacr: self.stored.read(at(CACR)),
-                dccr: self.stored.read(at(DCCR)),
-                bfcr: self.stored.read(at(BFCR)),
-                cfbar: self.stored.read(at(CFBAR)),
-                cfblr: self.stored.read(at(CFBLR)),
-                cfblnr: self.stored.read(at(CFBLNR)),
+                cr: self.active.read(at(0)),
+                whpcr: self.active.read(at(WHPCR)),
+                wvpcr: self.active.read(at(WVPCR)),
+                pfcr: self.active.read(at(PFCR)),
+                cacr: self.active.read(at(CACR)),
+                dccr: self.active.read(at(DCCR)),
+                bfcr: self.active.read(at(BFCR)),
+                cfbar: self.active.read(at(CFBAR)),
+                cfblr: self.active.read(at(CFBLR)),
+                cfblnr: self.active.read(at(CFBLNR)),
             }
         });
         self.display.update(|s| s.layers = layers);
@@ -337,6 +373,7 @@ impl Registers for LtdcRegisters {
             ISR => self.isr,
             SRCR if self.reload_pending => VBR,
             SRCR => 0,
+            _ if shadowed(offset) => self.active.read(offset),
             _ => self.stored.read(offset),
         }
     }
@@ -393,8 +430,8 @@ impl Registers for LtdcRegisters {
         }
     }
 
-    fn reset(&mut self, cause: ResetCause) {
-        self.stored.reset(cause);
+    fn reset(&mut self, _cause: ResetCause) {
+        (self.stored, self.active) = reset_values();
         self.display.update(|s| *s = Scanout::default());
         self.isr = 0;
         self.frame_start = None;
@@ -416,8 +453,10 @@ pub type Ltdc = WordAccess<LtdcRegisters>;
 impl Ltdc {
     pub(crate) fn new(clock: Clock, display: Display, irqs: Irqs, pixel_clock: PixelClock) -> Ltdc {
         let pixel_hz = pixel_clock.hz();
+        let (stored, active) = reset_values();
         WordAccess::wrap(LtdcRegisters {
-            stored: StubRegisters::with_reset_values(LTDC_BASE, Svd::stm32h743()),
+            stored,
+            active,
             clock,
             irqs,
             display,
@@ -569,8 +608,10 @@ mod tests {
     fn the_other_registers_store_what_is_written() {
         let mut m = Machine::new();
         m.memory.write32(LTDC_BASE + 0x08, 0x004F_0002); // SSCR
-        m.memory.write32(LTDC_BASE + 0x84, 0x11); // L1CR
+        m.memory.write32(LTDC_BASE + 0x84, 0x11); // L1CR, shadowed
         assert_eq!(m.memory.read32(LTDC_BASE + 0x08), 0x004F_0002);
+        assert_eq!(m.memory.read32(LTDC_BASE + 0x84), 0);
+        m.memory.write32(SRCR_ADDR, IMR);
         assert_eq!(m.memory.read32(LTDC_BASE + 0x84), 0x11);
     }
 
@@ -928,6 +969,53 @@ mod tests {
         assert_eq!(frame.pixel(0, 0), [0, 0, 0xFF]);
         assert_eq!(frame.pixel(1, 0), [0, 0xFF, 0]);
         assert_eq!(frame.pixel(2, 0), [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_layer_register_reads_back_the_active_value_until_the_reload() {
+        // RM0433 32.4.1 (p. 1208) and 32.7.6 (p. 1218): the shadow registers read back the
+        // active values, and what was written can be read only after the reload.
+        let mut m = Machine::new();
+        let cfbar = LTDC_BASE + LAYER_CR + CFBAR;
+        assert_eq!(m.memory.read32(cfbar), 0);
+        m.memory.write32(cfbar, 0x2400_0000);
+        assert_eq!(m.memory.read32(cfbar), 0);
+        // A held back reload keeps the old value too.
+        m.memory.write32(SRCR_ADDR, VBR);
+        assert_eq!(m.memory.read32(cfbar), 0);
+        m.memory.write32(SRCR_ADDR, IMR);
+        assert_eq!(m.memory.read32(cfbar), 0x2400_0000);
+        // Layer 2 has its own, and a write to the same register again before the reload
+        // overrides the first.
+        let layer_2 = cfbar + LAYER_STRIDE;
+        m.memory.write32(layer_2, 0x2400_1000);
+        m.memory.write32(layer_2, 0x2400_2000);
+        assert_eq!(m.memory.read32(layer_2), 0);
+        m.memory.write32(SRCR_ADDR, IMR);
+        assert_eq!(m.memory.read32(layer_2), 0x2400_2000);
+        assert_eq!(m.memory.read32(cfbar), 0x2400_0000);
+        // The registers around the layers are not shadowed.
+        m.memory.write32(LIPCR_ADDR, 5);
+        assert_eq!(m.memory.read32(LIPCR_ADDR), 5);
+    }
+
+    #[test]
+    fn the_layer_registers_reset_to_the_reference_manuals_values() {
+        // RM0433 32.7.19 (p. 1226) and 32.7.21 (p. 1227): CACR 0xFF and BFCR 0x0607.
+        let mut m = Machine::new();
+        assert_eq!(m.memory.read32(LTDC_BASE + LAYER_CR + CACR), 0xFF);
+        assert_eq!(m.memory.read32(LTDC_BASE + LAYER_CR + BFCR), 0x0607);
+        assert_eq!(
+            m.memory.read32(LTDC_BASE + LAYER_CR + LAYER_STRIDE + BFCR),
+            0x0607
+        );
+        // And a reload that takes what was never written keeps them.
+        m.memory.write32(SRCR_ADDR, IMR);
+        assert_eq!(m.memory.read32(LTDC_BASE + LAYER_CR + CACR), 0xFF);
+        assert_eq!(
+            m.memory.read32(LTDC_BASE + LAYER_CR + LAYER_STRIDE + CACR),
+            0xFF
+        );
     }
 
     #[test]

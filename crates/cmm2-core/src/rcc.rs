@@ -64,6 +64,11 @@ const PLLSRC_HSE: u32 = 2; // RCC_PLLCKSELR, bits 1:0
 const PLL3FRACEN: u32 = 1 << 8; // RCC_PLLCFGR
 const PLL3VCOSEL: u32 = 1 << 9; // RCC_PLLCFGR
 const DIVR3EN: u32 = 1 << 24; // RCC_PLLCFGR
+const DIVM3_BITS: u32 = 0x3F << 20; // RCC_PLLCKSELR
+const PLLSRC_BITS: u32 = 3; // RCC_PLLCKSELR
+const ANY_PLL_ON: u32 = 1 << 24 | 1 << 26 | PLL3ON; // RCC_CR
+// RCC_PLLCFGR: DIVR3EN, DIVQ3EN, DIVP3EN, PLL3RGE and PLL3VCOSEL, not PLL3FRACEN.
+const PLL3_CONFIG_BITS: u32 = 7 << 22 | 3 << 10 | PLL3VCOSEL;
 // The registers that PLL3's R output depends on.
 const PLL3_INPUTS: [u32; 5] = [CR, PLLCKSELR, PLLCFGR, PLL3DIVR, PLL3FRACR];
 
@@ -129,6 +134,9 @@ impl PixelClock {
 #[derive(Debug)]
 pub struct RccRegisters {
     stored: StubRegisters,
+    /// PLL3's SH_REG, the fraction the sigma-delta modulator works from: FRACN3 as it was when
+    /// PLL3FRACEN last went from 0 to 1, and 0 from a reset (RM0433 8.5.5, p. 347).
+    sh_reg: u32,
     rsr: u32,
     pixel_clock: PixelClock,
 }
@@ -145,22 +153,20 @@ enum Vco {
     Hz { hz: u128, per: u128 },
 }
 
-// What the PLLs take, from my memory of RM0433 and not yet checked against it. The reference (the
-// input divided by DIVM) must be in the range PLL3RGE selects: 1 to 2 MHz, 2 to 4, 4 to 8 or
-// 8 to 16. The VCO is of 192 to 836 MHz in the wide range (PLL3VCOSEL clear), which needs a
-// reference of 2 MHz or more, or of 150 to 420 MHz in the medium range, which is the one for a
-// reference of 1 to 2 MHz. A DIVN3 below the 3 the chip takes gives a VCO of at most 48 MHz, so
-// the range of the VCO covers it.
-const REFERENCE_HZ: [std::ops::RangeInclusive<u128>; 4] = [
-    1_000_000..=2_000_000,
-    2_000_000..=4_000_000,
-    4_000_000..=8_000_000,
-    8_000_000..=16_000_000,
-];
-const WIDE_VCO_HZ: std::ops::RangeInclusive<u128> = 192_000_000..=836_000_000;
+// What the PLLs take, from RM0433 8.5.5 (PLL block diagram and text, pp. 346 to 348) and the
+// descriptions of RCC_PLLCFGR (8.7.12, p. 401), RCC_PLL3DIVR (8.7.17, p. 410) and
+// RCC_PLL3FRACR (8.7.18, p. 411). The reference (the input divided by DIVM3) must be 1 to
+// 16 MHz. The wide VCO (VCOH, PLL3VCOSEL clear) takes a reference of 2 to 16 MHz and makes 192 to
+// 960 MHz; the medium one (VCOL, set) takes 1 to 2 MHz and makes 150 to 420 MHz (the
+// manual has VCOL chosen for a reference of 2 MHz or less, and VCOH otherwise). PLL3RGE is only
+// to be set to the reference's range for optimal performance, so it is not a condition here. DIVN3 is 4 to 512 (the field, 3 to
+// 0x1FF); no VCO range can be reached with less, so the range of the VCO covers the lower limit. The manual does not say what a PLL does outside
+// these ranges (it does not guarantee the output frequency): the model does not lock it.
+const REFERENCE_HZ: std::ops::RangeInclusive<u128> = 1_000_000..=16_000_000;
+const WIDE_REFERENCE_HZ: std::ops::RangeInclusive<u128> = 2_000_000..=16_000_000;
+const MEDIUM_REFERENCE_HZ: std::ops::RangeInclusive<u128> = 1_000_000..=2_000_000;
+const WIDE_VCO_HZ: std::ops::RangeInclusive<u128> = 192_000_000..=960_000_000;
 const MEDIUM_VCO_HZ: std::ops::RangeInclusive<u128> = 150_000_000..=420_000_000;
-/// The least reference the wide VCO range takes.
-const WIDE_VCO_REFERENCE_HZ: u128 = 2_000_000;
 
 impl RccRegisters {
     fn pll3_vco(&mut self) -> Vco {
@@ -173,29 +179,45 @@ impl RccRegisters {
         // on HSE, compared with the range times DIVM3 instead of dividing.
         let hse = u128::from(HSE_HZ);
         let medium = cfgr & PLL3VCOSEL != 0;
-        let reference = &REFERENCE_HZ[(cfgr >> 10 & 3) as usize];
-        let least = if medium {
-            *reference.start()
+        let reference = if medium {
+            MEDIUM_REFERENCE_HZ
         } else {
-            *reference.start().max(&WIDE_VCO_REFERENCE_HZ)
+            WIDE_REFERENCE_HZ
         };
-        if divm == 0 || hse < least * divm || hse > reference.end() * divm {
+        if divm == 0
+            || hse < reference.start().max(REFERENCE_HZ.start()) * divm
+            || hse > reference.end().min(REFERENCE_HZ.end()) * divm
+        {
             return Vco::OutOfRange;
         }
-        let (divr, fracr) = (self.stored.read(PLL3DIVR), self.stored.read(PLL3FRACR));
-        let divn = u128::from(divr & 0x1FF) + 1;
-        let frac = if cfgr & PLL3FRACEN != 0 {
-            u128::from(fracr >> 3 & 0x1FFF)
-        } else {
-            0
-        };
-        // HSE / DIVM3 x (DIVN3 + 1 + FRACN3 / 8192), with the 8192 and DIVM3 kept apart.
+        let divn = u128::from(self.stored.read(PLL3DIVR) & 0x1FF) + 1;
+        let frac = u128::from(self.sh_reg);
+        // HSE / DIVM3 x (DIVN3 + FRACN3 / 8192), with the 8192 and DIVM3 kept apart. The field
+        // holds DIVN3 less 1. The fraction is the one latched in SH_REG.
         let (hz, per) = (u128::from(HSE_HZ) * (divn << 13 | frac), divm << 13);
         let range = if medium { MEDIUM_VCO_HZ } else { WIDE_VCO_HZ };
         if hz < range.start() * per || hz > range.end() * per {
             return Vco::OutOfRange;
         }
         Vco::Hz { hz, per }
+    }
+
+    /// The bits of the register at `offset` that a write cannot change now (RM0433: DIVM3, and
+    /// PLLSRC while any PLL is on, p. 347 and 398; PLL3RGE, PLL3VCOSEL, DIVR3EN, DIVQ3EN and
+    /// DIVP3EN with PLL3 on, p. 401; DIVN3 and the three dividers, p. 409 and 410). FRACN3 and
+    /// PLL3FRACEN can be written at any time (p. 411).
+    fn locked_while_pll3_on(&mut self, offset: u32) -> u32 {
+        let cr = self.stored.read(CR);
+        let pll3_on = cr & PLL3ON != 0;
+        match offset {
+            PLLCKSELR => {
+                (if pll3_on { DIVM3_BITS } else { 0 })
+                    | (if cr & ANY_PLL_ON != 0 { PLLSRC_BITS } else { 0 })
+            }
+            PLLCFGR if pll3_on => PLL3_CONFIG_BITS,
+            PLL3DIVR if pll3_on => u32::MAX,
+            _ => 0,
+        }
     }
 
     /// PLL3's R output: the VCO divided by DIVR3.
@@ -248,7 +270,12 @@ impl Registers for RccRegisters {
                 self.rsr &= !FLAGS;
             }
         } else {
-            self.stored.write(offset, value, mask);
+            let was_latching = self.stored.read(PLLCFGR) & PLL3FRACEN != 0;
+            let locked = self.locked_while_pll3_on(offset);
+            self.stored.write(offset, value, mask & !locked);
+            if self.stored.read(PLLCFGR) & PLL3FRACEN != 0 && !was_latching {
+                self.sh_reg = self.stored.read(PLL3FRACR) >> 3 & 0x1FFF;
+            }
             if PLL3_INPUTS.contains(&offset) {
                 self.update_pixel_clock();
             }
@@ -259,6 +286,7 @@ impl Registers for RccRegisters {
         let bdcr = self.stored.read(BDCR);
         self.stored.reset(cause);
         self.stored.write(BDCR, bdcr, u32::MAX);
+        self.sh_reg = 0;
         // A software reset sets the pin flag too, as on the chip.
         self.rsr = match cause {
             ResetCause::PowerOn => POWER_ON_FLAGS,
@@ -274,6 +302,7 @@ impl Rcc {
     pub fn new(clock: Clock) -> Rcc {
         WordAccess::wrap(RccRegisters {
             stored: StubRegisters::with_reset_values(RCC_BASE, Svd::stm32h743()),
+            sh_reg: 0,
             rsr: POWER_ON_FLAGS,
             pixel_clock: PixelClock::new(clock),
         })
@@ -310,6 +339,8 @@ mod tests {
     // Always set: D1CKRDY, D2CKRDY and HSIDIVF.
     const ALWAYS_READY: u32 = 1 << 14 | 1 << 15 | 1 << 5;
     const ON_BITS: u32 = 0x1501_1001;
+    const PLL3_ON: u32 = 1 << 28;
+    const ALL_PLLS_ON: u32 = 0x1500_0000;
     const BOARD_CR: u32 = 0x3F03_F025;
 
     fn machine() -> MemoryMap {
@@ -531,12 +562,17 @@ mod tests {
     fn the_pixel_clock_follows_each_register_it_depends_on() {
         let (mut m, pixel_clock) = machine_and_pixel_clock();
         program_pll3(&mut m, 0x0F0F_1E62);
-        // DIVM3 of 2 halves it, with the reference range for 4 MHz (PLL3RGE of 2).
+        // DIVM3 of 2 halves it, with the reference range for 4 MHz (PLL3RGE of 2). The settings
+        // are written with PLL3 off, as the chip wants.
+        m.write32(CR, ON_BITS & !PLL3_ON);
         m.write32(RCC_BASE + 0x2C, 0x013F_08DD);
         m.write32(RCC_BASE + 0x28, 0x0020_1012);
+        m.write32(CR, ON_BITS);
         assert_eq!(pixel_clock.hz(), 24_750_000);
+        m.write32(CR, ON_BITS & !PLL3_ON);
         m.write32(RCC_BASE + 0x28, 0x0010_1012);
         m.write32(RCC_BASE + 0x2C, 0x013F_0CDD);
+        m.write32(CR, ON_BITS);
         assert_eq!(pixel_clock.hz(), 49_500_000);
         // PLL3 off stops it, on starts it again.
         m.write32(CR, ON_BITS & !(1 << 28));
@@ -544,7 +580,9 @@ mod tests {
         m.write32(CR, ON_BITS);
         assert_eq!(pixel_clock.hz(), 49_500_000);
         // So does the R output being disabled.
+        m.write32(CR, ON_BITS & !PLL3_ON);
         m.write32(RCC_BASE + 0x2C, 0x003F_0CDD);
+        m.write32(CR, ON_BITS);
         assert_eq!(pixel_clock.hz(), 0);
     }
 
@@ -563,12 +601,16 @@ mod tests {
     fn a_pll_that_is_not_fed_from_the_crystal_gives_no_pixel_clock() {
         let (mut m, pixel_clock) = machine_and_pixel_clock();
         program_pll3(&mut m, 0x0F0F_1E62);
+        m.write32(CR, ON_BITS & !ALL_PLLS_ON);
         for source in [0, 1, 3] {
             m.write32(RCC_BASE + 0x28, 0x0010_1010 | source);
+            m.write32(CR, ON_BITS);
             assert_eq!(pixel_clock.hz(), 0, "source {source}");
+            m.write32(CR, ON_BITS & !ALL_PLLS_ON);
         }
         // And a DIVM3 of 0 switches the PLL off.
         m.write32(RCC_BASE + 0x28, 0x0000_1012);
+        m.write32(CR, ON_BITS);
         assert_eq!(pixel_clock.hz(), 0);
     }
 
@@ -604,38 +646,119 @@ mod tests {
 
     #[test]
     fn pll3_only_locks_for_a_reference_and_a_vco_in_the_ranges_of_the_chip() {
-        // From memory of RM0433, to check against it: PLL3RGE picks the reference range (1 to 2,
-        // 2 to 4, 4 to 8, 8 to 16 MHz), the wide VCO (192 to 836 MHz) needs a reference of at
-        // least 2 MHz and the medium one (150 to 420 MHz) takes 1 MHz. 8 MHz / DIVM3 x DIVN3 is
-        // the VCO.
+        // RM0433 8.5.5 (PLL block diagram and text, pp. 346 to 348) and 8.7.17 (p. 410): the
+        // reference is 1 to 16 MHz, VCOH (PLL3VCOSEL clear) takes a reference of 2 to 16 MHz and
+        // makes 192 to 960 MHz, VCOL (set) takes 1 to 2 MHz and makes 150 to 420 MHz. 8 MHz /
+        // DIVM3 x DIVN3 is the VCO. PLL3RGE is not a condition (see the next test).
         for (divm, divn, rge, medium, locks) in [
             (1, 24, 3, false, true),   // 192 MHz
             (1, 23, 3, false, false),  // 184
-            (1, 104, 3, false, true),  // 832
-            (1, 105, 3, false, false), // 840
-            (1, 19, 3, true, true),    // 152 in the medium range
-            (1, 18, 3, true, false),   // 144
-            (1, 52, 3, true, true),    // 416
-            (1, 53, 3, true, false),   // 424
-            (1, 80, 3, true, false),   // 640 is for the wide range only
-            // The reference against PLL3RGE: 8 MHz, 4, 2, 1 and 0.89 MHz.
-            (1, 50, 2, false, true), // 8 MHz is the end of 4 to 8, which counts
-            (2, 100, 3, false, false), // 4 MHz is not in 8 to 16
-            (2, 100, 2, false, true), // but is in 4 to 8
-            (2, 100, 1, false, true), // and in 2 to 4
-            (2, 100, 0, false, false), // not in 1 to 2
-            (4, 200, 0, false, true), // 2 MHz is in 1 to 2, and the wide VCO takes it
-            (8, 200, 0, false, false), // 1 MHz is in 1 to 2 but the wide VCO needs 2
-            (8, 200, 0, true, true), // the medium VCO takes it: 200 MHz
-            (9, 216, 0, true, false), // 889 kHz is below the least
+            (1, 120, 3, false, true),  // 960
+            (1, 121, 3, false, false), // 968
+            (1, 105, 3, false, true),  // 840, over what the datasheet gives but in the manual's
+            (1, 19, 3, true, false),   // the medium VCO is for a reference of 2 MHz or less
+            (4, 75, 1, true, true),    // 2 MHz x 75 = 150 in the medium range
+            (4, 74, 1, true, false),   // 148
+            (4, 210, 1, true, true),   // 420
+            (4, 211, 1, true, false),  // 422
+            (4, 80, 1, true, true),    // 2 MHz is in both references
+            (8, 150, 0, true, true),   // 1 MHz x 150 = 150
+            (8, 149, 0, true, false),  // 149
+            (8, 200, 0, false, false), // 1 MHz is not for the wide VCO
+            (9, 216, 0, true, false),  // 889 kHz is below the least reference
+            (4, 100, 1, false, true),  // 2 MHz is in the wide VCO's range, 200 MHz
             (0, 100, 3, false, false), // DIVM3 of 0 is the PLL off
-            (1, 1, 3, false, false), // DIVN3 of 0, which is below the least the chip takes
+            (1, 1, 3, false, false),   // DIVN3 of 0, which is below the least the chip takes
             (1, 512, 3, false, false), // 4096 MHz
         ] {
             let (ready, hz) = pll3_locks_with(divm, divn, rge, medium);
             assert_eq!(ready, locks, "{divm} {divn} {rge} {medium}");
             assert_eq!(hz != 0, locks, "{divm} {divn} {rge} {medium}: {hz}");
         }
+    }
+
+    #[test]
+    fn pll3rge_does_not_decide_whether_pll3_locks() {
+        // RM0433 (p. 348, 8.7.12 p. 401) has PLL3RGE set to the reference's range for optimal
+        // performance, not that the PLL fails to lock with another one.
+        for rge in 0..4 {
+            assert_eq!(
+                pll3_locks_with(1, 99, rge, false),
+                (true, 792_000_000),
+                "{rge}"
+            );
+        }
+    }
+
+    // The registers as the firmware's video mode writes them, then `more`, with PLL3 on.
+    fn pll3_on(more: impl FnOnce(&mut MemoryMap)) -> (MemoryMap, PixelClock) {
+        let (mut m, pixel_clock) = machine_and_pixel_clock();
+        program_pll3(&mut m, 0x0F0F_1E62);
+        more(&mut m);
+        (m, pixel_clock)
+    }
+
+    #[test]
+    fn the_fraction_is_latched_when_fracen_goes_from_0_to_1() {
+        // RM0433 8.5.5 (p. 347 and 348): the modulator works from SH_REG, which takes FRACN3 when
+        // PLL3FRACEN goes 0 to 1, and keeps it when FRACEN goes back to 0.
+        let (mut m, pixel_clock) = pll3_on(|_| {});
+        // FRACEN is clear in the firmware's PLLCFGR (0x013F0CDD has bit 8 clear): nothing latched.
+        m.write32(RCC_BASE + 0x44, 4096 << 3);
+        assert_eq!(pixel_clock.hz(), 49_500_000);
+        m.write32(RCC_BASE + 0x2C, 0x013F_0DDD); // the latch
+        assert_eq!(pixel_clock.hz(), 49_750_000);
+        // A new FRACN3 with FRACEN still set is not taken.
+        m.write32(RCC_BASE + 0x44, 0);
+        assert_eq!(pixel_clock.hz(), 49_750_000);
+        // FRACEN clear keeps what was latched; setting it again takes the new one.
+        m.write32(RCC_BASE + 0x2C, 0x013F_0CDD);
+        assert_eq!(pixel_clock.hz(), 49_750_000);
+        m.write32(RCC_BASE + 0x2C, 0x013F_0DDD);
+        assert_eq!(pixel_clock.hz(), 49_500_000);
+    }
+
+    #[test]
+    fn a_reset_clears_the_latched_fraction() {
+        let (mut m, pixel_clock) = pll3_on(|m| {
+            m.write32(RCC_BASE + 0x44, 4096 << 3);
+            m.write32(RCC_BASE + 0x2C, 0x013F_0DDD);
+        });
+        assert_eq!(pixel_clock.hz(), 49_750_000);
+        m.reset_peripherals(ResetCause::Software);
+        program_pll3(&mut m, 0x0F0F_1E62);
+        assert_eq!(pixel_clock.hz(), 49_500_000);
+    }
+
+    #[test]
+    fn the_settings_that_the_manual_locks_while_pll3_is_on_are_not_written() {
+        // RM0433 8.7.11 (p. 398), 8.7.12 (p. 401) and 8.7.17 (p. 409): DIVM3, DIVN3 and the
+        // dividers, PLL3RGE, PLL3VCOSEL and DIVR3EN can be written only with PLL3 off.
+        let (mut m, pixel_clock) = pll3_on(|_| {});
+        m.write32(RCC_BASE + 0x40, 0x0F0F_1E00 | 50);
+        m.write32(RCC_BASE + 0x28, 0x0020_1012);
+        m.write32(RCC_BASE + 0x2C, 0x003F_00DD);
+        assert_eq!(pixel_clock.hz(), 49_500_000);
+        assert_eq!(m.read32(RCC_BASE + 0x40), 0x0F0F_1E62);
+        assert_eq!(m.read32(RCC_BASE + 0x28), 0x0010_1012);
+        assert_eq!(m.read32(RCC_BASE + 0x2C), 0x013F_0CDD);
+        // The same with PLL3 off, and the clock follows.
+        m.write32(CR, ON_BITS & !PLL3_ON);
+        m.write32(RCC_BASE + 0x40, 0x0F0F_1E00 | 50);
+        assert_eq!(m.read32(RCC_BASE + 0x40), 0x0F0F_1E32);
+        m.write32(CR, ON_BITS);
+        assert_eq!(pixel_clock.hz(), 25_500_000);
+    }
+
+    #[test]
+    fn the_source_cannot_be_changed_while_a_pll_is_on() {
+        // RM0433 8.5.5 (p. 347): not possible to change PLLSRC when one of the PLLs is on.
+        let (mut m, _) = pll3_on(|_| {});
+        m.write32(RCC_BASE + 0x28, 0x0010_1010);
+        assert_eq!(m.read32(RCC_BASE + 0x28) & 3, 2);
+        m.write32(CR, ON_BITS & !ALL_PLLS_ON);
+        m.write32(RCC_BASE + 0x28, 0x0010_1010);
+        assert_eq!(m.read32(RCC_BASE + 0x28) & 3, 0);
     }
 
     #[test]
