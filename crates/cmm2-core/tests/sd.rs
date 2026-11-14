@@ -2,7 +2,7 @@
 
 mod common;
 
-use cmm2_core::{Cpu, Irqs, cmm2_memory};
+use cmm2_core::{Console, Cpu, Irqs, cmm2_memory};
 use common::*;
 
 // A 64 MB FAT32 card image made with mkfs.vfat. The test is ignored and already needs the
@@ -94,6 +94,39 @@ fn real_firmware_lists_saves_and_runs_a_program_on_a_card() {
     assert!(String::from_utf8_lossy(&file).contains("PRINT \"FROM THE CARD\""));
 }
 
+// Boots with a card in the socket, AUTOSAVEs a program into `file` (an 8.3 name such as
+// "T.BAS"), loads it with F1, and RUNs it. `feed` is what types the program: it pushes the lines
+// and lets the firmware run. Returns the output of RUN and the file as it was saved on the card.
+fn autosave(name: &str, file: &str, feed: impl FnOnce(&mut Cpu, &Console)) -> (String, Vec<u8>) {
+    let firmware = firmware();
+    let irqs = Irqs::new();
+    let memory = cmm2_memory(&irqs);
+    let console = memory.console();
+    let sd = memory.sd_slot();
+    sd.insert(fat32_image(name)).unwrap();
+    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
+    boot_to_second_prompt(&mut cpu, &console);
+
+    // The 10 million instructions after AUTOSAVE are needed: the first command to reach the card
+    // initialises it, which takes about 5 million, and lines typed before it is up are lost (with
+    // none or 2 million the paced test below fails).
+    console.push_input(format!("AUTOSAVE \"{file}\"\r").as_bytes());
+    cpu.run(10_000_000);
+    feed(&mut cpu, &console);
+    console.push_input(b"\x1bOP");
+    run_until(&mut cpu, &console, 2_000_000_000, |output| {
+        output.contains("Saved to SDcard\r\n> ")
+    });
+    let ran = type_keys(&mut cpu, &console, &format!("RUN \"{file}\"\r")).0;
+
+    let (stem, extension) = file.split_once('.').unwrap();
+    let fat_name = format!("{stem:<8}{extension:<3}");
+    let image = sd.eject().unwrap();
+    let saved = fat32_file(&image, fat_name.as_bytes().try_into().unwrap())
+        .unwrap_or_else(|| panic!("no {file} on the card"));
+    (ran, saved)
+}
+
 // Issue 64: MMBasic ranks identifiers, and from rank 63 up it builds the code with a divide by 63
 // that the compiler turned into a SMULL by 0x82082083. The core ran SMULL unsigned, so a program
 // with more than about 85 distinct names got corrupt tokens, and RUN stopped with "Program damaged:
@@ -101,39 +134,64 @@ fn real_firmware_lists_saves_and_runs_a_program_on_a_card() {
 #[test]
 #[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
 fn real_firmware_runs_a_program_with_a_hundred_identifiers() {
-    let firmware = firmware();
-    let irqs = Irqs::new();
-    let memory = cmm2_memory(&irqs);
-    let console = memory.console();
-    let sd = memory.sd_slot();
-    sd.insert(fat32_image("identifiers")).unwrap();
-    let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
-    boot_to_second_prompt(&mut cpu, &console);
-
     let mut lines: Vec<String> = (0..100).map(|n| format!("CONST C{n:03} = {n}")).collect();
     lines.extend(["PRINT \"SUM\"; C099", "END", "SUB SUBA", "END SUB"].map(String::from));
 
     // The console's input buffer is small, so I feed AUTOSAVE a line at a time and let the firmware
-    // catch up before the next. Each line ends in LF. That is the firmware's doing, not the
-    // emulator's: the console passes a CR through unchanged, AUTOSAVE stores a bare CR as it is,
-    // and the firmware's own loader does not take that as a line end, so RUN says "Line is too
-    // long".
-    console.push_input(b"AUTOSAVE \"IDS.BAS\"\r");
-    cpu.run(10_000_000);
-    for line in &lines {
-        console.push_input(format!("{line}\n").as_bytes());
-        cpu.run(300_000);
-        console.take_output();
-    }
-    console.push_input(b"\x1bOP");
-    run_until(&mut cpu, &console, 2_000_000_000, |output| {
-        output.contains("Saved to SDcard\r\n> ")
+    // catch up before the next. Each line ends in LF, which the test sends itself. The firmware's
+    // console reader makes an LF after a CR only once nothing has arrived for 3 ms, so a pasted
+    // program stores bare CRs between the lines on the real board too, and the loader does not
+    // take a bare CR as a line end (RUN says "Line is too long").
+    let (ran, _) = autosave("identifiers", "IDS.BAS", |cpu, console| {
+        for line in &lines {
+            console.push_input(format!("{line}\n").as_bytes());
+            cpu.run(300_000);
+            console.take_output();
+        }
     });
-    let mut say = |keys: &str| type_keys(&mut cpu, &console, keys).0;
-
-    let ran = say("RUN \"IDS.BAS\"\r");
     assert!(!ran.contains("damaged"), "{ran:?}");
     assert!(ran.contains("SUM 99"), "{ran:?}");
+}
+
+// The three lines of the two CR tests, each ending in CR as the Enter key sends it.
+const THREE_LINES: [&str; 3] = ["A=1\r", "B=2\r", "PRINT \"SUM\";A+B\r"];
+
+// The firmware's console reader returns an LF of its own after a CR only once nothing has arrived
+// for 3 ms, which a person typing leaves after every Enter and a pasted program does not. In this
+// emulator a pause of 500,000 instructions per line still stores bare CRs after lines 1 and 2, and
+// 650,000 stores CRLF throughout; with 2 million after every line the file gets CRLF as for a
+// person typing.
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_autosave_stores_crlf_for_lines_typed_with_a_pause() {
+    let (ran, file) = autosave("crtest_paced", "CRTEST.BAS", |cpu, console| {
+        for line in THREE_LINES {
+            console.push_input(line.as_bytes());
+            cpu.run(2_000_000);
+        }
+    });
+    assert_eq!(file, b"A=1\r\nB=2\r\nPRINT \"SUM\";A+B\r\n", "{file:?}");
+    assert!(ran.contains("SUM 3"), "{ran:?}");
+}
+
+// Pushed in one chunk the lines arrive with no gap, so the firmware stores bare CRs between them
+// (the last CR gets its LF, as the 2 million instructions after it are quiet), and the loader then
+// takes the file as one long line and does not run it. The LF comes from 3 ms of silence and not
+// from any USART register.
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_autosave_stores_bare_cr_for_lines_pasted_without_a_pause() {
+    let (ran, file) = autosave("crtest_pasted", "CRTEST.BAS", |cpu, console| {
+        console.push_input(THREE_LINES.concat().as_bytes());
+        cpu.run(2_000_000);
+    });
+    assert!(file.starts_with(b"A=1\rB=2\r"), "{file:?}");
+    assert!(!ran.contains("SUM 3"), "{ran:?}");
+    // The failure to look for is the loader's, not a missing file.
+    assert!(
+        ran.contains("Error in line 1: Expression syntax"),
+        "{ran:?}"
+    );
 }
 
 // A card with its write-protect switch on is read, and the firmware refuses a write to it, with
