@@ -66,6 +66,98 @@ fn validate_feature_combinations() {
     }
 }
 
+/// The pattern table. A pattern listed twice would silently keep the last of its names in a
+/// `HashMap`, so a duplicate (of the same name too, so that the table stays clean) stops the build.
+fn pattern_table<'a>(entries: Vec<(&'a str, &'a str)>, bits: u32) -> HashMap<&'a str, &'a str> {
+    let mut table = HashMap::new();
+    let mut duplicates = Vec::new();
+    for (pattern, name) in entries {
+        if let Some(first) = table.insert(pattern, name) {
+            duplicates.push(format!("{bits}-bit: {pattern} is {first} and {name}"));
+        }
+    }
+    if !duplicates.is_empty() {
+        panic!("patterns listed twice:\n{}", duplicates.join("\n"));
+    }
+    table
+}
+
+/// Two patterns overlap when some opcode matches both.
+fn patterns_overlap(a: &str, b: &str) -> bool {
+    a.bytes()
+        .zip(b.bytes())
+        .all(|(x, y)| x == b'.' || y == b'.' || x == y)
+}
+
+/// Patterns with as many dots as each other are as specific as each other, and when they overlap
+/// the one that is listed first in `RESOLVED_OVERLAPS` (by decoder name) has to win. Every such
+/// overlap has to be listed, so a new pattern that overlaps another one without being resolved
+/// stops the build, and does not decode one way or the other by luck.
+fn order_overlapping_patterns(
+    maskstrings: &mut Vec<&str>,
+    instructions: &HashMap<&str, &str>,
+    bits: u32,
+) {
+    let mut unresolved = Vec::new();
+    let mut winners: Vec<(&str, &str)> = Vec::new();
+    for (i, a) in maskstrings.iter().enumerate() {
+        for b in &maskstrings[i + 1..] {
+            if a.matches('.').count() != b.matches('.').count() || !patterns_overlap(a, b) {
+                continue;
+            }
+            let (name_a, name_b) = (instructions[a], instructions[b]);
+            match RESOLVED_OVERLAPS.iter().find(|(win, lose)| {
+                (*win == name_a && *lose == name_b) || (*win == name_b && *lose == name_a)
+            }) {
+                Some((win, _)) if *win == name_a => winners.push((a, b)),
+                Some(_) => winners.push((b, a)),
+                None => unresolved.push(format!("{bits}-bit: {a} {name_a} and {b} {name_b}")),
+            }
+        }
+    }
+    if !unresolved.is_empty() {
+        panic!(
+            "patterns that overlap with the same number of dots, add them to RESOLVED_OVERLAPS \
+             (the winner first):\n{}",
+            unresolved.join("\n")
+        );
+    }
+    // Put every winner ahead of the pattern it beats and keep the rest of the order: a
+    // topological sort that always takes the first pattern, in the order they have, that has no
+    // winner left behind it. Moving pairs one at a time would not satisfy them all at once.
+    let base: Vec<&str> = maskstrings.clone();
+    let mut sorted: Vec<&str> = Vec::with_capacity(base.len());
+    while sorted.len() < base.len() {
+        let next = base
+            .iter()
+            .find(|pattern| {
+                !sorted.contains(pattern)
+                    && winners
+                        .iter()
+                        .all(|(winner, loser)| loser != *pattern || sorted.contains(winner))
+            })
+            .unwrap_or_else(|| panic!("the resolved overlaps of the {bits}-bit patterns go round"));
+        sorted.push(next);
+    }
+    for (winner, loser) in &winners {
+        let at = |pattern: &str| sorted.iter().position(|p| *p == pattern).unwrap();
+        assert!(at(winner) < at(loser), "{winner} must come before {loser}");
+    }
+    *maskstrings = sorted;
+}
+
+/// The overlapping patterns with the same number of dots, the decoder that has to win first.
+const RESOLVED_OVERLAPS: &[(&str, &str)] = &[
+    // VSTM with P = U is not a store: with W = 0 it is the 64-bit transfers between the core and
+    // the extension registers (VMOV, which is matched before these two), and any other is MCRR,
+    // which is undefined
+    ("MCRR_t1", "VSTM_t2"),
+    // VLDM with Rn = PC is the literal space of LDC (VLDM refuses Rn = PC itself)
+    ("LDC_lit_t1", "VLDM_t2"),
+    // ADD SP, SP, SP: T2 says Rm = SP is T1
+    ("ADD_reg_sp_t1", "ADD_reg_sp_t2"),
+];
+
 fn generate_decode(
     dest_path: &Path,
     func_name: &str,
@@ -85,8 +177,10 @@ fn generate_decode(
     // collect mask keys to string vector
     let mut maskstrings: Vec<&str> = instructions.keys().copied().collect();
 
-    // sort by number of dots in the string
-    maskstrings.sort_by_key(|a| a.matches(".").count());
+    // sort by number of dots in the string, and by the string itself among equals, so that the
+    // generated decoder does not depend on the order a HashMap happens to iterate in
+    maskstrings.sort_by_key(|a| (a.matches(".").count(), *a));
+    order_overlapping_patterns(&mut maskstrings, instructions, bits);
 
     let onemasks: Vec<u32> = maskstrings
         .iter()
@@ -106,7 +200,7 @@ fn generate_decode(
         .collect();
 
     writeln!(file, "/// automatically generated decoder function")?;
-    writeln!(file, "pub fn {} -> Instruction {{", func_name)?;
+    writeln!(file, "fn {} -> Instruction {{", func_name)?;
 
     for i in 0..onemasks.len() {
         let onemask = onemasks[i];
@@ -165,7 +259,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let out_dir = env::var("OUT_DIR").unwrap();
 
-    let mut instructions_thumb32 = HashMap::from([
+    let mut thumb32_entries: Vec<(&str, &str)> = Vec::from([
         ("11111110...1...............1....", "MRC2_t2"),
         ("11111110...0...............0....", "MCR2_t2"),
         ("11111110...................0....", "CDP2_t2"),
@@ -194,10 +288,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("11111010001.....1111....0000....", "LSR_reg_t2"),
         ("11111010000111111111....10......", "UXTH_t2"),
         ("11111010000011111111....10......", "SXTH_t2"),
-        ("111110100101....1111....10......", "UXTAB_t1"),
-        ("111110100100....1111....10......", "SXTAB_t1"),
-        ("111110100001....1111....10......", "UXTAH_t1"),
-        ("111110100000....1111....10......", "SXTAH_t1"),
         ("11111010000.....1111....0000....", "LSL_reg_t2"),
         ("111110011011....................", "LDRSH_imm_t1"),
         ("111110011001....1111............", "PLI_lit_imm_t1"),
@@ -236,7 +326,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("111110000001....11111100........", "PLD_imm_t2"),
         ("111110000001........1110........", "LDRBT_t1"),
         ("111110000001........1...........", "LDRB_imm_t3"),
-        ("111110000001........00000.......", "LDRB_reg_t2"),
+        ("111110000001........000000......", "LDRB_reg_t2"),
         ("111110000010........000000......", "STRH_reg_t2"),
         ("111110000000........1...........", "STRB_imm_t3"),
         ("111110000000........000000......", "STRB_reg_t2"),
@@ -261,7 +351,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("1111001110.0....0.........0.....", "USAT_t1"),
         ("11110011011011110.........0.....", "BFC_t1"),
         ("111100110110....0.........0.....", "BFI_t1"),
-        ("111100110100....0.........0.....", "SBFX_t1"),
         ("1111001100.0....0.........0.....", "SSAT_t1"),
         ("11110.101100....0...............", "MOVT_t1"),
         ("11110.10101011110...............", "ADR_t2"),
@@ -306,7 +395,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("11101011000.....0...............", "ADD_reg_t3"),
         ("111010101001....0...1111........", "TEQ_reg_t1"),
         ("11101010100.....0...............", "EOR_reg_t2"),
-        ("111010101100....0..........0....", "PKH_t1"),
         ("11101010011.11110...............", "MVN_reg_t2"),
         ("11101010011.....0...............", "ORN_reg_t1"),
         ("11101010010.11110000....0011....", "RRX_t1"),
@@ -339,7 +427,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     ]);
 
     if cargo_feature_enabled("has-fp") {
-        instructions_thumb32.extend([
+        thumb32_entries.extend([
             ("111011101.110000....101.11.0....", "VABS_t1"),
             ("111011101.110001....101.01.0....", "VNEG_t1"),
             ("111011101.110001....101.11.0....", "VSQRT_t1"),
@@ -365,6 +453,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ("111011101.01........101..0.0....", "VFNMS_t1"),
             ("111011101.01........101..1.0....", "VFNMA_t1"),
             ("1110111011110001....101000010000", "VMRS"),
+            ("1110111011100001....101000010000", "VMSR"),
             ("1110110....1........1011.......0", "VLDM_t1"),
             ("1110110....1........1010........", "VLDM_t2"),
             ("1110110....0........1011.......0", "VSTM_t1"),
@@ -389,7 +478,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // DSP-extension-only instructions
     if cargo_feature_enabled("has-dsp-ext") {
-        instructions_thumb32.extend([
+        thumb32_entries.extend([
             // SIMD parallel add
             ("111110101000....1111....0100....", "UADD8_t1"),
             // Select bytes using GE flags
@@ -398,102 +487,114 @@ fn main() -> Result<(), Box<dyn Error>> {
             ("111110110001....1111....00......", "SMUL_t1"),
             // Halfword multiply-accumulate (SMLAXY)
             ("111110110001............00......", "SMLA_t1"),
+            // Extend and add
+            ("111110100101....1111....10......", "UXTAB_t1"),
+            ("111110100100....1111....10......", "SXTAB_t1"),
+            ("111110100001....1111....10......", "UXTAH_t1"),
+            ("111110100000....1111....10......", "SXTAH_t1"),
+            // Pack halfword (PKHBT, PKHTB)
+            ("111010101100....0..........0....", "PKH_t1"),
         ]);
     }
 
-    let instructions_thumb16 = HashMap::from([
-        ("00000...........", "MOV_reg_t2_LSL_imm_t1"),
-        ("00001...........", "LSR_imm_t1"),
-        ("00010...........", "ASR_imm_t1"),
-        ("0001100.........", "ADD_reg_t1"),
-        ("0001101.........", "SUB_reg_t1"),
-        ("0001110.........", "ADD_imm_t1"),
-        ("0001111.........", "SUB_imm_t1"),
-        ("00100...........", "MOV_imm_t1"),
-        ("00101...........", "CMP_imm_t1"),
-        ("00110...........", "ADD_imm_t2"),
-        ("00111...........", "SUB_imm_t2"),
-        ("0100000000......", "AND_reg_t1"),
-        ("0100000001......", "EOR_reg_t1"),
-        ("0100000010......", "LSL_reg_t1"),
-        ("0100000011......", "LSR_reg_t1"),
-        ("0100000100......", "ASR_reg_t1"),
-        ("0100000101......", "ADC_reg_t1"),
-        ("0100000110......", "SBC_reg_t1"),
-        ("0100000111......", "ROR_reg_t1"),
-        ("0100001000......", "TST_reg_t1"),
-        ("0100001001......", "RSB_imm_t1"),
-        ("0100001010......", "CMP_reg_t1"),
-        ("0100001011......", "CMN_reg_t1"),
-        ("0100001100......", "ORR_reg_t1"),
-        ("0100001101......", "MUL_t1"),
-        ("0100001110......", "BIC_reg_t1"),
-        ("0100001111......", "MVN_reg_t1"),
-        ("01000100........", "ADD_reg_t2"),
-        ("01000100.1101...", "ADD_reg_sp_t1"),
-        ("010001001....101", "ADD_reg_sp_t2"),
-        ("01000101........", "CMP_reg_t2"),
-        ("01000110........", "MOV_reg_t1"),
-        ("010001110....000", "BX_t1"),
-        ("010001111....000", "BLX_t1"),
-        ("01001...........", "LDR_lit_t1"),
-        ("0101000.........", "STR_reg_t1"),
-        ("0101001.........", "STRH_reg_t1"),
-        ("0101010.........", "STRB_reg_t1"),
-        ("0101011.........", "LDRSB_reg_t1"),
-        ("0101100.........", "LDR_reg_t1"),
-        ("0101101.........", "LDRH_reg_t1"),
-        ("0101110.........", "LDRB_reg_t1"),
-        ("0101111.........", "LDRSH_reg_t1"),
-        ("01100...........", "STR_imm_t1"),
-        ("01101...........", "LDR_imm_t1"),
-        ("01110...........", "STRB_imm_t1"),
-        ("01111...........", "LDRB_imm_t1"),
-        ("10000...........", "STRH_imm_t1"),
-        ("10001...........", "LDRH_imm_t1"),
-        ("10010...........", "STR_imm_t2"),
-        ("10011...........", "LDR_imm_t2"),
-        ("10100...........", "ADR_t1"),
-        ("10101...........", "ADD_SP_imm_t1"),
-        ("101100000.......", "ADD_SP_imm_t2"),
-        ("101100001.......", "SUB_SP_imm_t1"),
-        ("1011001000......", "SXTH_t1"),
-        ("1011001001......", "SXTB_t1"),
-        ("1011001010......", "UXTH_t1"),
-        ("1011001011......", "UXTB_t1"),
-        ("1011010.........", "PUSH_t1"),
-        ("10110110011.0010", "CPS_t1"),
-        ("1011.0.1........", "CBZ_t1"),
-        ("1011101000......", "REV_t1"),
-        ("1011101001......", "REV16_t1"),
-        ("1011101011......", "REVSH_t1"),
-        ("1011110.........", "POP_reg_t1"),
-        ("10111110........", "BKPT_t1"),
-        ("10111111........", "IT_t1"),
-        ("1011111100000000", "NOP_t1"),
-        ("1011111100010000", "YIELD_t1"),
-        ("1011111100100000", "WFE_t1"),
-        ("1011111100110000", "WFI_t1"),
-        ("1011111101000000", "SEV_t1"),
-        ("11000...........", "STM_t1"),
-        ("11001...........", "LDM_t1"),
-        ("1101............", "B_t1_SVC_t1"),
-        ("11100...........", "B_t2"),
-    ]);
+    let instructions_thumb32 = pattern_table(thumb32_entries, 32);
+
+    let instructions_thumb16 = pattern_table(
+        Vec::from([
+            ("00000...........", "MOV_reg_t2_LSL_imm_t1"),
+            ("00001...........", "LSR_imm_t1"),
+            ("00010...........", "ASR_imm_t1"),
+            ("0001100.........", "ADD_reg_t1"),
+            ("0001101.........", "SUB_reg_t1"),
+            ("0001110.........", "ADD_imm_t1"),
+            ("0001111.........", "SUB_imm_t1"),
+            ("00100...........", "MOV_imm_t1"),
+            ("00101...........", "CMP_imm_t1"),
+            ("00110...........", "ADD_imm_t2"),
+            ("00111...........", "SUB_imm_t2"),
+            ("0100000000......", "AND_reg_t1"),
+            ("0100000001......", "EOR_reg_t1"),
+            ("0100000010......", "LSL_reg_t1"),
+            ("0100000011......", "LSR_reg_t1"),
+            ("0100000100......", "ASR_reg_t1"),
+            ("0100000101......", "ADC_reg_t1"),
+            ("0100000110......", "SBC_reg_t1"),
+            ("0100000111......", "ROR_reg_t1"),
+            ("0100001000......", "TST_reg_t1"),
+            ("0100001001......", "RSB_imm_t1"),
+            ("0100001010......", "CMP_reg_t1"),
+            ("0100001011......", "CMN_reg_t1"),
+            ("0100001100......", "ORR_reg_t1"),
+            ("0100001101......", "MUL_t1"),
+            ("0100001110......", "BIC_reg_t1"),
+            ("0100001111......", "MVN_reg_t1"),
+            ("01000100........", "ADD_reg_t2"),
+            ("01000100.1101...", "ADD_reg_sp_t1"),
+            ("010001001....101", "ADD_reg_sp_t2"),
+            ("01000101........", "CMP_reg_t2"),
+            ("01000110........", "MOV_reg_t1"),
+            ("010001110....000", "BX_t1"),
+            ("010001111....000", "BLX_t1"),
+            ("01001...........", "LDR_lit_t1"),
+            ("0101000.........", "STR_reg_t1"),
+            ("0101001.........", "STRH_reg_t1"),
+            ("0101010.........", "STRB_reg_t1"),
+            ("0101011.........", "LDRSB_reg_t1"),
+            ("0101100.........", "LDR_reg_t1"),
+            ("0101101.........", "LDRH_reg_t1"),
+            ("0101110.........", "LDRB_reg_t1"),
+            ("0101111.........", "LDRSH_reg_t1"),
+            ("01100...........", "STR_imm_t1"),
+            ("01101...........", "LDR_imm_t1"),
+            ("01110...........", "STRB_imm_t1"),
+            ("01111...........", "LDRB_imm_t1"),
+            ("10000...........", "STRH_imm_t1"),
+            ("10001...........", "LDRH_imm_t1"),
+            ("10010...........", "STR_imm_t2"),
+            ("10011...........", "LDR_imm_t2"),
+            ("10100...........", "ADR_t1"),
+            ("10101...........", "ADD_SP_imm_t1"),
+            ("101100000.......", "ADD_SP_imm_t2"),
+            ("101100001.......", "SUB_SP_imm_t1"),
+            ("1011001000......", "SXTH_t1"),
+            ("1011001001......", "SXTB_t1"),
+            ("1011001010......", "UXTH_t1"),
+            ("1011001011......", "UXTB_t1"),
+            ("1011010.........", "PUSH_t1"),
+            ("10110110011.0010", "CPS_t1"),
+            ("1011.0.1........", "CBZ_t1"),
+            ("1011101000......", "REV_t1"),
+            ("1011101001......", "REV16_t1"),
+            ("1011101011......", "REVSH_t1"),
+            ("1011110.........", "POP_reg_t1"),
+            ("10111110........", "BKPT_t1"),
+            ("10111111........", "IT_t1"),
+            ("1011111100000000", "NOP_t1"),
+            ("1011111100010000", "YIELD_t1"),
+            ("1011111100100000", "WFE_t1"),
+            ("1011111100110000", "WFI_t1"),
+            ("1011111101000000", "SEV_t1"),
+            ("11000...........", "STM_t1"),
+            ("11001...........", "LDM_t1"),
+            ("1101............", "B_t1_SVC_t1"),
+            ("11100...........", "B_t2"),
+        ]),
+        16,
+    );
 
     let dest_path_16 = Path::new(&out_dir).join("decode_16.rs");
     let dest_path_32 = Path::new(&out_dir).join("decode_32.rs");
 
     generate_decode(
         &dest_path_32,
-        "decode_32(opcode: u32)",
+        "decode_32_table(opcode: u32)",
         "decode_UDF_t2(opcode)",
         &instructions_thumb32,
         32,
     )?;
     generate_decode(
         &dest_path_16,
-        "decode_16(opcode: u16)",
+        "decode_16_table(opcode: u16)",
         "decode_undefined(opcode)",
         &instructions_thumb16,
         16,

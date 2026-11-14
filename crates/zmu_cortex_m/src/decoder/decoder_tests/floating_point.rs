@@ -453,6 +453,139 @@ fn test_decode_vmrs() {
 }
 
 #[test]
+fn test_decode_vmrs_to_a_register() {
+    // vmrs r3, fpscr
+    assert_eq!(
+        decode_32(0xeef1_3a10),
+        Instruction::VMRS {
+            rt: VMRSTarget::Register(Reg::R3)
+        }
+    );
+    // Rt = SP is unpredictable.
+    assert!(matches!(decode_32(0xeef1_da10), Instruction::UDF { .. }));
+}
+
+#[test]
+fn test_decode_vmsr() {
+    // vmsr fpscr, r0 / r7 / r12
+    for (opcode, rt) in [
+        (0xeee1_0a10, Reg::R0),
+        (0xeee1_7a10, Reg::R7),
+        (0xeee1_ca10, Reg::R12),
+    ] {
+        assert_eq!(decode_32(opcode), Instruction::VMSR { rt });
+    }
+    assert_eq!(decode_32(0xeee1_0a10).to_string(), "vmsr fpscr, r0");
+    // Rt = SP and Rt = PC are unpredictable.
+    assert!(matches!(decode_32(0xeee1_da10), Instruction::UDF { .. }));
+    assert!(matches!(decode_32(0xeee1_fa10), Instruction::UDF { .. }));
+}
+
+#[test]
+fn test_decode_vmov_two_core_registers_and_two_singles() {
+    // vmov s0, s1, r0, r1
+    assert_eq!(
+        decode_32(0xec41_0a10),
+        Instruction::VMOV_cr2_sp2 {
+            params: VMovCr2Sp2Params {
+                to_arm_registers: false,
+                rt: Reg::R0,
+                rt2: Reg::R1,
+                sm: SingleReg::S0,
+                sm1: SingleReg::S1,
+            }
+        }
+    );
+    // vmov r2, r3, s4, s5
+    assert_eq!(
+        decode_32(0xec53_2a12),
+        Instruction::VMOV_cr2_sp2 {
+            params: VMovCr2Sp2Params {
+                to_arm_registers: true,
+                rt: Reg::R2,
+                rt2: Reg::R3,
+                sm: SingleReg::S4,
+                sm1: SingleReg::S5,
+            }
+        }
+    );
+    // vmov s1, s2, r0, r1: the pair starts on an odd single.
+    assert_eq!(
+        decode_32(0xec41_0a30),
+        Instruction::VMOV_cr2_sp2 {
+            params: VMovCr2Sp2Params {
+                to_arm_registers: false,
+                rt: Reg::R0,
+                rt2: Reg::R1,
+                sm: SingleReg::S1,
+                sm1: SingleReg::S2,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vmov_two_singles_unpredictable_forms() {
+    // Rt or Rt2 as SP or PC, the same register twice into the core, and the pair s31, s32.
+    for opcode in [0xec41_da10u32, 0xec41_fa10, 0xec4d_0a10, 0xec4f_0a10] {
+        assert!(
+            matches!(decode_32(opcode), Instruction::UDF { .. }),
+            "{opcode:#x}"
+        );
+    }
+    assert!(matches!(decode_32(0xec51_1a10), Instruction::UDF { .. }));
+    assert!(matches!(decode_32(0xec41_0a3f), Instruction::UDF { .. }));
+}
+
+#[test]
+fn test_decode_vmov_between_a_core_register_and_a_double_word() {
+    // vmov.32 d3[0], r2 / d3[1], r2 / d15[1], r12
+    for (opcode, dd, x, rt) in [
+        (0xee03_2b10u32, DoubleReg::D3, false, Reg::R2),
+        (0xee23_2b10, DoubleReg::D3, true, Reg::R2),
+        (0xee2f_cb10, DoubleReg::D15, true, Reg::R12),
+    ] {
+        assert_eq!(
+            decode_32(opcode),
+            Instruction::VMOV_cr_scalar {
+                params: VMovCrScalarParams { rt, dd, x }
+            }
+        );
+    }
+    // vmov.32 r4, d5[0] / r4, d5[1] / r0, d15[1]
+    for (opcode, dd, x, rt) in [
+        (0xee15_4b10u32, DoubleReg::D5, false, Reg::R4),
+        (0xee35_4b10, DoubleReg::D5, true, Reg::R4),
+        (0xee3f_0b10, DoubleReg::D15, true, Reg::R0),
+    ] {
+        assert_eq!(
+            decode_32(opcode),
+            Instruction::VMOV_scalar_cr {
+                params: VMovCrScalarParams { rt, dd, x }
+            }
+        );
+    }
+}
+
+#[test]
+fn test_decode_vmov_scalar_unpredictable_forms() {
+    // Rt as SP or PC, and a register above d15, which fpv5-d16 does not have.
+    for opcode in [
+        0xee03_db10u32,
+        0xee03_fb10,
+        0xee13_db10,
+        0xee13_fb10,
+        0xee03_2b90,
+        0xee13_2b90,
+    ] {
+        assert!(
+            matches!(decode_32(opcode), Instruction::UDF { .. }),
+            "{opcode:#x}"
+        );
+    }
+}
+
+#[test]
 fn test_decode_vpop() {
     //  ecbd 8b06       vpop    {d8-d10}
 

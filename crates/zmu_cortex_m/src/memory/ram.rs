@@ -5,6 +5,7 @@
 
 use crate::bus::Bus;
 use crate::core::fault::Fault;
+use crate::memory::{window, window_mut};
 use byteorder::{ByteOrder, LittleEndian};
 
 #[derive(Debug)]
@@ -38,42 +39,38 @@ impl RAM {
 impl Bus for RAM {
     #[inline(always)]
     fn read8(&self, addr: u32) -> Result<u8, Fault> {
-        let a = addr - self.start_address;
-        Ok(self.data[a as usize])
+        Ok(window(&self.data, addr.wrapping_sub(self.start_address), 1)?[0])
     }
 
     #[inline(always)]
     fn read16(&self, addr: u32) -> Result<u16, Fault> {
-        let a = (addr - self.start_address) as usize;
-
-        Ok(LittleEndian::read_u16(&self.data[a..a + 2]))
+        let bytes = window(&self.data, addr.wrapping_sub(self.start_address), 2)?;
+        Ok(LittleEndian::read_u16(bytes))
     }
 
     #[inline(always)]
     fn read32(&mut self, addr: u32) -> Result<u32, Fault> {
-        let a = (addr - self.start_address) as usize;
-        Ok(LittleEndian::read_u32(&self.data[a..a + 4]))
+        let bytes = window(&self.data, addr.wrapping_sub(self.start_address), 4)?;
+        Ok(LittleEndian::read_u32(bytes))
     }
 
     #[inline(always)]
     fn write8(&mut self, addr: u32, value: u8) -> Result<(), Fault> {
-        let a = addr - self.start_address;
-        self.data[a as usize] = value;
+        window_mut(&mut self.data, addr.wrapping_sub(self.start_address), 1)?[0] = value;
         Ok(())
     }
 
     #[inline(always)]
     fn write16(&mut self, addr: u32, value: u16) -> Result<(), Fault> {
-        let a = (addr - self.start_address) as usize;
-
-        LittleEndian::write_u16(&mut self.data[a..a + 2], value);
+        let bytes = window_mut(&mut self.data, addr.wrapping_sub(self.start_address), 2)?;
+        LittleEndian::write_u16(bytes, value);
         Ok(())
     }
 
     #[inline(always)]
     fn write32(&mut self, addr: u32, value: u32) -> Result<(), Fault> {
-        let a = (addr - self.start_address) as usize;
-        LittleEndian::write_u32(&mut self.data[a..a + 4], value);
+        let bytes = window_mut(&mut self.data, addr.wrapping_sub(self.start_address), 4)?;
+        LittleEndian::write_u32(bytes, value);
         Ok(())
     }
 
@@ -135,4 +132,21 @@ fn test_write_read() {
         mem.write8(1022, 0xCC).unwrap();
         assert_eq!(mem.read8(1022).unwrap(), 0xCC);
     }
+}
+
+#[test]
+fn test_access_past_the_end_is_a_fault() {
+    let mut mem = RAM::new(0x2000_0000, 1024);
+    let end = 0x2000_0000 + 1024;
+    assert_eq!(mem.read32(end - 3), Err(Fault::Preciserr));
+    assert_eq!(mem.read16(end - 1), Err(Fault::Preciserr));
+    assert_eq!(mem.read8(end), Err(Fault::Preciserr));
+    assert_eq!(mem.write32(end - 2, 1), Err(Fault::Preciserr));
+    assert_eq!(mem.write16(end - 1, 1), Err(Fault::Preciserr));
+    assert_eq!(mem.write8(end, 1), Err(Fault::Preciserr));
+    // below the start, the subtraction must not underflow either
+    assert_eq!(mem.read8(0), Err(Fault::Preciserr));
+    assert_eq!(mem.write8(0x1fff_ffff, 1), Err(Fault::Preciserr));
+    // nothing was written by the failed write
+    assert_eq!(mem.read32(end - 4), Ok(0));
 }

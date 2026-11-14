@@ -47,7 +47,9 @@ impl Bits for u32 {
 
     #[inline(always)]
     fn set_bits(&mut self, range: Range<usize>, value: Self) {
-        let mask: Self = !(((1 << (range.end - range.start)) - 1) << range.start);
+        // a field as wide as the word has no `1 << width` to take
+        let ones: Self = !0 >> (32 - (range.end - range.start));
+        let mask: Self = !(ones << range.start);
 
         *self &= mask;
         *self |= value << range.start;
@@ -72,7 +74,9 @@ impl Bits for u64 {
     }
     #[inline(always)]
     fn set_bits(&mut self, range: Range<usize>, value: Self) {
-        let mask: Self = !(((1 << (range.end - range.start)) - 1) << range.start);
+        // a field as wide as the word has no `1 << width` to take
+        let ones: Self = !0 >> (64 - (range.end - range.start));
+        let mask: Self = !(ones << range.start);
         *self &= mask;
         *self |= value << range.start;
     }
@@ -95,7 +99,9 @@ impl Bits for u16 {
     }
     #[inline(always)]
     fn set_bits(&mut self, range: Range<usize>, value: Self) {
-        let mask: Self = !(((1 << (range.end - range.start)) - 1) << range.start);
+        // a field as wide as the word has no `1 << width` to take
+        let ones: Self = !0 >> (16 - (range.end - range.start));
+        let mask: Self = !(ones << range.start);
 
         *self &= mask;
         *self |= value << range.start;
@@ -119,7 +125,9 @@ impl Bits for u8 {
     }
     #[inline(always)]
     fn set_bits(&mut self, range: Range<usize>, value: Self) {
-        let mask: Self = !(((1 << (range.end - range.start)) - 1) << range.start);
+        // a field as wide as the word has no `1 << width` to take
+        let ones: Self = !0 >> (8 - (range.end - range.start));
+        let mask: Self = !(ones << range.start);
 
         *self &= mask;
         *self |= value << range.start;
@@ -145,7 +153,9 @@ impl Bits for i128 {
 
     #[inline(always)]
     fn set_bits(&mut self, range: Range<usize>, value: Self) {
-        let mask: Self = !(((1 << (range.end - range.start)) - 1) << range.start);
+        // a field as wide as the word has no `1 << width` to take
+        let ones = (!0_u128 >> (128 - (range.end - range.start))) as Self;
+        let mask: Self = !(ones << range.start);
 
         *self &= mask;
         *self |= value << range.start;
@@ -171,7 +181,9 @@ impl Bits for u128 {
 
     #[inline(always)]
     fn set_bits(&mut self, range: Range<usize>, value: Self) {
-        let mask: Self = !(((1 << (range.end - range.start)) - 1) << range.start);
+        // a field as wide as the word has no `1 << width` to take
+        let ones: Self = !0 >> (128 - (range.end - range.start));
+        let mask: Self = !(ones << range.start);
 
         *self &= mask;
         *self |= value << range.start;
@@ -223,5 +235,24 @@ mod tests {
             // assert
             assert_eq!(o1, 0b1111_1111_1111_1111_1111_1111_1111_1111_u32);
         }
+    }
+
+    #[test]
+    fn test_set_bits_over_the_whole_word() {
+        let mut a: u32 = 0xffff_ffff;
+        a.set_bits(0..32, 0x1234_5678);
+        assert_eq!(a, 0x1234_5678);
+
+        let mut b: u64 = 0;
+        b.set_bits(0..64, u64::MAX);
+        assert_eq!(b, u64::MAX);
+
+        let mut c: u8 = 0xff;
+        c.set_bits(0..8, 0x12);
+        assert_eq!(c, 0x12);
+
+        let mut d: u32 = 0xffff_ffff;
+        d.set_bits(4..8, 0);
+        assert_eq!(d, 0xffff_ff0f);
     }
 }

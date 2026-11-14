@@ -23,6 +23,10 @@ pub fn decode_LDRH_reg_t1(opcode: u16) -> Instruction {
 
 #[allow(non_snake_case)]
 pub fn decode_LDRH_reg_t2(opcode: u32) -> Instruction {
+    // Rn = PC is the literal form, whatever else is in the opcode
+    if opcode.get_bits(16..20) == 0b1111 {
+        return decode_LDRH_lit_t1(opcode);
+    }
     Instruction::LDRH_reg {
         params: Reg3FullParams {
             rm: Reg::from(opcode.get_bits(0..4) as u8),
@@ -86,9 +90,12 @@ pub fn decode_LDRH_imm_t3(opcode: u32) -> Instruction {
 
 #[allow(non_snake_case)]
 pub fn decode_LDRH_lit_t1(opcode: u32) -> Instruction {
-    Instruction::UDF {
-        imm32: 0,
-        opcode: opcode.into(),
+    // Rt = PC is a memory hint, and not a load
+    if opcode.get_bits(12..16) == 0b1111 {
+        return super::decode_hint_t2(opcode);
+    }
+    Instruction::LDRH_imm {
+        params: super::literal_params(opcode),
         thumb32: true,
     }
 }

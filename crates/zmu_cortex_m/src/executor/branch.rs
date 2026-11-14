@@ -4,12 +4,9 @@ use crate::executor::{ExecuteSuccess, ExecutorHelper};
 
 use super::ExecuteResult;
 
-use crate::{
-    bus::Bus,
-    core::{
-        instruction::{CondBranchParams, ParamsRegImm32, Reg2RnRmParams},
-        register::{BaseReg, Reg},
-    },
+use crate::core::{
+    instruction::{CondBranchParams, ParamsRegImm32, Reg2RnRmParams},
+    register::{BaseReg, Reg},
 };
 
 /// Branching operations
@@ -33,7 +30,7 @@ impl IsaBranch for Processor {
         if self.condition_passed() {
             let pc = self.get_r(Reg::PC);
             self.set_r(Reg::LR, pc | 0x01);
-            let target = ((pc as i32) + imm32) as u32;
+            let target = pc.wrapping_add_signed(imm32);
 
             self.branch_write_pc(target);
             return Ok(ExecuteSuccess::Branched { cycles: 4 });
@@ -55,7 +52,7 @@ impl IsaBranch for Processor {
         if self.condition_passed() {
             let pc = self.get_r(Reg::PC);
             let target = self.get_r(rm);
-            self.set_r(Reg::LR, (((pc - 2) >> 1) << 1) | 1);
+            self.set_r(Reg::LR, (((pc.wrapping_sub(2)) >> 1) << 1) | 1);
             self.blx_write_pc(target);
             return Ok(ExecuteSuccess::Branched { cycles: 3 });
         }
@@ -66,7 +63,7 @@ impl IsaBranch for Processor {
     fn exec_b_t13(&mut self, params: CondBranchParams) -> ExecuteResult {
         if self.condition_passed_b(params.cond) {
             let pc = self.get_r(Reg::PC);
-            let target = ((pc as i32) + params.imm32) as u32;
+            let target = pc.wrapping_add_signed(params.imm32);
             self.branch_write_pc(target);
             Ok(ExecuteSuccess::Branched { cycles: 3 })
         } else {
@@ -77,7 +74,7 @@ impl IsaBranch for Processor {
     fn exec_b_t24(&mut self, imm32: i32) -> ExecuteResult {
         if self.condition_passed() {
             let pc = self.get_r(Reg::PC);
-            let target = ((pc as i32) + imm32) as u32;
+            let target = pc.wrapping_add_signed(imm32);
             self.branch_write_pc(target);
             Ok(ExecuteSuccess::Branched { cycles: 3 })
         } else {
@@ -90,9 +87,9 @@ impl IsaBranch for Processor {
             let rn = self.get_r(params.rn);
             let rm = self.get_r(params.rm);
             let pc = self.get_r(Reg::PC);
-            let halfwords = u32::from(self.read8(rn + rm)?);
+            let halfwords = u32::from(self.read8_data(rn.wrapping_add(rm))?);
 
-            self.branch_write_pc(pc + 2 * halfwords);
+            self.branch_write_pc(pc.wrapping_add(2 * halfwords));
 
             return Ok(ExecuteSuccess::Branched { cycles: 2 });
         }
@@ -104,9 +101,9 @@ impl IsaBranch for Processor {
             let rn = self.get_r(params.rn);
             let rm = self.get_r(params.rm);
             let pc = self.get_r(Reg::PC);
-            let halfwords = u32::from(self.read16(rn + (rm << 1))?);
+            let halfwords = u32::from(self.read16_data(rn.wrapping_add(rm << 1))?);
 
-            self.branch_write_pc(pc + 2 * halfwords);
+            self.branch_write_pc(pc.wrapping_add(2 * halfwords));
 
             return Ok(ExecuteSuccess::Branched { cycles: 1 });
         }
@@ -117,7 +114,7 @@ impl IsaBranch for Processor {
         let rn = self.get_r(params.rn);
         if rn == 0 {
             let pc = self.get_r(Reg::PC);
-            self.branch_write_pc(pc + params.imm32);
+            self.branch_write_pc(pc.wrapping_add(params.imm32));
             Ok(ExecuteSuccess::Branched { cycles: 1 })
         } else {
             Ok(ExecuteSuccess::Taken { cycles: 1 })
@@ -130,7 +127,7 @@ impl IsaBranch for Processor {
             Ok(ExecuteSuccess::Taken { cycles: 1 })
         } else {
             let pc = self.get_r(Reg::PC);
-            self.branch_write_pc(pc + params.imm32);
+            self.branch_write_pc(pc.wrapping_add(params.imm32));
             Ok(ExecuteSuccess::Branched { cycles: 1 })
         }
     }

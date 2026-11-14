@@ -1,3 +1,4 @@
+use super::decode_UDF_t2;
 use crate::core::{
     bits::Bits,
     fpregister::FPRounding,
@@ -15,6 +16,16 @@ fn decode_vcvt_to_integer(
     let d = (opcode.get_bits(12..16) as u8) << 1 | u8::from(opcode.get_bit(22));
     let vm = opcode.get_bits(0..4) as u8;
     let m_low = u8::from(opcode.get_bit(5));
+    let m = if dp_operation {
+        let Some(reg) = DoubleReg::new(m_low << 4 | vm) else {
+            return decode_UDF_t2(opcode);
+        };
+        ExtensionReg::Double { reg }
+    } else {
+        ExtensionReg::Single {
+            reg: SingleReg::from(vm << 1 | m_low),
+        }
+    };
     Instruction::VCVT {
         params: VCVTParams {
             to_integer: true,
@@ -24,15 +35,7 @@ fn decode_vcvt_to_integer(
             d: ExtensionReg::Single {
                 reg: SingleReg::from(d),
             },
-            m: if dp_operation {
-                ExtensionReg::Double {
-                    reg: DoubleReg::from(m_low << 4 | vm),
-                }
-            } else {
-                ExtensionReg::Single {
-                    reg: SingleReg::from(vm << 1 | m_low),
-                }
-            },
+            m,
         },
     }
 }
@@ -57,9 +60,14 @@ pub fn decode_VCVT_t1(opcode: u32) -> Instruction {
         let unsigned = !op;
         let m = vm << 1 | M;
         let d = if dp_operation {
-            D << 4 | vd
+            let Some(reg) = DoubleReg::new(D << 4 | vd) else {
+                return decode_UDF_t2(opcode);
+            };
+            ExtensionReg::Double { reg }
         } else {
-            vd << 1 | D
+            ExtensionReg::Single {
+                reg: SingleReg::from(vd << 1 | D),
+            }
         };
         Instruction::VCVT {
             params: VCVTParams {
@@ -67,15 +75,7 @@ pub fn decode_VCVT_t1(opcode: u32) -> Instruction {
                 dp_operation,
                 unsigned,
                 rounding: None,
-                d: if dp_operation {
-                    ExtensionReg::Double {
-                        reg: DoubleReg::from(d),
-                    }
-                } else {
-                    ExtensionReg::Single {
-                        reg: SingleReg::from(d),
-                    }
-                },
+                d,
                 m: ExtensionReg::Single {
                     reg: SingleReg::from(m),
                 },
@@ -104,16 +104,13 @@ pub fn decode_VCVT_fixed_t1(opcode: u32) -> Instruction {
     let vd = opcode.get_bits(12..16) as u8;
 
     if imm5 > size {
-        return Instruction::UDF {
-            imm32: 0,
-            opcode: opcode.into(),
-            thumb32: true,
-        };
+        return decode_UDF_t2(opcode);
     }
     let reg = if opcode.get_bit(8) {
-        ExtensionReg::Double {
-            reg: DoubleReg::from(d << 4 | vd),
-        }
+        let Some(reg) = DoubleReg::new(d << 4 | vd) else {
+            return decode_UDF_t2(opcode);
+        };
+        ExtensionReg::Double { reg }
     } else {
         ExtensionReg::Single {
             reg: SingleReg::from(vd << 1 | d),
@@ -140,16 +137,22 @@ pub fn decode_VCVT_ds_t1(opcode: u32) -> Instruction {
     let d = u8::from(opcode.get_bit(22));
 
     if sz {
+        let Some(dm) = DoubleReg::new((m << 4) | vm) else {
+            return decode_UDF_t2(opcode);
+        };
         Instruction::VCVT_f32_f64 {
             params: VCVTParamsF32F64 {
                 sd: SingleReg::from((vd << 1) | d),
-                dm: DoubleReg::from((m << 4) | vm),
+                dm,
             },
         }
     } else {
+        let Some(dd) = DoubleReg::new((d << 4) | vd) else {
+            return decode_UDF_t2(opcode);
+        };
         Instruction::VCVT_f64_f32 {
             params: VCVTParamsF64F32 {
-                dd: DoubleReg::from((d << 4) | vd),
+                dd,
                 sm: SingleReg::from((vm << 1) | m),
             },
         }

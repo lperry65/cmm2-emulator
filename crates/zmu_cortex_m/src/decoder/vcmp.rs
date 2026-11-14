@@ -1,75 +1,41 @@
-use crate::core::{
-    bits::Bits,
-    instruction::{Instruction, VCmpParamsf32, VCmpParamsf64},
-    register::{DoubleReg, SingleReg},
-};
+use super::vfp_operands::decode_two_reg;
+use crate::core::bits::Bits;
+use crate::core::instruction::{Instruction, VCmpParamsf32, VCmpParamsf64};
+
+// VCMP and VCMPE of two registers (T1) or of one against zero (T2). Bit 7 makes it VCMPE, which
+// signals on a quiet NaN too.
+fn decode_vcmp(opcode: u32, with_zero: bool) -> Instruction {
+    let quiet_nan_exc = opcode.get_bit(7);
+
+    decode_two_reg(
+        opcode,
+        |p| Instruction::VCMP_f32 {
+            params: VCmpParamsf32 {
+                sd: p.sd,
+                sm: p.sm,
+                quiet_nan_exc,
+                with_zero,
+            },
+        },
+        |p| Instruction::VCMP_f64 {
+            params: VCmpParamsf64 {
+                dd: p.dd,
+                dm: p.dm,
+                quiet_nan_exc,
+                with_zero,
+            },
+        },
+    )
+}
 
 #[allow(non_snake_case)]
 #[inline(always)]
 pub fn decode_VCMP_t1(opcode: u32) -> Instruction {
-    let sz = opcode.get_bit(8);
-
-    let D = u8::from(opcode.get_bit(22));
-    let vd = opcode.get_bits(12..16) as u8;
-    let vm = opcode.get_bits(0..4) as u8;
-    let M = u8::from(opcode.get_bit(5));
-    let e = u8::from(opcode.get_bit(7));
-
-    let quiet_nan_exc = e == 1;
-    let with_zero = false;
-
-    if sz {
-        Instruction::VCMP_f64 {
-            params: VCmpParamsf64 {
-                dd: DoubleReg::from(D << 4 | vd),
-                dm: DoubleReg::from(M << 4 | vm),
-                quiet_nan_exc,
-                with_zero,
-            },
-        }
-    } else {
-        Instruction::VCMP_f32 {
-            params: VCmpParamsf32 {
-                sd: SingleReg::from(vd << 1 | D),
-                sm: SingleReg::from(vm << 1 | M),
-                quiet_nan_exc,
-                with_zero,
-            },
-        }
-    }
+    decode_vcmp(opcode, false)
 }
 
 #[allow(non_snake_case)]
 #[inline(always)]
 pub fn decode_VCMP_t2(opcode: u32) -> Instruction {
-    let sz = opcode.get_bit(8);
-
-    let D = u8::from(opcode.get_bit(22));
-    let vd = opcode.get_bits(12..16) as u8;
-    let vm = opcode.get_bits(0..4) as u8;
-    let M = u8::from(opcode.get_bit(5));
-    let e = u8::from(opcode.get_bit(7));
-
-    let quiet_nan_exc = e == 1;
-    let with_zero = true;
-
-    if sz {
-        Instruction::VCMP_f64 {
-            params: VCmpParamsf64 {
-                dd: DoubleReg::from(D << 4 | vd),
-                dm: DoubleReg::from(M << 4 | vm),
-                quiet_nan_exc,
-                with_zero,
-            },
-        }
-    } else {
-        Instruction::VCMP_f32 {
-            params: VCmpParamsf32 {
-                sd: SingleReg::from(vd << 1 | D),
-                sm: SingleReg::from(vm << 1 | M),
-                quiet_nan_exc,
-                with_zero,
-            },
-        }
-    }
+    decode_vcmp(opcode, true)
 }

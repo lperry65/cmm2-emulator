@@ -4,15 +4,12 @@ use crate::core::instruction::{
 };
 
 use super::ExecuteResult;
+use crate::core::{
+    instruction::VLoadAndStoreParams,
+    register::{BaseReg, ExtensionReg, ExtensionRegOperations, Reg},
+};
 use crate::executor::fp_generic::FloatingPointChecks;
 use crate::executor::{ExecuteSuccess, ExecutorHelper};
-use crate::{
-    bus::Bus,
-    core::{
-        instruction::VLoadAndStoreParams,
-        register::{BaseReg, ExtensionReg, ExtensionRegOperations, Reg},
-    },
-};
 
 /// Multiply operations
 pub trait IsaFloatingPointLoadAndStore {
@@ -37,18 +34,18 @@ impl IsaFloatingPointLoadAndStore for Processor {
             };
 
             let address = if params.add {
-                base + params.imm32
+                base.wrapping_add(params.imm32)
             } else {
-                base - params.imm32
+                base.wrapping_sub(params.imm32)
             };
             match params.dd {
                 ExtensionReg::Single { reg } => {
-                    let data = self.read32(address)?;
+                    let data = self.read32_data(address)?;
                     self.set_sr(reg, data);
                 }
                 ExtensionReg::Double { reg } => {
-                    let word1 = self.read32(address)?;
-                    let word2 = self.read32(address + 4)?;
+                    let word1 = self.read32_data(address)?;
+                    let word2 = self.read32_data(address.wrapping_add(4))?;
                     self.set_dr(reg, word1, word2);
                 }
             }
@@ -65,19 +62,19 @@ impl IsaFloatingPointLoadAndStore for Processor {
             let base = self.get_r(params.rn);
 
             let address = if params.add {
-                base + params.imm32
+                base.wrapping_add(params.imm32)
             } else {
-                base - params.imm32
+                base.wrapping_sub(params.imm32)
             };
             match params.dd {
                 ExtensionReg::Single { reg } => {
                     let value = self.get_sr(reg);
-                    self.write32(address, value)?;
+                    self.write32_data(address, value)?;
                 }
                 ExtensionReg::Double { reg } => {
                     let (low_word, high_word) = self.get_dr(reg);
-                    self.write32(address, low_word)?;
-                    self.write32(address + 4, high_word)?;
+                    self.write32_data(address, low_word)?;
+                    self.write32_data(address.wrapping_add(4), high_word)?;
                 }
             }
 
@@ -88,6 +85,8 @@ impl IsaFloatingPointLoadAndStore for Processor {
 
     fn exec_vldm_t1(&mut self, params: &VStoreMultipleParams64) -> ExecuteResult {
         if self.condition_passed() {
+            self.execute_fp_check()?;
+
             let base = self.get_r(params.rn);
             let mut address = if params.mode == AddressingMode::IncrementAfter {
                 base
@@ -105,8 +104,8 @@ impl IsaFloatingPointLoadAndStore for Processor {
             }
 
             for reg in &params.list {
-                let low_word = self.read32(address)?;
-                let high_word = self.read32(address + 4)?;
+                let low_word = self.read32_data(address)?;
+                let high_word = self.read32_data(address.wrapping_add(4))?;
                 if self.big_endian() {
                     self.set_dr(reg, high_word, low_word);
                 } else {
@@ -122,6 +121,8 @@ impl IsaFloatingPointLoadAndStore for Processor {
 
     fn exec_vldm_t2(&mut self, params: &VStoreMultipleParams32) -> ExecuteResult {
         if self.condition_passed() {
+            self.execute_fp_check()?;
+
             let base = self.get_r(params.rn);
             let mut address = if params.mode == AddressingMode::IncrementAfter {
                 base
@@ -139,7 +140,7 @@ impl IsaFloatingPointLoadAndStore for Processor {
             }
 
             for reg in &params.list {
-                let value = self.read32(address)?;
+                let value = self.read32_data(address)?;
                 self.set_sr(reg, value);
                 address = address.wrapping_add(4);
             }
@@ -154,26 +155,26 @@ impl IsaFloatingPointLoadAndStore for Processor {
             self.execute_fp_check()?;
 
             let sp = self.get_r(Reg::SP);
-            let mut address = sp - params.imm32;
+            let mut address = sp.wrapping_sub(params.imm32);
             self.set_r(Reg::SP, address);
 
             if params.single_regs {
                 for reg in &params.single_precision_registers {
                     let value = self.get_sr(reg);
-                    self.write32(address, value)?;
-                    address += 4;
+                    self.write32_data(address, value)?;
+                    address = address.wrapping_add(4);
                 }
             } else {
                 for reg in &params.double_precision_registers {
                     let (low_word, high_word) = self.get_dr(reg);
                     if self.big_endian() {
-                        self.write32(address, high_word)?;
-                        self.write32(address + 4, low_word)?;
+                        self.write32_data(address, high_word)?;
+                        self.write32_data(address.wrapping_add(4), low_word)?;
                     } else {
-                        self.write32(address, low_word)?;
-                        self.write32(address + 4, high_word)?;
+                        self.write32_data(address, low_word)?;
+                        self.write32_data(address.wrapping_add(4), high_word)?;
                     }
-                    address += 8;
+                    address = address.wrapping_add(8);
                 }
             }
 
@@ -188,23 +189,23 @@ impl IsaFloatingPointLoadAndStore for Processor {
 
             let sp = self.get_r(Reg::SP);
             let mut address = sp;
-            self.set_r(Reg::SP, sp + params.imm32);
+            self.set_r(Reg::SP, sp.wrapping_add(params.imm32));
             if params.single_regs {
                 for reg in &params.single_precision_registers {
-                    let value = self.read32(address)?;
+                    let value = self.read32_data(address)?;
                     self.set_sr(reg, value);
-                    address += 4;
+                    address = address.wrapping_add(4);
                 }
             } else {
                 for reg in &params.double_precision_registers {
-                    let low_word = self.read32(address)?;
-                    let high_word = self.read32(address + 4)?;
+                    let low_word = self.read32_data(address)?;
+                    let high_word = self.read32_data(address.wrapping_add(4))?;
                     if self.big_endian() {
                         self.set_dr(reg, high_word, low_word);
                     } else {
                         self.set_dr(reg, low_word, high_word);
                     }
-                    address += 8;
+                    address = address.wrapping_add(8);
                 }
             }
 
@@ -220,14 +221,14 @@ impl IsaFloatingPointLoadAndStore for Processor {
             let mut address = if params.mode == AddressingMode::IncrementAfter {
                 self.get_r(params.rn)
             } else {
-                self.get_r(params.rn) - params.imm32
+                self.get_r(params.rn).wrapping_sub(params.imm32)
             };
 
             if params.write_back {
                 let write_back_value = if params.mode == AddressingMode::IncrementAfter {
-                    self.get_r(params.rn) + params.imm32
+                    self.get_r(params.rn).wrapping_add(params.imm32)
                 } else {
-                    self.get_r(params.rn) - params.imm32
+                    self.get_r(params.rn).wrapping_sub(params.imm32)
                 };
                 self.set_r(params.rn, write_back_value);
             }
@@ -235,13 +236,13 @@ impl IsaFloatingPointLoadAndStore for Processor {
             for reg in &params.list {
                 let (low_word, high_word) = self.get_dr(reg);
                 if self.big_endian() {
-                    self.write32(address, high_word)?;
-                    self.write32(address + 4, low_word)?;
+                    self.write32_data(address, high_word)?;
+                    self.write32_data(address.wrapping_add(4), low_word)?;
                 } else {
-                    self.write32(address, low_word)?;
-                    self.write32(address + 4, high_word)?;
+                    self.write32_data(address, low_word)?;
+                    self.write32_data(address.wrapping_add(4), high_word)?;
                 }
-                address += 8;
+                address = address.wrapping_add(8);
             }
 
             return Ok(ExecuteSuccess::Taken { cycles: 1 });
@@ -256,22 +257,22 @@ impl IsaFloatingPointLoadAndStore for Processor {
             let mut address = if params.mode == AddressingMode::IncrementAfter {
                 self.get_r(params.rn)
             } else {
-                self.get_r(params.rn) - params.imm32
+                self.get_r(params.rn).wrapping_sub(params.imm32)
             };
 
             if params.write_back {
                 let write_back_value = if params.mode == AddressingMode::IncrementAfter {
-                    self.get_r(params.rn) + params.imm32
+                    self.get_r(params.rn).wrapping_add(params.imm32)
                 } else {
-                    self.get_r(params.rn) - params.imm32
+                    self.get_r(params.rn).wrapping_sub(params.imm32)
                 };
                 self.set_r(params.rn, write_back_value);
             }
 
             for reg in &params.list {
                 let value = self.get_sr(reg);
-                self.write32(address, value)?;
-                address += 4;
+                self.write32_data(address, value)?;
+                address = address.wrapping_add(4);
             }
 
             return Ok(ExecuteSuccess::Taken { cycles: 1 });
@@ -291,6 +292,45 @@ mod tests {
         let mut processor = Processor::new();
         processor.cpacr = 0x00f0_0000;
         processor
+    }
+
+    // vldmia r0!, {d0, d1}, vstmia r0!, {d0, d1} and the same with s0, s1
+    const MULTIPLE_FORMS: [u32; 4] = [0xecb0_0b04, 0xeca0_0b04, 0xecb0_0a02, 0xeca0_0a02];
+
+    #[test]
+    fn test_vldm_and_vstm_fault_when_the_fpu_is_disabled() {
+        use crate::core::fault::Fault;
+        use crate::decoder::decode_32;
+
+        for opcode in MULTIPLE_FORMS {
+            let mut processor = Processor::new();
+            processor.set_r(Reg::R0, 0x2000_0100);
+
+            assert_eq!(
+                processor.execute_internal(&decode_32(opcode)),
+                Err(Fault::Nocp),
+                "{opcode:#010x}"
+            );
+            // the write back did not happen
+            assert_eq!(processor.get_r(Reg::R0), 0x2000_0100);
+        }
+    }
+
+    #[test]
+    fn test_vldm_and_vstm_start_the_floating_point_context() {
+        use crate::decoder::decode_32;
+        use crate::peripheral::scb::FPCCR_ASPEN;
+
+        for opcode in MULTIPLE_FORMS {
+            let mut processor = fp_test_processor();
+            processor.set_r(Reg::R0, 0x2000_0100);
+            processor.fpccr = 1 << FPCCR_ASPEN;
+            assert!(!processor.control.fpca);
+
+            processor.execute_internal(&decode_32(opcode)).unwrap();
+
+            assert!(processor.control.fpca, "{opcode:#010x}");
+        }
     }
 
     #[test]

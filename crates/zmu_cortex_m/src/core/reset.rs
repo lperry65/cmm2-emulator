@@ -75,7 +75,9 @@ impl Reset for Processor {
         self.itstate = 0;
         self.execution_priority = self.get_execution_priority();
 
-        let reset_vector = self.read32(vtor + 4).map_err(Fault::on_vector_read)?;
+        let reset_vector = self
+            .read32(vtor.wrapping_add(4))
+            .map_err(Fault::on_vector_read)?;
         self.blx_write_pc(reset_vector);
         Ok(())
     }
@@ -97,6 +99,21 @@ mod tests {
         processor.flash_memory(image.len(), &image);
         processor.reset().unwrap();
         processor
+    }
+
+    #[test]
+    fn reset_with_the_vector_table_at_the_top_of_memory_wraps_to_the_bottom() {
+        let mut processor = booted();
+        processor.device(Some(Box::new(crate::memory::ram::RAM::new(
+            0xffff_f000,
+            0x1000,
+        ))));
+        processor.write32(0xE000_ED08, 0xffff_fffc).unwrap();
+        processor.write32(0xffff_fffc, 0x2000_0100).unwrap();
+
+        // the stack pointer comes from the last word, and the reset vector is past it, at address 0
+        assert_eq!(processor.reset(), Ok(()));
+        assert_eq!(processor.get_pc(), 0x2000_0100 & !1);
     }
 
     #[test]
@@ -177,6 +194,8 @@ mod tests {
         assert_eq!(processor.read32(0xE000_E018), Ok(0));
     }
 
+    // SHPR1, SHCSR, SCR and CCR are there on ARMv7-M only
+    #[cfg(not(feature = "armv6m"))]
     #[test]
     fn reset_clears_system_control_registers() {
         let mut processor = booted();
@@ -184,6 +203,8 @@ mod tests {
         processor.write32(0xE000_ED24, 0x0007_0000).unwrap();
         processor.write32(0xE000_ED10, 0x10).unwrap();
         processor.write32(0xE000_ED14, 0x200).unwrap();
+        // CPACR is there only with an FPU
+        #[cfg(feature = "has-fp")]
         processor.write32(0xE000_ED88, 0x00F0_0000).unwrap();
         processor.write32(0xE000_1000, 1).unwrap();
 
@@ -193,6 +214,7 @@ mod tests {
         assert_eq!(processor.read32(0xE000_ED24), Ok(0));
         assert_eq!(processor.read32(0xE000_ED10), Ok(0));
         assert_eq!(processor.read32(0xE000_ED14), Ok(0));
+        #[cfg(feature = "has-fp")]
         assert_eq!(processor.read32(0xE000_ED88), Ok(0));
         assert_eq!(processor.read32(0xE000_1000), Ok(0x4000_0000));
     }

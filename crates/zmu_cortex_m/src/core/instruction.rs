@@ -1608,6 +1608,10 @@ pub enum Instruction {
     VMRS {
         rt: VMRSTarget,
     },
+    #[cfg(feature = "has-fp")]
+    VMSR {
+        rt: Reg,
+    },
 
     // --------------------------------------------
     //
@@ -2027,10 +2031,10 @@ impl fmt::Display for Instruction {
             ),
             Self::ADR { params, thumb32 } => write!(
                 f,
-                "adr{} {}, pc, 0x#{:x}",
+                "adr{} {}, pc, #{}",
                 if thumb32 { ".W" } else { "" },
                 params.r,
-                params.imm32
+                params.imm32 as i32
             ),
             Self::AND_reg { params, thumb32 } => write!(
                 f,
@@ -2778,11 +2782,21 @@ impl fmt::Display for Instruction {
             Self::UXTAH { params } => write!(f, "{}", fmt_extend_add("uxtah", params)),
             Self::PKH { params, tb_form } => write!(
                 f,
-                "pkh{} {}, {}, {}",
+                "pkh{} {}, {}, {}{}",
                 if tb_form { "tb" } else { "bt" },
                 params.rd,
                 params.rn,
-                params.rm
+                params.rm,
+                // PKHBT with no shift leaves it out; PKHTB always has one, 32 for an immediate of 0.
+                if params.shift_n == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        ", {} #{}",
+                        if tb_form { "asr" } else { "lsl" },
+                        params.shift_n
+                    )
+                }
             ),
             Self::UXTH { params, thumb32 } => write!(
                 f,
@@ -2899,11 +2913,23 @@ impl fmt::Display for Instruction {
             Self::VMOV_reg_f64 { params } => write!(f, "vmov.f64 {}, {}", params.dd, params.dm),
             #[cfg(feature = "has-fp")]
             Self::VMOV_cr_scalar { params } => {
-                write!(f, "vmov {}[{}], {}", params.dd, params.x, params.rt)
+                write!(
+                    f,
+                    "vmov {}[{}], {}",
+                    params.dd,
+                    u8::from(params.x),
+                    params.rt
+                )
             }
             #[cfg(feature = "has-fp")]
             Self::VMOV_scalar_cr { params } => {
-                write!(f, "vmov {}, {}[{}]", params.rt, params.dd, params.x)
+                write!(
+                    f,
+                    "vmov {}, {}[{}]",
+                    params.rt,
+                    params.dd,
+                    u8::from(params.x)
+                )
             }
 
             #[cfg(feature = "has-fp")]
@@ -2958,6 +2984,8 @@ impl fmt::Display for Instruction {
             Self::VNEG_f64 { params } => write!(f, "vneg.f64 {}, {}", params.dd, params.dm),
             #[cfg(feature = "has-fp")]
             Self::VMRS { rt } => write!(f, "vmrs {rt}, fpscr"),
+            #[cfg(feature = "has-fp")]
+            Self::VMSR { rt } => write!(f, "vmsr fpscr, {rt}"),
             #[cfg(feature = "has-fp")]
             Self::VCMP_f32 { params } => write!(
                 f,
@@ -3479,7 +3507,8 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
 
         #[cfg(feature = "has-fp")]
         Instruction::VMRS { .. } => 4,
-        //VMSR
+        #[cfg(feature = "has-fp")]
+        Instruction::VMSR { .. } => 4,
         #[cfg(feature = "has-fp")]
         Instruction::VMUL_f32 { .. } => 4,
         #[cfg(feature = "has-fp")]

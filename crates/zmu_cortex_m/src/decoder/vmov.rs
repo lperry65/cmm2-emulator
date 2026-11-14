@@ -1,11 +1,21 @@
+use super::vfp_operands::decode_two_reg;
 use crate::core::{
     bits::Bits,
     instruction::{
-        Instruction, VMovCr2DpParams, VMovCrSpParams, VMovImmParams32, VMovImmParams64,
-        VMovRegParamsf32, VMovRegParamsf64,
+        Instruction, VMovCr2DpParams, VMovCr2Sp2Params, VMovCrScalarParams, VMovCrSpParams,
+        VMovImmParams32, VMovImmParams64,
     },
     register::{DoubleReg, Reg, SingleReg},
 };
+
+// The encodings the manual calls unpredictable decode as undefined.
+fn undefined(opcode: u32) -> Instruction {
+    Instruction::UDF {
+        opcode: opcode.into(),
+        thumb32: true,
+        imm32: 0,
+    }
+}
 
 // Example:
 //
@@ -83,9 +93,12 @@ pub fn decode_VMOV_imm(opcode: u32) -> Instruction {
     let imm8 = imm4h << 4 | imm4l;
 
     if sz {
+        let Some(dd) = DoubleReg::new(D << 4 | vd) else {
+            return undefined(opcode);
+        };
         Instruction::VMOV_imm_64 {
             params: VMovImmParams64 {
-                dd: DoubleReg::from(D << 4 | vd),
+                dd,
                 imm64: vfpexpand_imm64(imm8),
             },
         }
@@ -102,53 +115,43 @@ pub fn decode_VMOV_imm(opcode: u32) -> Instruction {
 #[allow(non_snake_case)]
 #[inline(always)]
 pub fn decode_VMOV_reg(opcode: u32) -> Instruction {
-    let sz = opcode.get_bit(8);
+    decode_two_reg(
+        opcode,
+        |params| Instruction::VMOV_reg_f32 { params },
+        |params| Instruction::VMOV_reg_f64 { params },
+    )
+}
 
-    let vm = opcode.get_bits(0..4) as u8;
-    let M = u8::from(opcode.get_bit(5));
-    let vd = opcode.get_bits(12..16) as u8;
-    let D = u8::from(opcode.get_bit(22));
-
-    let dp_operation = sz;
-
-    let d = if dp_operation {
-        D << 4 | vd
-    } else {
-        vd << 1 | D
-    };
-
-    let m = if dp_operation {
-        M << 4 | vm
-    } else {
-        vm << 1 | M
-    };
-
-    if dp_operation {
-        return Instruction::VMOV_reg_f64 {
-            params: VMovRegParamsf64 {
-                dm: DoubleReg::from(m),
-                dd: DoubleReg::from(d),
-            },
-        };
+// The 32-bit scalar form both directions share: bit 21 picks the word of the double register,
+// which is N:Vn in bits 7 and 19:16, and N set would name D16 or above. Rt can not be SP or PC.
+fn scalar_params(opcode: u32) -> Option<VMovCrScalarParams> {
+    let rt = Reg::from(opcode.get_bits(12..16) as u8);
+    if rt == Reg::PC || rt == Reg::SP || opcode.get_bit(7) {
+        return None;
     }
-    Instruction::VMOV_reg_f32 {
-        params: VMovRegParamsf32 {
-            sd: SingleReg::from(d),
-            sm: SingleReg::from(m),
-        },
+    Some(VMovCrScalarParams {
+        rt,
+        dd: DoubleReg::new(opcode.get_bits(16..20) as u8)?,
+        x: opcode.get_bit(21),
+    })
+}
+
+#[allow(non_snake_case)]
+#[inline(always)]
+pub fn decode_VMOV_cr_scalar(opcode: u32) -> Instruction {
+    match scalar_params(opcode) {
+        Some(params) => Instruction::VMOV_cr_scalar { params },
+        None => undefined(opcode),
     }
 }
 
 #[allow(non_snake_case)]
 #[inline(always)]
-pub fn decode_VMOV_cr_scalar(_opcode: u32) -> Instruction {
-    unimplemented!()
-}
-
-#[allow(non_snake_case)]
-#[inline(always)]
-pub fn decode_VMOV_scalar_cr(_opcode: u32) -> Instruction {
-    unimplemented!()
+pub fn decode_VMOV_scalar_cr(opcode: u32) -> Instruction {
+    match scalar_params(opcode) {
+        Some(params) => Instruction::VMOV_scalar_cr { params },
+        None => undefined(opcode),
+    }
 }
 
 #[allow(non_snake_case)]
@@ -158,11 +161,7 @@ pub fn decode_VMOV_cr_sp(opcode: u32) -> Instruction {
 
     // rt 15 and 13 are unpredictable:
     if rt == Reg::PC || rt == Reg::SP {
-        return Instruction::UDF {
-            opcode: opcode.into(),
-            thumb32: true,
-            imm32: 0,
-        };
+        return undefined(opcode);
     }
 
     let N = opcode.get_bit(7);
@@ -179,8 +178,30 @@ pub fn decode_VMOV_cr_sp(opcode: u32) -> Instruction {
 
 #[allow(non_snake_case)]
 #[inline(always)]
-pub fn decode_VMOV_cr2_sp2(_opcode: u32) -> Instruction {
-    unimplemented!()
+pub fn decode_VMOV_cr2_sp2(opcode: u32) -> Instruction {
+    let rt = Reg::from(opcode.get_bits(12..16) as u8);
+    let rt2 = Reg::from(opcode.get_bits(16..20) as u8);
+    let to_arm_registers = opcode.get_bit(20);
+    let m = (opcode.get_bits(0..4) as u8) << 1 | u8::from(opcode.get_bit(5));
+
+    // SP and PC in either register, the same register twice into the core, and the pair that
+    // would run on from s31 are unpredictable.
+    if [rt, rt2].iter().any(|r| *r == Reg::PC || *r == Reg::SP)
+        || (to_arm_registers && rt == rt2)
+        || m == 31
+    {
+        return undefined(opcode);
+    }
+
+    Instruction::VMOV_cr2_sp2 {
+        params: VMovCr2Sp2Params {
+            to_arm_registers,
+            rt,
+            rt2,
+            sm: SingleReg::from(m),
+            sm1: SingleReg::from(m + 1),
+        },
+    }
 }
 
 #[allow(non_snake_case)]
@@ -191,34 +212,24 @@ pub fn decode_VMOV_cr2_dp(opcode: u32) -> Instruction {
 
     // rt&rt2 15 and 13 are unpredictable:
     if rt == Reg::PC || rt == Reg::SP {
-        return Instruction::UDF {
-            opcode: opcode.into(),
-            thumb32: true,
-            imm32: 0,
-        };
+        return undefined(opcode);
     }
 
     if rt2 == Reg::PC || rt2 == Reg::SP {
-        return Instruction::UDF {
-            opcode: opcode.into(),
-            thumb32: true,
-            imm32: 0,
-        };
+        return undefined(opcode);
     }
     let op = opcode.get_bit(20);
     if op && rt == rt2 {
-        return Instruction::UDF {
-            opcode: opcode.into(),
-            thumb32: true,
-            imm32: 0,
-        };
+        return undefined(opcode);
     }
 
     let M = opcode.get_bit(5);
     let vm = opcode.get_bits(0..4) as u8;
     let m = ((u8::from(M)) << 4) + vm;
 
-    let dm = DoubleReg::from(m);
+    let Some(dm) = DoubleReg::new(m) else {
+        return undefined(opcode);
+    };
 
     Instruction::VMOV_cr2_dp {
         params: VMovCr2DpParams {

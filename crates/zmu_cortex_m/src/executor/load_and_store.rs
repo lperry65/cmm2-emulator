@@ -21,37 +21,48 @@ use crate::{
 };
 
 impl Processor {
-    fn read8_data(&mut self, address: u32) -> Result<u8, Fault> {
+    /// The base register of an immediate-offset load. PC is the literal form, and its base is
+    /// Align(PC, 4).
+    #[inline(always)]
+    fn load_base(&self, rn: Reg) -> u32 {
+        if rn == Reg::PC {
+            self.get_r(Reg::PC) & 0xffff_fffc
+        } else {
+            self.get_r(rn)
+        }
+    }
+
+    pub(crate) fn read8_data(&mut self, address: u32) -> Result<u8, Fault> {
         self.read8(address).map_err(|fault| {
             self.fault_with_status(fault, FaultStatusContext::with_fault_address(address))
         })
     }
 
-    fn read16_data(&mut self, address: u32) -> Result<u16, Fault> {
+    pub(crate) fn read16_data(&mut self, address: u32) -> Result<u16, Fault> {
         self.read16(address).map_err(|fault| {
             self.fault_with_status(fault, FaultStatusContext::with_fault_address(address))
         })
     }
 
-    fn read32_data(&mut self, address: u32) -> Result<u32, Fault> {
+    pub(crate) fn read32_data(&mut self, address: u32) -> Result<u32, Fault> {
         self.read32(address).map_err(|fault| {
             self.fault_with_status(fault, FaultStatusContext::with_fault_address(address))
         })
     }
 
-    fn write8_data(&mut self, address: u32, value: u8) -> Result<(), Fault> {
+    pub(crate) fn write8_data(&mut self, address: u32, value: u8) -> Result<(), Fault> {
         self.write8(address, value).map_err(|fault| {
             self.fault_with_status(fault, FaultStatusContext::with_fault_address(address))
         })
     }
 
-    fn write16_data(&mut self, address: u32, value: u16) -> Result<(), Fault> {
+    pub(crate) fn write16_data(&mut self, address: u32, value: u16) -> Result<(), Fault> {
         self.write16(address, value).map_err(|fault| {
             self.fault_with_status(fault, FaultStatusContext::with_fault_address(address))
         })
     }
 
-    fn write32_data(&mut self, address: u32, value: u32) -> Result<(), Fault> {
+    pub(crate) fn write32_data(&mut self, address: u32, value: u32) -> Result<(), Fault> {
         self.write32(address, value).map_err(|fault| {
             self.fault_with_status(fault, FaultStatusContext::with_fault_address(address))
         })
@@ -285,7 +296,7 @@ impl IsaLoadAndStore for Processor {
     #[inline(always)]
     fn exec_ldrb_imm(&mut self, params: &Reg2FullParams) -> ExecuteResult {
         if self.condition_passed() {
-            let rn = self.get_r(params.rn);
+            let rn = self.load_base(params.rn);
             let offset_address = if params.add {
                 rn.wrapping_add(params.imm32)
             } else {
@@ -307,7 +318,7 @@ impl IsaLoadAndStore for Processor {
     fn exec_ldrh_imm(&mut self, params: &Reg2FullParams) -> ExecuteResult {
         if self.condition_passed() {
             let (address, offset_address) = resolve_addressing(
-                self.get_r(params.rn),
+                self.load_base(params.rn),
                 params.imm32,
                 params.add,
                 params.index,
@@ -327,7 +338,7 @@ impl IsaLoadAndStore for Processor {
     fn exec_ldrsb_imm(&mut self, params: &Reg2FullParams) -> ExecuteResult {
         if self.condition_passed() {
             let (address, offset_address) = resolve_addressing(
-                self.get_r(params.rn),
+                self.load_base(params.rn),
                 params.imm32,
                 params.add,
                 params.index,
@@ -346,7 +357,7 @@ impl IsaLoadAndStore for Processor {
     #[inline(always)]
     fn exec_ldrsh_imm(&mut self, params: &Reg2FullParams) -> ExecuteResult {
         if self.condition_passed() {
-            let rn = self.get_r(params.rn);
+            let rn = self.load_base(params.rn);
             let offset_address = if params.add {
                 rn.wrapping_add(params.imm32)
             } else {
@@ -531,7 +542,7 @@ impl IsaLoadAndStore for Processor {
     fn exec_ldrd_imm(&mut self, params: &Reg2DoubleParams) -> ExecuteResult {
         if self.condition_passed() {
             let (address, offset_address) = resolve_addressing(
-                self.get_r(params.rn),
+                self.load_base(params.rn),
                 params.imm32,
                 params.add,
                 params.index,
@@ -539,7 +550,7 @@ impl IsaLoadAndStore for Processor {
 
             let data = self.read32_data(address)?;
             self.set_r(params.rt, data);
-            let data2 = self.read32_data(address + 4)?;
+            let data2 = self.read32_data(address.wrapping_add(4))?;
             self.set_r(params.rt2, data2);
 
             if params.wback {
@@ -563,7 +574,7 @@ impl IsaLoadAndStore for Processor {
             let value1 = self.get_r(params.rt);
             self.write32_data(address, value1)?;
             let value2 = self.get_r(params.rt2);
-            self.write32_data(address + 4, value2)?;
+            self.write32_data(address.wrapping_add(4), value2)?;
 
             if params.wback {
                 self.set_r(params.rn, offset_address);
@@ -578,9 +589,9 @@ impl IsaLoadAndStore for Processor {
         if self.condition_passed() {
             let base = self.get_r(Reg::PC) & 0xffff_fffc;
             let address = if params.add {
-                base + params.imm32
+                base.wrapping_add(params.imm32)
             } else {
-                base - params.imm32
+                base.wrapping_sub(params.imm32)
             };
             let data = self.read32_data(address)?;
 

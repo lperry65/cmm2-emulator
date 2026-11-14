@@ -157,7 +157,7 @@ impl IsaStandardDataProcessing for Processor {
     }
     fn exec_adr(&mut self, params: RegImmParams) -> ExecuteResult {
         if self.condition_passed() {
-            let result = (self.get_r(Reg::PC) & 0xffff_fffc) + params.imm32;
+            let result = (self.get_r(Reg::PC) & 0xffff_fffc).wrapping_add(params.imm32);
             self.set_r(params.r, result);
             return Ok(ExecuteSuccess::Taken { cycles: 1 });
         }
@@ -696,5 +696,64 @@ mod tests {
         core.execute_internal(&instruction).unwrap();
 
         assert_eq!(core.get_r(Reg::R6), 0);
+    }
+
+    // ORNS with an immediate: the carry out is the immediate's own when it was rotated, and the
+    // old carry when it was a byte or a byte pattern.
+    fn run_orns(opcode: u32, rn: u32, carry_in: bool) -> Processor {
+        let mut core = Processor::new();
+        core.psr.value = 0;
+        core.psr.set_c(carry_in);
+        core.set_r(Reg::R2, rn);
+        core.execute_internal(&crate::decoder::decode_32(opcode))
+            .unwrap();
+        core
+    }
+
+    #[test]
+    fn test_orns_imm_sets_n_and_takes_the_carry_from_a_rotated_immediate() {
+        // orns r1, r2, #0x80000000
+        let core = run_orns(0xf072_4100, 0, false);
+        assert_eq!(core.get_r(Reg::R1), 0x7fff_ffff);
+        assert!(!core.psr.get_n());
+        assert!(!core.psr.get_z());
+        assert!(core.psr.get_c());
+
+        let core = run_orns(0xf072_4100, 0x8000_0000, false);
+        assert_eq!(core.get_r(Reg::R1), 0xffff_ffff);
+        assert!(core.psr.get_n());
+    }
+
+    #[test]
+    fn test_orns_imm_keeps_the_carry_for_a_byte_pattern() {
+        // orns r1, r2, #0xff00ff00
+        for carry in [false, true] {
+            let core = run_orns(0xf072_21ff, 0, carry);
+            assert_eq!(core.get_r(Reg::R1), 0x00ff_00ff);
+            assert!(!core.psr.get_n());
+            assert_eq!(core.psr.get_c(), carry);
+        }
+    }
+
+    #[test]
+    fn test_orns_imm_sets_z_when_the_result_is_zero() {
+        // orns r1, r2, #0xffffffff
+        let core = run_orns(0xf072_31ff, 0, true);
+        assert_eq!(core.get_r(Reg::R1), 0);
+        assert!(core.psr.get_z());
+        assert!(!core.psr.get_n());
+    }
+
+    #[test]
+    fn test_orn_imm_without_s_leaves_the_flags() {
+        // orn r1, r2, #0xff00ff00
+        let mut core = Processor::new();
+        core.psr.value = 0;
+        core.psr.set_z_bit(true);
+        core.set_r(Reg::R2, 0);
+        core.execute_internal(&crate::decoder::decode_32(0xf062_21ff))
+            .unwrap();
+        assert_eq!(core.get_r(Reg::R1), 0x00ff_00ff);
+        assert!(core.psr.get_z());
     }
 }

@@ -175,8 +175,8 @@ impl Fpscr for u32 {
             0 => FPSCRRounding::RoundToNearest,
             1 => FPSCRRounding::RoundTowardsPlusInfinity,
             2 => FPSCRRounding::RoundTowardsMinusInfinity,
-            3 => FPSCRRounding::RoundTowardsZero,
-            _ => unreachable!(),
+            // a two bit field, so 3 is the value left
+            _ => FPSCRRounding::RoundTowardsZero,
         }
     }
 

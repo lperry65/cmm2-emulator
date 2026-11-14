@@ -86,6 +86,11 @@ pub(crate) const FPSCR_STATUS_CONTROL_END: usize = 27;
 const CPACR_CP10_CP11_MASK: u32 = 0x00f0_0000;
 #[cfg(feature = "has-fp")]
 const FPCCR_WRITABLE_MASK: u32 = (1 << FPCCR_LSPEN) | (1 << FPCCR_ASPEN);
+// The FPSCR bits a Cortex-M7 implements: N, Z, C, V, AHP, DN, FZ, RMode and the cumulative flags
+// IDC, IXC, UFC, OFC, DZC and IOC. The trap enables (bits 8-12 and 15) and the rest are reserved:
+// they read as zero and a write to them is ignored, so the core never traps on an FP exception.
+#[cfg(feature = "has-fp")]
+pub(crate) const FPSCR_WRITE_MASK: u32 = 0xf7c0_009f;
 #[cfg(feature = "has-fp")]
 const FPDSCR_WRITABLE_MASK: u32 = 0x07c0_0000;
 
@@ -125,6 +130,7 @@ const CFSR_INVPC: u32 = 1 << 18;
 // HardFault Status Register bit positions
 const HFSR_VECTTBL: u32 = 1 << 1;
 const HFSR_FORCED: u32 = 1 << 30;
+const HFSR_DEBUGEVT_BIT: u32 = 1 << 31;
 const HFSR_WRITE_ONE_TO_CLEAR_MASK: u32 = (1 << 1) | HFSR_FORCED | (1 << 31);
 
 impl Processor {
@@ -283,6 +289,12 @@ impl Processor {
         Ok(())
     }
 
+    // Every write to the FPSCR goes through here, so the reserved bits stay zero.
+    #[cfg(feature = "has-fp")]
+    pub(crate) fn write_fpscr(&mut self, value: u32) {
+        self.fpscr = value & FPSCR_WRITE_MASK;
+    }
+
     #[cfg(feature = "has-fp")]
     pub(crate) fn write_fpdscr(&mut self, value: u32) -> Result<(), Fault> {
         if !self.current_mode_is_privileged() {
@@ -326,6 +338,7 @@ impl Processor {
             Fault::Invstate => self.cfsr |= CFSR_INVSTATE,
             Fault::InvPc => self.cfsr |= CFSR_INVPC,
             Fault::Forced => self.set_hfsr_forced(),
+            Fault::DebugEvt => self.hfsr |= HFSR_DEBUGEVT_BIT,
             Fault::VectorTable => self.hfsr |= HFSR_VECTTBL,
             _ => {}
         }

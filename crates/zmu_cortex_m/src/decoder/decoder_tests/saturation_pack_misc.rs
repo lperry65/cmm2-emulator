@@ -138,6 +138,7 @@ fn test_decode_ubfx() {
 }
 
 #[test]
+#[cfg(feature = "has-dsp-ext")]
 fn test_decode_uxtab_() {
     //0xfa54_f480 UXTAB.W R4, R4, R0
 
@@ -155,6 +156,7 @@ fn test_decode_uxtab_() {
 }
 
 #[test]
+#[cfg(feature = "has-dsp-ext")]
 fn test_decode_extend_and_add() {
     let cases = [
         // uxtah r0, r0, r3
@@ -188,6 +190,7 @@ fn test_decode_extend_and_add() {
 }
 
 #[test]
+#[cfg(feature = "has-dsp-ext")]
 fn test_the_extend_and_add_and_pack_instructions_are_shown_as_assembly() {
     let cases = [
         (0xfa10_f083, "uxtah r0, r0, r3"),
@@ -196,7 +199,11 @@ fn test_the_extend_and_add_and_pack_instructions_are_shown_as_assembly() {
         (0xfa42_f3b3, "sxtab r3, r2, r3, ror #24"),
         (0xfa52_f383, "uxtab r3, r2, r3"),
         (0xeacc_0400, "pkhbt r4, r12, r0"),
-        (0xeacc_4460, "pkhtb r4, r12, r0"),
+        (0xeacc_4460, "pkhtb r4, r12, r0, asr #17"),
+        (0xeac2_11e3, "pkhtb r1, r2, r3, asr #7"),
+        // An immediate of 0 is a shift by 32 for TB.
+        (0xeac2_0123, "pkhtb r1, r2, r3, asr #32"),
+        (0xeac2_11c3, "pkhbt r1, r2, r3, lsl #7"),
     ];
     for (opcode, expected) in cases {
         let text = decode_32(opcode).to_string();
@@ -222,6 +229,7 @@ fn test_decode_extend_without_add_is_not_the_extend_and_add() {
 }
 
 #[test]
+#[cfg(feature = "has-dsp-ext")]
 fn test_decode_pkhbt_and_pkhtb() {
     let params = |shift_t, shift_n| Reg3ShiftParams {
         rd: Reg::R4,
@@ -376,4 +384,70 @@ fn test_decode_ssat_usat() {
             }
         }
     );
+}
+
+// Without the DSP extension the extend-and-add and pack encodings are undefined, like SEL.
+#[test]
+#[cfg(not(feature = "has-dsp-ext"))]
+fn test_decode_extend_and_add_and_pack_without_dsp_ext_are_udf() {
+    // uxtab, sxtab, uxtah, sxtah, pkhbt, pkhtb
+    for opcode in [
+        0xfa54_f480u32,
+        0xfa42_f3b3,
+        0xfa12_f393,
+        0xfa02_f3a3,
+        0xeacc_0400,
+        0xeacc_4460,
+    ] {
+        assert!(
+            matches!(decode_32(opcode), Instruction::UDF { thumb32: true, .. }),
+            "{opcode:#010x}"
+        );
+    }
+}
+
+#[test]
+fn test_decode_bitfield_extract_past_bit_31() {
+    // ubfx r1, r0, #28, #4 reaches bit 31 and is fine; a width of 5 runs past it and is
+    // UNPREDICTABLE, so it decodes as undefined.
+    assert_eq!(
+        decode_32(0xf3c0_7103),
+        Instruction::UBFX {
+            params: BfxParams {
+                rd: Reg::R1,
+                rn: Reg::R0,
+                lsb: 28,
+                widthminus1: 3,
+            }
+        }
+    );
+    assert_eq!(
+        decode_32(0xf340_7103),
+        Instruction::SBFX {
+            params: BfxParams {
+                rd: Reg::R1,
+                rn: Reg::R0,
+                lsb: 28,
+                widthminus1: 3,
+            }
+        }
+    );
+    assert_udf_32(0xf3c0_7104);
+    assert_udf_32(0xf340_7104);
+}
+
+#[test]
+fn test_decode_bfc_msbit_below_lsbit_is_udf() {
+    // bfc r1, #28, #4 is fine; an msbit of 3 under an lsbit of 28 is UNPREDICTABLE.
+    assert_eq!(
+        decode_32(0xf36f_711f),
+        Instruction::BFC {
+            params: BfcParams {
+                rd: Reg::R1,
+                lsbit: 28,
+                msbit: 31,
+            }
+        }
+    );
+    assert_udf_32(0xf36f_7103);
 }

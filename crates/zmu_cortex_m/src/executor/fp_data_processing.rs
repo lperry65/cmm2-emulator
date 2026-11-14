@@ -2047,6 +2047,38 @@ mod tests {
         assert_eq!(processor.get_sr(SingleReg::S6), 2);
     }
 
+    // A signed 16-bit fixed-point result is sign extended into the whole register, and a signed
+    // operand is read from the low 16 bits only.
+    #[test]
+    fn test_vcvt_negative_16_bit_fixed_point_is_sign_extended() {
+        let run = |processor: &mut Processor, opcode| {
+            processor
+                .execute_internal(&crate::decoder::decode_32(opcode))
+                .unwrap();
+        };
+
+        // vcvt.s16.f32 s0, s0, #4: -1.5 is -24
+        let mut processor = fp_test_processor();
+        processor.set_sr(SingleReg::S0, (-1.5f32).to_bits());
+        run(&mut processor, 0xeebe_0a46);
+        assert_eq!(processor.get_sr(SingleReg::S0), 0xffff_ffe8);
+
+        // vcvt.s16.f64 d0, d0, #4
+        processor.set_dr_bits(DoubleReg::D0, (-1.5f64).to_bits());
+        run(&mut processor, 0xeebe_0b46);
+        assert_eq!(processor.get_dr_bits(DoubleReg::D0), 0xffff_ffff_ffff_ffe8);
+
+        // vcvt.f32.s16 s0, s0, #4: the upper half of the register is not part of the operand
+        processor.set_sr(SingleReg::S0, 0x1234_ffe8);
+        run(&mut processor, 0xeeba_0a46);
+        assert_eq!(processor.get_sr(SingleReg::S0), (-1.5f32).to_bits());
+
+        // vcvt.f64.s16 d0, d0, #4
+        processor.set_dr(DoubleReg::D0, 0x1234_ffe8, 0xdead_beef);
+        run(&mut processor, 0xeeba_0b46);
+        assert_eq!(processor.get_dr_bits(DoubleReg::D0), (-1.5f64).to_bits());
+    }
+
     #[test]
     fn test_vcvt_from_fixed_ignores_the_fpscr_rounding_mode() {
         // 2^24 + 1 is half way between two singles; to nearest, ties to even, it is 2^24.

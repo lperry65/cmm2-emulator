@@ -157,6 +157,8 @@ impl BaseReg for Processor {
         self.bx_write_pc(address)
     }
 
+    // The general registers are the hot path of every instruction, so r0-r12 come first, as a
+    // plain index, and the last arm of the rest is PC, which keeps the match total.
     #[inline(always)]
     fn get_r(&self, r: Reg) -> u32 {
         let reg = r as u32;
@@ -173,12 +175,14 @@ impl BaseReg for Processor {
                     }
                 }
                 14 => self.lr,
-                15 => self.pc + 4,
-                _ => unreachable!(),
+                _ => self.pc.wrapping_add(4),
             }
         }
     }
 
+    // Writing R15 here is a plain branch. The decoder keeps the guest away from this (an
+    // instruction that may not have PC as its destination is UDF, the ones that may branch
+    // themselves), so this only has to stay well defined.
     #[inline(always)]
     fn set_r(&mut self, r: Reg, value: u32) {
         let reg = r as u32;
@@ -195,8 +199,7 @@ impl BaseReg for Processor {
                     }
                 }
                 14 => self.lr = value,
-                15 => panic!("use branch commands instead"),
-                _ => unreachable!(),
+                _ => self.branch_write_pc(value),
             }
         }
     }
@@ -222,7 +225,7 @@ impl BaseReg for Processor {
 
     #[inline(always)]
     fn add_pc(&mut self, value: u32) {
-        self.pc += value;
+        self.pc = self.pc.wrapping_add(value);
     }
 
     #[inline(always)]
@@ -236,50 +239,50 @@ impl BaseReg for Processor {
     }
 
     //
-    // Add value to register
+    // Add value to register, registers are modular
     //
     #[inline(always)]
     fn add_r(&mut self, r: Reg, value: u32) {
         let reg = r as u32;
 
         if reg < 13 {
-            self.r0_12[reg as usize] += value;
+            let register = &mut self.r0_12[reg as usize];
+            *register = register.wrapping_add(value);
         } else {
             match reg {
                 13 => {
                     if self.control.sp_sel {
-                        self.psp += value;
+                        self.psp = self.psp.wrapping_add(value);
                     } else {
-                        self.msp += value;
+                        self.msp = self.msp.wrapping_add(value);
                     }
                 }
-                14 => self.lr += value,
-                15 => self.pc += value,
-                _ => unreachable!(),
+                14 => self.lr = self.lr.wrapping_add(value),
+                _ => self.pc = self.pc.wrapping_add(value),
             }
         }
     }
     //
-    // Substract value from register
+    // Substract value from register, registers are modular
     //
     #[inline(always)]
     fn sub_r(&mut self, r: Reg, value: u32) {
         let reg = r as u32;
 
         if reg < 13 {
-            self.r0_12[reg as usize] -= value;
+            let register = &mut self.r0_12[reg as usize];
+            *register = register.wrapping_sub(value);
         } else {
             match reg {
                 13 => {
                     if self.control.sp_sel {
-                        self.psp -= value;
+                        self.psp = self.psp.wrapping_sub(value);
                     } else {
-                        self.msp -= value;
+                        self.msp = self.msp.wrapping_sub(value);
                     }
                 }
-                14 => self.lr -= value,
-                15 => self.pc -= value,
-                _ => unreachable!(),
+                14 => self.lr = self.lr.wrapping_sub(value),
+                _ => self.pc = self.pc.wrapping_sub(value),
             }
         }
     }
@@ -1004,8 +1007,50 @@ impl From<Reg> for usize {
 mod tests {
     #[cfg(feature = "has-fp")]
     use super::Control;
-    use super::{BaseReg, Epsr};
+    use super::{BaseReg, Epsr, Reg};
     use crate::{Processor, ProcessorMode};
+
+    #[test]
+    fn test_double_registers_display_as_d_and_their_number() {
+        for number in 0..16 {
+            let register = super::DoubleReg::new(number).unwrap();
+            assert_eq!(register.to_string(), format!("d{number}"));
+        }
+    }
+
+    #[test]
+    fn test_registers_wrap_around_on_add_and_sub() {
+        let mut processor = Processor::new();
+        for register in [Reg::R0, Reg::R12, Reg::SP, Reg::LR] {
+            processor.set_r(register, u32::MAX);
+            processor.add_r(register, 2);
+            assert_eq!(processor.get_r(register), 1);
+            processor.sub_r(register, 2);
+            assert_eq!(processor.get_r(register), u32::MAX);
+        }
+
+        processor.set_pc(u32::MAX);
+        processor.add_r(Reg::PC, 2);
+        assert_eq!(processor.get_pc(), 1);
+        processor.sub_r(Reg::PC, 2);
+        assert_eq!(processor.get_pc(), u32::MAX);
+    }
+
+    #[test]
+    fn test_pc_reads_four_ahead_without_overflowing() {
+        let mut processor = Processor::new();
+        processor.set_pc(0xffff_fffe);
+        assert_eq!(processor.get_r(Reg::PC), 2);
+        processor.add_pc(4);
+        assert_eq!(processor.get_pc(), 2);
+    }
+
+    #[test]
+    fn test_set_r_of_pc_is_a_branch_not_a_panic() {
+        let mut processor = Processor::new();
+        processor.set_r(Reg::PC, 0x0800_0003);
+        assert_eq!(processor.get_pc(), 0x0800_0002);
+    }
 
     #[test]
     fn test_bx_write_pc_even_address_remains_out_of_scope_for_invstate_todo() {
@@ -1182,24 +1227,8 @@ impl fmt::Display for SingleReg {
 
 impl fmt::Display for DoubleReg {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            DoubleReg::D0 => write!(f, "d0"),
-            DoubleReg::D1 => write!(f, "d1"),
-            DoubleReg::D2 => write!(f, "d2"),
-            DoubleReg::D3 => write!(f, "d3"),
-            DoubleReg::D4 => write!(f, "d4"),
-            DoubleReg::D5 => write!(f, "d5"),
-            DoubleReg::D6 => write!(f, "d6"),
-            DoubleReg::D7 => write!(f, "d7"),
-            DoubleReg::D8 => write!(f, "d8"),
-            DoubleReg::D9 => write!(f, "d9"),
-            DoubleReg::D10 => write!(f, "s10"),
-            DoubleReg::D11 => write!(f, "s11"),
-            DoubleReg::D12 => write!(f, "s12"),
-            DoubleReg::D13 => write!(f, "s14"),
-            DoubleReg::D14 => write!(f, "s15"),
-            DoubleReg::D15 => write!(f, "s16"),
-        }
+        // the register index of the array is twice the number, so go through the number
+        write!(f, "d{}", usize::from(*self) / 2)
     }
 }
 
@@ -1318,26 +1347,29 @@ impl From<SingleReg> for usize {
     }
 }
 
-impl From<u8> for DoubleReg {
-    fn from(value: u8) -> Self {
-        match value & 0xf {
-            0 => Self::D0,
-            1 => Self::D1,
-            2 => Self::D2,
-            3 => Self::D3,
-            4 => Self::D4,
-            5 => Self::D5,
-            6 => Self::D6,
-            7 => Self::D7,
-            8 => Self::D8,
-            9 => Self::D9,
-            10 => Self::D10,
-            11 => Self::D11,
-            12 => Self::D12,
-            13 => Self::D13,
-            14 => Self::D14,
-            15 => Self::D15,
-            _ => Self::D0,
+impl DoubleReg {
+    /// The double register with this number, or `None` for D16 and above. The FPU has 16 double
+    /// registers (FPv5-D16), and the encodings that name D16-D31 are UNDEFINED, so they must
+    /// not alias onto D0-D15.
+    pub fn new(number: u8) -> Option<Self> {
+        match number {
+            0 => Some(Self::D0),
+            1 => Some(Self::D1),
+            2 => Some(Self::D2),
+            3 => Some(Self::D3),
+            4 => Some(Self::D4),
+            5 => Some(Self::D5),
+            6 => Some(Self::D6),
+            7 => Some(Self::D7),
+            8 => Some(Self::D8),
+            9 => Some(Self::D9),
+            10 => Some(Self::D10),
+            11 => Some(Self::D11),
+            12 => Some(Self::D12),
+            13 => Some(Self::D13),
+            14 => Some(Self::D14),
+            15 => Some(Self::D15),
+            _ => None,
         }
     }
 }

@@ -13,17 +13,18 @@ pub fn decode_B_t1_SVC_t1(opcode: u16) -> Instruction {
             imm32: u32::from(opcode.get_bits(0..8)),
         };
     }
-    if cond == 0b1110 {
+    // 0b1110 is UDF, and so is anything else that is not a condition.
+    let Some(cond) = Condition::from_u16(cond).filter(|cond| *cond != Condition::AL) else {
         return Instruction::UDF {
             imm32: 0,
             opcode: opcode.into(),
             thumb32: false,
         };
-    }
+    };
 
     Instruction::B_t13 {
         params: CondBranchParams {
-            cond: Condition::from_u16(cond).unwrap(),
+            cond,
             imm32: sign_extend(u32::from(opcode.get_bits(0..8)) << 1, 8, 32) as i32,
         },
         thumb32: false,

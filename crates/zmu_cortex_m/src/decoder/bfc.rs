@@ -1,3 +1,4 @@
+use super::decode_UDF_t2;
 use crate::core::bits::Bits;
 use crate::core::instruction::{BfcParams, Instruction};
 use crate::core::register::Reg;
@@ -11,6 +12,11 @@ pub fn decode_BFC_t1(opcode: u32) -> Instruction {
 
     let lsbit = u32::from((imm3 << 2) + imm2);
     let msbit = opcode.get_bits(0..5);
+
+    // msbit below lsbit is UNPREDICTABLE, so it decodes as UDF (like BFI).
+    if msbit < lsbit {
+        return decode_UDF_t2(opcode);
+    }
 
     Instruction::BFC {
         params: BfcParams {

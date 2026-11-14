@@ -63,9 +63,7 @@ impl Bus for Processor {
         }
 
         let result = match addr {
-            0xE000_E400..=0xE000_E5EC => {
-                self.nvic_read_ipr_u8(((addr - 0xE000_E400) >> 2) as usize)
-            }
+            0xE000_E400..=0xE000_E5EC => self.nvic_read_ipr_u8((addr - 0xE000_E400) as usize),
             #[cfg(any(feature = "armv7m", feature = "armv7em"))]
             0xE000_ED18..=0xE000_ED1B => self.read_shpr1_u8((addr - 0xE000_ED18) as usize),
             #[cfg(any(feature = "armv7m", feature = "armv7em"))]
@@ -645,5 +643,126 @@ mod tests {
         assert_eq!(processor.fpccr, initial_fpccr);
         assert_eq!(processor.fpcar, initial_fpcar);
         assert_eq!(processor.fpdscr, initial_fpdscr);
+    }
+
+    // The guest picks the address, the width and the value. None of them may panic the host,
+    // whatever register or hole of the system space, or end of a memory, they land on.
+    #[test]
+    fn test_every_address_of_the_system_space_and_the_memory_ends_at_every_width() {
+        let ranges = [
+            0xe000_0000_u32..0xe000_f000,
+            0xe004_0000..0xe004_0100,
+            0x0000_fff0..0x0001_0010,
+            0x2001_fff0..0x2002_0010,
+            0xffff_ff00..0xffff_ffff,
+        ];
+        let values = [
+            0,
+            0xffff_ffff,
+            0xdead_beef,
+            0x0000_0001,
+            0x8000_0000,
+            0xfa05_0004,
+        ];
+        let mut processor = Processor::new();
+
+        for range in ranges {
+            for address in range {
+                let _ = processor.read8(address);
+                let _ = processor.read16(address);
+                let _ = processor.read32(address);
+                for value in values {
+                    let _ = processor.write8(address, value as u8);
+                    let _ = processor.write16(address, value as u16);
+                    let _ = processor.write32(address, value);
+                }
+            }
+        }
+    }
+
+    // An access that starts in a memory and runs past its end is a precise bus error, and not a
+    // memory protection fault: PRECISERR, with BFAR holding the address.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_access_straddling_the_end_of_ram_is_a_precise_bus_fault() {
+        use crate::core::instruction::instruction_size;
+        use crate::core::register::{BaseReg, Reg};
+        use crate::decoder::decode_32;
+        use crate::executor::Executor;
+
+        let mut processor = Processor::new();
+        processor.set_msp(0x2000_0200);
+        processor.write32(0xE000_ED24, 1 << 17).unwrap(); // BUSFAULTENA
+        processor.set_r(Reg::R0, 0x2001_fffe);
+        processor.set_pc(0x100);
+
+        // ldr.w r1, [r0]: the word is half in RAM
+        let instruction = decode_32(0xf8d0_1000);
+        assert_eq!(
+            processor.read32(0x2001_fffe),
+            Err(Fault::Preciserr),
+            "bus level"
+        );
+        processor.execute(&instruction, instruction_size(&instruction));
+
+        assert_eq!(processor.cfsr & (1 << 9), 1 << 9, "PRECISERR");
+        assert_eq!(processor.cfsr & (1 << 15), 1 << 15, "BFARVALID");
+        assert_eq!(processor.cfsr & (1 << 1), 0, "no DACCVIOL");
+        assert_eq!(processor.bfar, 0x2001_fffe);
+    }
+
+    // Every kind of data access latches the address of a precise bus fault, and not only the
+    // single loads and stores: the multiple loads and stores, the FP ones and the table branches.
+    #[test]
+    #[cfg(not(feature = "armv6m"))]
+    fn test_every_data_access_latches_bfar_on_a_precise_bus_fault() {
+        use crate::core::instruction::instruction_size;
+        use crate::core::register::{BaseReg, Reg};
+        use crate::decoder::decode_32;
+        use crate::executor::Executor;
+
+        for (name, opcode) in [
+            ("ldm.w", 0xe890_0006_u32), // ldm.w r0, {r1, r2}
+            ("stm.w", 0xe880_0006),     // stm.w r0, {r1, r2}
+            ("ldrd", 0xe9d0_1200),      // ldrd r1, r2, [r0]
+            ("strd", 0xe9c0_1200),      // strd r1, r2, [r0]
+            #[cfg(feature = "has-fp")]
+            ("vldr d", 0xed90_0b00), // vldr d0, [r0]
+            #[cfg(feature = "has-fp")]
+            ("vstr d", 0xed80_0b00), // vstr d0, [r0]
+            #[cfg(feature = "has-fp")]
+            ("vldmia d", 0xec90_0b04), // vldmia r0, {d0, d1}
+            #[cfg(feature = "has-fp")]
+            ("vstmia s", 0xec80_0a02), // vstmia r0, {s0, s1}
+        ] {
+            let mut processor = Processor::new();
+            processor.set_msp(0x2000_0200);
+            #[cfg(feature = "has-fp")]
+            {
+                processor.cpacr = 0x00f0_0000;
+            }
+            processor.write32(0xE000_ED24, 1 << 17).unwrap(); // BUSFAULTENA
+            processor.set_r(Reg::R0, 0x2001_fffe);
+            processor.set_pc(0x100);
+
+            let instruction = decode_32(opcode);
+            processor.execute(&instruction, instruction_size(&instruction));
+
+            assert_eq!(processor.cfsr & (1 << 9), 1 << 9, "{name}: PRECISERR");
+            assert_eq!(processor.cfsr & (1 << 15), 1 << 15, "{name}: BFARVALID");
+            assert_eq!(processor.bfar, 0x2001_fffe, "{name}");
+        }
+
+        // tbh [r0, r1, lsl #1]: the table halfword runs past the end
+        let mut processor = Processor::new();
+        processor.set_msp(0x2000_0200);
+        processor.write32(0xE000_ED24, 1 << 17).unwrap();
+        processor.set_r(Reg::R0, 0x2001_ffff);
+        processor.set_r(Reg::R1, 0);
+        processor.set_pc(0x100);
+        let instruction = decode_32(0xe8d0_f011);
+        processor.execute(&instruction, instruction_size(&instruction));
+        assert_eq!(processor.cfsr & (1 << 15), 1 << 15, "tbh: BFARVALID");
+        assert_eq!(processor.bfar, 0x2001_ffff);
     }
 }

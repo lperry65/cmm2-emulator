@@ -1274,3 +1274,49 @@ fn test_decode_tst_reg_w() {
         }
     );
 }
+
+#[test]
+fn test_decode_adr_w_both_forms() {
+    // adr.w r1, #8 (T3, add) and adr.w r1, #-8 (T2, subtract: the offset is kept negated)
+    assert_eq!(
+        decode_32(0xf20f_0108),
+        Instruction::ADR {
+            params: RegImmParams {
+                r: Reg::R1,
+                imm32: 8
+            },
+            thumb32: true
+        }
+    );
+    assert_eq!(
+        decode_32(0xf2af_0108),
+        Instruction::ADR {
+            params: RegImmParams {
+                r: Reg::R1,
+                imm32: 8_u32.wrapping_neg()
+            },
+            thumb32: true
+        }
+    );
+    // the 12-bit offset: adr.w r1, #2748 and #-2748
+    assert_eq!(
+        decode_32(0xf60f_21bc),
+        Instruction::ADR {
+            params: RegImmParams {
+                r: Reg::R1,
+                imm32: 2748
+            },
+            thumb32: true
+        }
+    );
+    assert_eq!(
+        decode_32(0xf6af_21bc),
+        Instruction::ADR {
+            params: RegImmParams {
+                r: Reg::R1,
+                imm32: 2748_u32.wrapping_neg()
+            },
+            thumb32: true
+        }
+    );
+}

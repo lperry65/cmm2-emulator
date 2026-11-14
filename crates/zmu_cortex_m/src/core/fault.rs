@@ -134,6 +134,20 @@ pub struct FaultTrapMode {
 pub struct FaultStatusContext {
     /// Faulting access address when the architecture defines it as valid.
     pub fault_address: Option<u32>,
+    /// For an exception return that was refused: what the UsageFault entry stacks and is given.
+    pub refused_return: Option<RefusedReturn>,
+}
+
+#[derive(PartialEq, Eq, Debug, Copy, Clone)]
+/// What a refused exception return hands to the exception entry that follows it, so that no state
+/// is left behind if there is no entry (a lockup) or a reset comes first.
+pub struct RefusedReturn {
+    /// The LR the new frame stacks: the one that was popped, or the current one if nothing was.
+    pub frame_lr: u32,
+    /// The LR the handler is given: 0xF0000000 with the refused EXC_RETURN.
+    pub handler_lr: u32,
+    /// The xPSR the new frame stacks, when a frame was popped: the popped one as it is.
+    pub frame_xpsr: Option<u32>,
 }
 
 impl FaultStatusContext {
@@ -141,6 +155,7 @@ impl FaultStatusContext {
     pub const fn with_fault_address(fault_address: u32) -> Self {
         Self {
             fault_address: Some(fault_address),
+            refused_return: None,
         }
     }
 }

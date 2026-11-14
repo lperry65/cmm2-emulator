@@ -13,6 +13,9 @@ pub fn decode_PLD_imm_t1(opcode: u32) -> Instruction {
 
 #[allow(non_snake_case)]
 pub fn decode_PLD_imm_t2(opcode: u32) -> Instruction {
+    if opcode.get_bits(16..20) == 0b1111 {
+        return decode_PLD_lit_t1(opcode);
+    }
     Instruction::PLD_imm {
         rn: opcode.get_bits(16..20).into(),
         imm32: opcode.get_bits(0..8),
@@ -22,6 +25,10 @@ pub fn decode_PLD_imm_t2(opcode: u32) -> Instruction {
 
 #[allow(non_snake_case)]
 pub fn decode_PLD_reg_t1(opcode: u32) -> Instruction {
+    // Rn = PC is the literal form, whatever else is in the opcode
+    if opcode.get_bits(16..20) == 0b1111 {
+        return decode_PLD_lit_t1(opcode);
+    }
     Instruction::PLD_reg {
         rm: opcode.get_bits(0..4).into(),
         rn: opcode.get_bits(16..20).into(),

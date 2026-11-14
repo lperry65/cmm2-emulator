@@ -49,6 +49,7 @@ use crate::core::register::{Apsr, BaseReg, Control, PSR, Reg};
 use crate::memory::flash::FlashMemory;
 use crate::memory::map::MemoryMapConfig;
 use crate::memory::ram::RAM;
+use crate::peripheral::nvic::INTERRUPT_COUNT;
 use crate::semihosting::SemihostingCommand;
 use crate::semihosting::SemihostingResponse;
 
@@ -315,7 +316,7 @@ fn make_default_exception_priorities() -> HashMap<usize, ExceptionState> {
         ExceptionState::new(Exception::SysTick, 0),
     );
 
-    for irqn in 0..240 {
+    for irqn in 0..INTERRUPT_COUNT {
         let irq = Exception::Interrupt { n: irqn };
         priorities.insert(irq.into(), ExceptionState::new(irq, 0));
     }

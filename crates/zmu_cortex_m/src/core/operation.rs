@@ -132,18 +132,19 @@ pub fn condition_test(condition: Condition, psr: &PSR) -> bool {
 /// output: (shitft type, immedate to use)
 ///
 pub fn decode_imm_shift(typebits: u8, imm5: u8) -> (SRType, u8) {
-    match typebits.get_bits(0..3) {
+    // The type is a 2-bit field, so 0b11 is what is left after the other three. It used to take
+    // three bits and panic on the fourth value onwards, which no decoder passes.
+    match typebits.get_bits(0..2) {
         0b00 => (SRType::LSL, imm5),
         0b01 => (SRType::LSR, if imm5 == 0 { 32 } else { imm5 }),
         0b10 => (SRType::ASR, if imm5 == 0 { 32 } else { imm5 }),
-        0b11 => {
+        _ => {
             if imm5 == 0 {
                 (SRType::RRX, 1)
             } else {
                 (SRType::ROR, imm5)
             }
         }
-        _ => todo!("invalid typebits"),
     }
 }
 
@@ -285,8 +286,8 @@ pub fn thumb_expand_imm_c(params: &[u8], lengths: &[u8], carry_in: bool) -> (u32
             0b00 => low_word,
             0b01 => (low_word << 16) + low_word,
             0b10 => (low_word << 24) + (low_word << 8),
-            0b11 => (low_word << 24) + (low_word << 16) + (low_word << 8) + low_word,
-            _ => unreachable!(),
+            // the two bits have no other value than 0b11 left
+            _ => (low_word << 24) + (low_word << 16) + (low_word << 8) + low_word,
         };
 
         (imm32, carry_in)
@@ -525,5 +526,18 @@ mod tests {
     fn test_decode_imm_shift_rrx_alias() {
         assert_eq!(decode_imm_shift(0b11, 0), (SRType::RRX, 1));
         assert_eq!(decode_imm_shift(0b11, 5), (SRType::ROR, 5));
+    }
+
+    // No decoder passes more than two bits of type, but every value must still be defined.
+    #[test]
+    fn test_decode_imm_shift_takes_the_two_type_bits_only() {
+        for typebits in 0..=u8::MAX {
+            for imm5 in [0, 1, 31] {
+                assert_eq!(
+                    decode_imm_shift(typebits, imm5),
+                    decode_imm_shift(typebits & 0b11, imm5)
+                );
+            }
+        }
     }
 }

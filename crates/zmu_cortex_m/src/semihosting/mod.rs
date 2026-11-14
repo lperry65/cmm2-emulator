@@ -249,65 +249,76 @@ const SYS_ERRNO: u32 = 0x13;
 const SYS_EXIT: u32 = 0x18;
 const SYS_EXIT_EXTENDED: u32 = 0x20;
 
+/// The most bytes of a file name or a write that I read from the guest for one call. The guest
+/// picks the length, and a 4 GiB one would hold the host up and fill its memory, so more than this
+/// is refused like an operation I do not serve (r0 is -1).
+const MAX_BLOCK: u32 = 1 << 20;
+
 ///
-/// Decode semihosting command based on register values
+/// Decode semihosting command based on register values.
+///
+/// `Ok(None)` means the guest asked for an operation I do not implement, or gave a
+/// file name that is not UTF-8. The semihosting spec has no error for an unknown
+/// operation, so the caller answers -1 in r0, the same as a failed open.
 ///
 pub fn decode_semihostcmd(
     r0: u32,
     r1: u32,
     processor: &mut Processor,
-) -> Result<SemihostingCommand, Fault> {
+) -> Result<Option<SemihostingCommand>, Fault> {
+    // The guest picks every address here, so they wrap like the bus addresses do.
+    let word = |index: u32| r1.wrapping_add(4 * index);
     let result = match r0 {
         SYS_OPEN => {
-            let argument_block = r1;
-
-            let mut string_ptr = processor.read32(argument_block)?;
-            let mode = processor.read32(argument_block + 4)?;
-            let mut filename_len = processor.read32(argument_block + 8)?;
+            let mut string_ptr = processor.read32(word(0))?;
+            let mode = processor.read32(word(1))?;
+            let mut filename_len = processor.read32(word(2))?;
             let mut string_bytes: Vec<u8> = Vec::new();
 
+            if filename_len > MAX_BLOCK {
+                return Ok(None);
+            }
             while filename_len > 0 {
                 string_bytes.push(processor.read8(string_ptr)?);
-                string_ptr += 1;
+                string_ptr = string_ptr.wrapping_add(1);
                 filename_len -= 1;
             }
 
-            SemihostingCommand::SysOpen {
-                name: String::from_utf8(string_bytes).unwrap(),
-                mode,
-            }
+            let Ok(name) = String::from_utf8(string_bytes) else {
+                return Ok(None);
+            };
+            SemihostingCommand::SysOpen { name, mode }
         }
         SYS_CLOSE => {
-            let params_ptr = r1;
-            let handle = processor.read32(params_ptr)?;
+            let handle = processor.read32(word(0))?;
             SemihostingCommand::SysClose { handle }
         }
         SYS_WRITEC => {
-            let params_ptr = r1;
-            let ch = processor.read8(params_ptr)?;
+            let ch = processor.read8(r1)?;
             SemihostingCommand::SysWriteC { data: ch }
         }
         SYS_WRITE => {
-            let params_ptr = r1;
-            let handle = processor.read32(params_ptr)?;
-            let mut memoryptr = processor.read32(params_ptr + 4)?;
-            let mut len = processor.read32(params_ptr + 8)?;
+            let handle = processor.read32(word(0))?;
+            let mut memoryptr = processor.read32(word(1))?;
+            let mut len = processor.read32(word(2))?;
 
+            if len > MAX_BLOCK {
+                return Ok(None);
+            }
             let mut data: Vec<u8> = Vec::new();
 
             // :tt console output
             while len > 0 {
                 data.push(processor.read8(memoryptr)?);
-                memoryptr += 1;
+                memoryptr = memoryptr.wrapping_add(1);
                 len -= 1;
             }
             SemihostingCommand::SysWrite { handle, data }
         }
         SYS_READ => {
-            let params_ptr = r1;
-            let handle = processor.read32(params_ptr)?;
-            let memoryptr = processor.read32(params_ptr + 4)?;
-            let len = processor.read32(params_ptr + 8)?;
+            let handle = processor.read32(word(0))?;
+            let memoryptr = processor.read32(word(1))?;
+            let len = processor.read32(word(2))?;
 
             SemihostingCommand::SysRead {
                 handle,
@@ -316,45 +327,38 @@ pub fn decode_semihostcmd(
             }
         }
         SYS_FLEN => {
-            let params_ptr = r1;
-            let handle = processor.read32(params_ptr)?;
+            let handle = processor.read32(word(0))?;
 
             SemihostingCommand::SysFlen { handle }
         }
         SYS_ISTTY => {
-            let params_ptr = r1;
-            let handle = processor.read32(params_ptr)?;
+            let handle = processor.read32(word(0))?;
 
             SemihostingCommand::SysIstty { handle }
         }
         SYS_SEEK => {
-            let params_ptr = r1;
-            let handle = processor.read32(params_ptr)?;
-            let position = processor.read32(params_ptr + 4)?;
+            let handle = processor.read32(word(0))?;
+            let position = processor.read32(word(1))?;
 
             SemihostingCommand::SysSeek { handle, position }
         }
         SYS_CLOCK => SemihostingCommand::SysClock,
         SYS_ERRNO => SemihostingCommand::SysErrno,
         SYS_EXIT_EXTENDED => {
-            let params_ptr = r1;
-
             // see: https://github.com/ARM-software/abi-aa/blob/main/semihosting/semihosting.rst#sys-exit-extended-0x20
 
             // read field 1 and field 2
-            let reason = SysExceptionReason::from_u32(processor.read32(params_ptr)?);
-            let subcode = processor.read32(params_ptr + 4)?;
+            let reason = SysExceptionReason::from_u32(processor.read32(word(0))?);
+            let subcode = processor.read32(word(1))?;
 
             SemihostingCommand::SysExitExtended { reason, subcode }
         }
         SYS_EXIT => SemihostingCommand::SysException {
             reason: SysExceptionReason::from_u32(r1),
         },
-        _ => {
-            todo!("unknown semihosting command {}", r0);
-        }
+        _ => return Ok(None),
     };
-    Ok(result)
+    Ok(Some(result))
 }
 
 #[allow(unused)]
@@ -408,7 +412,7 @@ pub fn semihost_return(processor: &mut Processor, response: &SemihostingResponse
                 let mut addr = *memoryptr;
                 for x in data {
                     processor.write8(addr, *x);
-                    addr += 1;
+                    addr = addr.wrapping_add(1);
                 }
                 processor.set_r(Reg::R0, *diff);
             }
@@ -421,5 +425,123 @@ pub fn semihost_return(processor: &mut Processor, response: &SemihostingResponse
         SemihostingResponse::SysErrno { result } => {
             processor.set_r(Reg::R0, result);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::instruction::Instruction;
+    use crate::executor::Executor;
+
+    const ERROR: u32 = u32::MAX;
+    const BKPT: Instruction = Instruction::BKPT { imm32: 0xab };
+
+    #[test]
+    fn unknown_operation_returns_minus_one_to_the_guest() {
+        let mut core = Processor::new();
+        core.semihost(Some(Box::new(|_| panic!("callback must not run"))));
+        core.set_r(Reg::R0, 0x55);
+        core.set_r(Reg::R1, 0x2000_0000);
+
+        core.execute(&BKPT, 2);
+
+        assert_eq!(core.get_r(Reg::R0), ERROR);
+        assert_eq!(core.get_pc(), 2);
+    }
+
+    #[test]
+    fn unknown_operation_does_not_reach_the_host_callback() {
+        let mut core = Processor::new();
+        core.semihost(Some(Box::new(|_| panic!("callback must not run"))));
+        core.set_r(Reg::R0, 0x55);
+
+        core.execute(&BKPT, 2);
+    }
+
+    #[test]
+    fn open_with_a_name_that_is_not_utf8_returns_minus_one() {
+        let mut core = Processor::new();
+        core.semihost(Some(Box::new(|_| panic!("callback must not run"))));
+        core.write8(0x2000_0100, 0xff).unwrap();
+        core.write32(0x2000_0000, 0x2000_0100).unwrap();
+        core.write32(0x2000_0004, 0).unwrap();
+        core.write32(0x2000_0008, 1).unwrap();
+        core.set_r(Reg::R0, SYS_OPEN);
+        core.set_r(Reg::R1, 0x2000_0000);
+
+        core.execute(&BKPT, 2);
+
+        assert_eq!(core.get_r(Reg::R0), ERROR);
+    }
+
+    #[test]
+    fn read_response_at_the_top_of_memory_does_not_overflow_the_address() {
+        let mut core = Processor::new();
+
+        semihost_return(
+            &mut core,
+            &SemihostingResponse::SysRead {
+                result: Ok((0xffff_ffff, vec![1, 2], 0)),
+            },
+        );
+
+        assert_eq!(core.get_r(Reg::R0), 0);
+    }
+
+    #[test]
+    fn a_call_without_a_handler_does_not_read_the_guests_arguments() {
+        let mut core = Processor::new();
+        core.set_msp(0x2000_0200);
+        // SYS_WRITE with an argument block that would fault, and a length of 4 GiB
+        core.set_r(Reg::R0, SYS_WRITE);
+        core.set_r(Reg::R1, 0xffff_fff0);
+
+        core.execute(&BKPT, 2);
+
+        // the BKPT is a debug event with nothing to take it: HardFault, and the arguments are not read
+        assert_eq!(core.get_r(Reg::R0), SYS_WRITE);
+        assert_eq!(core.dfsr & 2, 2);
+        assert_eq!(core.cfsr, 0);
+    }
+
+    #[test]
+    fn a_huge_write_or_file_name_is_refused_before_it_is_read() {
+        for operation in [SYS_WRITE, SYS_OPEN] {
+            let mut core = Processor::new();
+            core.semihost(Some(Box::new(|_| panic!("callback must not run"))));
+            core.write32(0x2000_0000, 1).unwrap(); // handle, or the name pointer
+            core.write32(0x2000_0004, 0x2000_0100).unwrap();
+            core.write32(0x2000_0008, 0xffff_ffff).unwrap();
+            core.set_r(Reg::R0, operation);
+            core.set_r(Reg::R1, 0x2000_0000);
+
+            core.execute(&BKPT, 2);
+
+            assert_eq!(core.get_r(Reg::R0), ERROR, "{operation:#x}");
+        }
+    }
+
+    #[test]
+    fn a_write_up_to_the_limit_is_read_and_passed_on() {
+        let seen = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen_in_handler = seen.clone();
+        let mut core = Processor::new();
+        core.semihost(Some(Box::new(move |command| {
+            if let SemihostingCommand::SysWrite { data, .. } = command {
+                seen_in_handler.set(data.len());
+            }
+            SemihostingResponse::SysWrite { result: Ok(0) }
+        })));
+        core.write32(0x2000_0000, 1).unwrap();
+        core.write32(0x2000_0004, 0x2000_0100).unwrap();
+        core.write32(0x2000_0008, 100).unwrap();
+        core.set_r(Reg::R0, SYS_WRITE);
+        core.set_r(Reg::R1, 0x2000_0000);
+
+        core.execute(&BKPT, 2);
+
+        assert_eq!(seen.get(), 100);
+        assert_eq!(core.get_r(Reg::R0), 0);
     }
 }

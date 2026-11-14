@@ -44,7 +44,9 @@ impl MemoryMapConfig {
 impl MapMemory for MemoryMapConfig {
     fn map_address(&self, address: u32) -> u32 {
         if self.contains(address) {
-            address - self.source_start + self.target_start
+            address
+                .wrapping_sub(self.source_start)
+                .wrapping_add(self.target_start)
         } else {
             address
         }

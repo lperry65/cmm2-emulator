@@ -63,8 +63,10 @@ impl Real {
         }
     }
 
-    // Exact for operands of up to 64 significant bits, which is every float and integer the FPU
-    // takes.
+    // Exact while the product fits the 128-bit `sig`, which holds for operands of up to 64 bits
+    // each. What the FPU multiplies is at most 53 bits by 53 bits (two double significands), so
+    // a product has at most 106 bits, and `add` relies on that: it needs the top bit at or
+    // below SUM_TOP.
     pub(crate) fn mul(self, other: Real) -> Real {
         Real {
             sign: self.sign != other.sign,
@@ -84,6 +86,8 @@ impl Real {
         }
         let align = |value: Real| {
             let shift = SUM_TOP as i32 - top_bit(value.sig);
+            // A wider addend would have to shift right, which drops bits that matter.
+            debug_assert!(shift >= 0, "an addend of more than {} bits", SUM_TOP + 1);
             Real {
                 sig: value.sig << shift,
                 exp: value.exp - shift,
@@ -334,6 +338,26 @@ mod tests {
         // The big term keeps its sign when it is the one that is subtracted from.
         assert!(!sum.sign && !difference.sign);
         assert!(real(true, 1, 0).add(real(false, 1, -1000)).sign);
+    }
+
+    // The widest product the FPU forms, two 53-bit significands, is a valid addend.
+    #[test]
+    fn a_product_of_two_double_significands_can_be_added() {
+        let wide = real(false, (1 << 53) - 1, 0).mul(real(false, (1 << 53) - 1, 0));
+        assert!(top_bit(wide.sig) <= SUM_TOP as i32);
+        let sum = wide.add(real(true, 1, 0));
+        assert_eq!(
+            sum.sig >> (SUM_TOP as i32 - top_bit(wide.sig)),
+            wide.sig - 1
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "an addend of more than 125 bits")]
+    fn an_addend_wider_than_the_sum_allows_is_refused() {
+        // 2^126 has 127 bits, which a product of two 64-bit operands can reach.
+        let _ = real(false, 1 << 126, 0).add(real(false, 1, 0));
     }
 
     #[test]

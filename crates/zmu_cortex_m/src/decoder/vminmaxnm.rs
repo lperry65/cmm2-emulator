@@ -1,4 +1,4 @@
-use super::vfma::decode_three_reg;
+use super::vfp_operands::decode_three_reg;
 use crate::core::bits::Bits;
 use crate::core::instruction::{Instruction, VMinMaxNumParamsf32, VMinMaxNumParamsf64};
 

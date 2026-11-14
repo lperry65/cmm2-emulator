@@ -120,7 +120,7 @@ impl FloatOps for u64 {
 pub trait FloatingPointChecks {
     fn check_vfp_enabled(&mut self) -> Result<(), Fault>;
     fn execute_fp_check(&mut self) -> Result<(), Fault>;
-    fn fp_process_exception(&mut self, exc: FPExc, fpscr_val: u32);
+    fn fp_process_exception(&mut self, exc: FPExc);
 }
 
 impl Processor {
@@ -343,7 +343,7 @@ impl FloatingPointHiddenOperations for Processor {
         let mut result = op;
         if type1 == FPType::SNaN {
             result = T::set_bit(result, topfrac, true);
-            self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
+            self.fp_process_exception(FPExc::InvalidOp);
         }
         if fpscr_val.get_dn() {
             result = T::fp_default_nan();
@@ -417,7 +417,7 @@ impl FloatingPointHiddenOperations for Processor {
             (fptype, false)
         } else if exp == 0 && frac != 0 && fpscr_val.get_fz() {
             // A subnormal input is flushed to zero.
-            self.fp_process_exception(FPExc::InputDenorm, fpscr_val);
+            self.fp_process_exception(FPExc::InputDenorm);
             (FPType::Zero, false)
         } else if bits.get_bits(0..T::n() - 1) == 0 {
             (FPType::Zero, false)
@@ -440,13 +440,13 @@ impl FloatingPointHiddenOperations for Processor {
             fpscr_val.get_fz(),
         );
         if packed.underflow {
-            self.fp_process_exception(FPExc::Underflow, fpscr_val);
+            self.fp_process_exception(FPExc::Underflow);
         }
         if packed.overflow {
-            self.fp_process_exception(FPExc::Overflow, fpscr_val);
+            self.fp_process_exception(FPExc::Overflow);
         }
         if packed.inexact {
-            self.fp_process_exception(FPExc::Inexact, fpscr_val);
+            self.fp_process_exception(FPExc::Inexact);
         }
         packed.bits
     }
@@ -476,7 +476,7 @@ impl FloatingPointHiddenOperations for Processor {
         let zero2 = type2 == FPType::Zero;
 
         if inf1 && inf2 && sign1 != sign2 {
-            self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
+            self.fp_process_exception(FPExc::InvalidOp);
             T::fp_default_nan()
         } else if (inf1 && !sign1) || (inf2 && !sign2) {
             T::fp_infinity(false)
@@ -542,7 +542,7 @@ impl FloatingPointPublicOperations for Processor {
 
         if typea == FPType::QNaN && ((inf1 && zero2) || (zero1 && inf2)) {
             result = T::fp_default_nan();
-            self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
+            self.fp_process_exception(FPExc::InvalidOp);
             return result;
         }
 
@@ -558,7 +558,7 @@ impl FloatingPointPublicOperations for Processor {
         let zerop = zero1 || zero2;
 
         if (inf1 && zero2) || (zero1 && inf2) || (infa && infp && signa != signp) {
-            self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
+            self.fp_process_exception(FPExc::InvalidOp);
             T::fp_default_nan()
         } else if (infa && !signa) || (infp && !signp) {
             T::fp_infinity(false)
@@ -600,7 +600,7 @@ impl FloatingPointPublicOperations for Processor {
         let sign = sign1 != sign2;
 
         if (inf1 && zero2) || (zero1 && inf2) {
-            self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
+            self.fp_process_exception(FPExc::InvalidOp);
             T::fp_default_nan()
         } else if inf1 || inf2 {
             T::fp_infinity(sign)
@@ -633,14 +633,14 @@ impl FloatingPointPublicOperations for Processor {
         let sign = sign1 != sign2;
 
         if (zero1 && zero2) || (inf1 && inf2) {
-            self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
+            self.fp_process_exception(FPExc::InvalidOp);
             T::fp_default_nan()
         } else if inf1 {
             T::fp_infinity(sign)
         } else if inf2 {
             T::fp_zero(sign)
         } else if zero2 {
-            self.fp_process_exception(FPExc::DivideByZero, fpscr_val);
+            self.fp_process_exception(FPExc::DivideByZero);
             T::fp_infinity(sign)
         } else if zero1 {
             T::fp_zero(sign)
@@ -668,7 +668,7 @@ impl FloatingPointPublicOperations for Processor {
         {
             let result = (false, false, true, true);
             if type1 == FPType::SNaN || type2 == FPType::SNaN || quiet_nan_exc {
-                self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
+                self.fp_process_exception(FPExc::InvalidOp);
             }
             result
         } else {
@@ -693,7 +693,7 @@ impl FloatingPointPublicOperations for Processor {
             FPType::SNaN | FPType::QNaN => self.fp_process_nan::<T>(fptype, op, fpscr_val),
             FPType::Infinity => {
                 if sign {
-                    self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
+                    self.fp_process_exception(FPExc::InvalidOp);
                     T::fp_default_nan()
                 } else {
                     T::fp_infinity(false)
@@ -702,7 +702,7 @@ impl FloatingPointPublicOperations for Processor {
             FPType::Zero => T::fp_zero(sign),
             FPType::Nonzero => {
                 if sign {
-                    self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
+                    self.fp_process_exception(FPExc::InvalidOp);
                     return T::fp_default_nan();
                 }
 
@@ -744,7 +744,7 @@ impl FloatingPointPublicOperations for Processor {
         }
 
         if exact {
-            self.fp_process_exception(FPExc::Inexact, fpscr_val);
+            self.fp_process_exception(FPExc::Inexact);
         }
 
         // Rounding a value that has a fraction gives a whole number that fits the format, or
@@ -881,7 +881,7 @@ impl FloatingPointPublicOperations for Processor {
 
         let rounded = match type_t {
             FPType::SNaN | FPType::QNaN => {
-                self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
+                self.fp_process_exception(FPExc::InvalidOp);
                 Rounded {
                     magnitude: 0,
                     inexact: false,
@@ -905,9 +905,9 @@ impl FloatingPointPublicOperations for Processor {
         let (result, overflow) = satq(if sign { -magnitude } else { magnitude }, size, unsigned);
 
         if overflow {
-            self.fp_process_exception(FPExc::InvalidOp, fpscr_val);
+            self.fp_process_exception(FPExc::InvalidOp);
         } else if rounded.inexact {
-            self.fp_process_exception(FPExc::Inexact, fpscr_val);
+            self.fp_process_exception(FPExc::Inexact);
         }
 
         result
@@ -940,8 +940,8 @@ impl FloatingPointChecks for Processor {
                 self.cfsr.set_bit(19, true);
                 Err(Fault::Nocp)
             }
-            0b11 => Ok(()), // full access
-            _ => unreachable!(),
+            // 0b11, the last value of the two bit field: full access
+            _ => Ok(()),
         }
     }
     fn execute_fp_check(&mut self) -> Result<(), Fault> {
@@ -964,21 +964,17 @@ impl FloatingPointChecks for Processor {
         Ok(())
     }
 
-    fn fp_process_exception(&mut self, exc: FPExc, fpscr_val: u32) {
-        let (enable, cumul) = match exc {
-            FPExc::InvalidOp => (8, 0),
-            FPExc::DivideByZero => (9, 1),
-            FPExc::Overflow => (10, 2),
-            FPExc::Underflow => (11, 3),
-            FPExc::Inexact => (12, 4),
-            FPExc::InputDenorm => (15, 7),
+    fn fp_process_exception(&mut self, exc: FPExc) {
+        // The trap enables are reserved on this core, so the cumulative flag is all there is.
+        let cumul = match exc {
+            FPExc::InvalidOp => 0,
+            FPExc::DivideByZero => 1,
+            FPExc::Overflow => 2,
+            FPExc::Underflow => 3,
+            FPExc::Inexact => 4,
+            FPExc::InputDenorm => 7,
         };
-        if fpscr_val.get_bit(enable) {
-            // implementation defined trap handling
-            todo!()
-        } else {
-            self.fpscr.set_bit(cumul, true);
-        }
+        self.fpscr.set_bit(cumul, true);
     }
 }
 

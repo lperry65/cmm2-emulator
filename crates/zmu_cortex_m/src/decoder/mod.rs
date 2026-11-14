@@ -21,6 +21,7 @@ mod dbg;
 mod sbfx;
 mod ssat;
 mod ubfx;
+mod unpredictable;
 mod usat;
 mod wfe;
 mod wfi;
@@ -76,6 +77,7 @@ mod nop;
 mod orn;
 mod orr;
 
+#[cfg(feature = "has-dsp-ext")]
 mod pkh;
 mod pld;
 mod pli;
@@ -118,6 +120,7 @@ mod udiv;
 mod umlal;
 mod umull;
 mod uxt;
+#[cfg(feature = "has-dsp-ext")]
 mod uxtab;
 
 #[cfg(feature = "has-fp")]
@@ -131,6 +134,8 @@ mod vcvt;
 #[cfg(feature = "has-fp")]
 mod vfma;
 #[cfg(feature = "has-fp")]
+mod vfp_operands;
+#[cfg(feature = "has-fp")]
 mod vldm;
 #[cfg(feature = "has-fp")]
 mod vldr;
@@ -140,6 +145,8 @@ mod vminmaxnm;
 mod vmov;
 #[cfg(feature = "has-fp")]
 mod vmrs;
+#[cfg(feature = "has-fp")]
+mod vmsr;
 #[cfg(feature = "has-fp")]
 mod vmul_vdiv;
 #[cfg(feature = "has-fp")]
@@ -244,7 +251,6 @@ use {
     nop::{decode_NOP_t1, decode_NOP_t2},
     orn::{decode_ORN_imm_t1, decode_ORN_reg_t1},
     orr::{decode_ORR_imm_t1, decode_ORR_reg_t1, decode_ORR_reg_t2},
-    pkh::decode_PKH_t1,
     pld::{decode_PLD_imm_t1, decode_PLD_imm_t2, decode_PLD_lit_t1, decode_PLD_reg_t1},
     pli::{decode_PLI_lit_imm_t1, decode_PLI_lit_imm_t2, decode_PLI_lit_imm_t3, decode_PLI_reg_t1},
     pop::{decode_POP_reg_t1, decode_POP_t2, decode_POP_t3},
@@ -283,7 +289,6 @@ use {
     umull::decode_UMULL_t1,
     usat::decode_USAT_t1,
     uxt::{decode_UXTB_t1, decode_UXTB_t2, decode_UXTH_t1, decode_UXTH_t2},
-    uxtab::{decode_SXTAB_t1, decode_SXTAH_t1, decode_UXTAB_t1, decode_UXTAH_t1},
     wfe::{decode_WFE_t1, decode_WFE_t2},
     wfi::{decode_WFI_t1, decode_WFI_t2},
     yield_::{decode_YIELD_t1, decode_YIELD_t2},
@@ -291,7 +296,12 @@ use {
 
 #[cfg(feature = "has-dsp-ext")]
 use self::{
-    sel::decode_SEL_t1, smla::decode_SMLA_t1, smul::decode_SMUL_t1, uadd8::decode_UADD8_t1,
+    pkh::decode_PKH_t1,
+    sel::decode_SEL_t1,
+    smla::decode_SMLA_t1,
+    smul::decode_SMUL_t1,
+    uadd8::decode_UADD8_t1,
+    uxtab::{decode_SXTAB_t1, decode_SXTAH_t1, decode_UXTAB_t1, decode_UXTAH_t1},
 };
 
 use crate::Processor;
@@ -315,6 +325,7 @@ use {
     vmov::decode_VMOV_reg,
     vmov::decode_VMOV_scalar_cr,
     vmrs::decode_VMRS,
+    vmsr::decode_VMSR,
     vmul_vdiv::{decode_VDIV_t1, decode_VMUL_t1, decode_VNMUL_t1},
     vneg::decode_VNEG_t1,
     vpop::decode_VPOP_t1,
@@ -378,6 +389,47 @@ fn decode_UDF_t2(opcode: u32) -> Instruction {
 include!(concat!(env!("OUT_DIR"), "/decode_16.rs"));
 
 include!(concat!(env!("OUT_DIR"), "/decode_32.rs"));
+
+// The operands of a byte or halfword literal load: PC is the base, U is bit 23 and the offset
+// the 12 bits below. The register and unprivileged encodings with Rn = PC are this too.
+fn literal_params(opcode: u32) -> crate::core::instruction::Reg2FullParams {
+    crate::core::instruction::Reg2FullParams {
+        rt: crate::core::register::Reg::from(opcode.get_bits(12..16) as u8),
+        rn: crate::core::register::Reg::PC,
+        imm32: opcode.get_bits(0..12),
+        index: true,
+        add: opcode.get_bit(23),
+        wback: false,
+    }
+}
+
+// A memory hint (PLI, and the unallocated ones of the halfword loads) does nothing.
+#[allow(non_snake_case)]
+fn decode_hint_t2(_opcode: u32) -> Instruction {
+    Instruction::NOP { thumb32: true }
+}
+
+/// Decode a 32-bit opcode. The table finds the instruction, then an encoding that would put PC
+/// in a plain destination register or write a base register back to PC becomes UDF.
+/// The 16-bit encodings have 3-bit destinations, or branch through PC, so they need no check.
+pub fn decode_32(opcode: u32) -> Instruction {
+    let instruction = decode_32_table(opcode);
+    if unpredictable::is_memory_hint(&instruction) {
+        decode_hint_t2(opcode)
+    } else if unpredictable::is_unallocated_addressing(&instruction)
+        || unpredictable::writes_pc_as_plain_register(&instruction)
+        || unpredictable::uses_a_register_the_manual_forbids(&instruction)
+    {
+        decode_UDF_t2(opcode)
+    } else {
+        instruction
+    }
+}
+
+/// Decode a 16-bit opcode.
+pub fn decode_16(opcode: u16) -> Instruction {
+    decode_16_table(opcode)
+}
 
 #[cfg(test)]
 mod decoder_tests;

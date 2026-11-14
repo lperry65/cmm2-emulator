@@ -8,6 +8,9 @@ use crate::core::exception::Exception;
 use crate::core::exception::ExceptionHandling;
 use Exception::Interrupt;
 
+/// How many interrupts the core has.
+pub(crate) const INTERRUPT_COUNT: usize = 240;
+
 ///
 /// Register API for NVIC
 ///
@@ -99,20 +102,21 @@ trait NVICHelper {
     fn nvic_clear_unpended_exceptions(&mut self, index: usize);
 }
 
-fn set_bits_array(array: &mut [u32; 16], index: usize, value: u32) {
-    if index == 15 {
-        array[index] |= value & 0xffff;
-    } else {
-        array[index] |= value;
+// The interrupt bits of word `index` of an NVIC register that the core has.
+fn implemented_bits(index: usize) -> u32 {
+    match INTERRUPT_COUNT.saturating_sub(index * 32) {
+        0 => 0,
+        count if count >= 32 => 0xffff_ffff,
+        count => (1 << count) - 1,
     }
 }
 
+fn set_bits_array(array: &mut [u32; 16], index: usize, value: u32) {
+    array[index] |= value & implemented_bits(index);
+}
+
 fn clear_bits_array(array: &mut [u32; 16], index: usize, value: u32) {
-    if index == 15 {
-        array[index] &= (value & 0xffff) ^ 0xFFFF_FFFF;
-    } else {
-        array[index] &= value ^ 0xFFFF_FFFF;
-    }
+    array[index] &= !(value & implemented_bits(index));
 }
 
 impl NVICHelper for Processor {
@@ -220,9 +224,8 @@ impl NVIC for Processor {
     }
 
     fn nvic_read_ipr_u8(&self, index: usize) -> u8 {
-        let priority = self.get_exception_priority(Interrupt { n: index });
-        assert!((0..256).contains(&priority));
-        priority as u8
+        // The priority of an interrupt is stored from a byte, and is 0 for one the core lacks.
+        self.get_exception_priority(Interrupt { n: index }) as u8
     }
 
     fn nvic_write_ipr_u8(&mut self, index: usize, value: u8) {
@@ -494,5 +497,70 @@ mod tests {
             let value = ((((n * 2) + 1) as u16) << 8) + ((n * 2) as u16);
             assert_eq!(processor.nvic_read_ipr_u16(n), value);
         }
+    }
+
+    // The NVIC registers have room for 512 interrupts and the core has 240 of them. The bits past
+    // the last are read as zero and writes to them are ignored.
+    #[test]
+    fn test_interrupt_registers_past_the_last_interrupt_are_zero_and_ignore_writes() {
+        let mut processor = Processor::new();
+
+        for index in 0..16 {
+            processor.nvic_write_iser(index, 0xffff_ffff);
+            processor.nvic_write_ispr(index, 0xffff_ffff);
+        }
+        // 240 interrupts are 7 words and 16 bits
+        assert_eq!(processor.nvic_read_iser(6), 0xffff_ffff);
+        assert_eq!(processor.nvic_read_iser(7), 0x0000_ffff);
+        assert_eq!(processor.nvic_read_ispr(7), 0x0000_ffff);
+        for index in 8..16 {
+            assert_eq!(processor.nvic_read_iser(index), 0);
+            assert_eq!(processor.nvic_read_ispr(index), 0);
+        }
+
+        for index in 0..16 {
+            processor.nvic_write_icer(index, 0xffff_ffff);
+            processor.nvic_write_icpr(index, 0xffff_ffff);
+            let _ = processor.nvic_read_iabr(index);
+        }
+        assert_eq!(processor.nvic_read_iabr(7), 0);
+
+        // priorities of the last interrupt, and of one that is not there
+        processor.nvic_write_ipr_u8(239, 0x80);
+        processor.nvic_write_ipr_u8(240, 0x80);
+        processor.nvic_write_ipr(123, 0xffff_ffff);
+        assert_eq!(processor.nvic_read_ipr_u8(239), 0x80);
+        assert_eq!(processor.nvic_read_ipr_u8(240), 0);
+        assert_eq!(processor.nvic_read_ipr_u16(247), 0);
+    }
+
+    // STIR (the software trigger) is there on ARMv7-M only
+    #[cfg(any(feature = "armv7m", feature = "armv7em"))]
+    #[test]
+    fn test_software_trigger_of_an_interrupt_the_core_does_not_have_pends_nothing() {
+        use crate::peripheral::scb::SystemControlBlock;
+
+        let mut processor = Processor::new();
+
+        processor.write_stir(300);
+        assert!(!processor.exception_pending(Exception::Interrupt { n: 300 }));
+        // and of one that is there does
+        processor.write_stir(5);
+        assert!(processor.exception_pending(Exception::Interrupt { n: 5 }));
+    }
+
+    #[test]
+    fn test_priority_byte_reads_use_the_byte_address() {
+        use crate::bus::Bus;
+
+        let mut processor = Processor::new();
+        processor.write8(0xE000_E407, 0x40).unwrap();
+        processor.write8(0xE000_E408, 0x50).unwrap();
+
+        assert_eq!(processor.read8(0xE000_E407), Ok(0x40));
+        assert_eq!(processor.read8(0xE000_E408), Ok(0x50));
+        assert_eq!(processor.read8(0xE000_E409), Ok(0));
+        assert_eq!(processor.read32(0xE000_E404), Ok(0x4000_0000));
+        assert_eq!(processor.read16(0xE000_E406), Ok(0x4000));
     }
 }

@@ -10,17 +10,21 @@ use crate::core::fetch::Fetch;
 use crate::core::instruction::{Imm32Carry, Instruction, SetFlags, instruction_size};
 
 use crate::core::operation::condition_test;
-use crate::core::register::{Apsr, BaseReg, Ipsr};
+use crate::core::register::{Apsr, BaseReg};
 use crate::decoder::Decoder;
 use crate::memory::map::MapMemory;
 use crate::peripheral::{dwt::Dwt, systick::SysTick};
 
 use crate::{CachedInstruction, Processor};
 
+#[cfg(test)]
+mod address_wrap_tests;
 mod branch;
 mod coproc;
 mod divide;
 mod exception;
+#[cfg(test)]
+mod guest_never_panics_tests;
 mod load_and_store;
 mod load_and_store_multiple;
 mod misc;
@@ -166,22 +170,18 @@ fn conditional_setflags(setflags: SetFlags, in_it_block: bool) -> bool {
 }
 
 impl Processor {
-    fn active_exception(&self) -> Option<Exception> {
-        let active_exception = self.psr.get_isr_number();
-        if active_exception == 0 {
-            None
-        } else {
-            Some(Exception::from(active_exception))
-        }
-    }
-
     #[cfg(not(feature = "armv6m"))]
     fn fault_delivery_exception(&mut self, fault: Fault) -> Exception {
         let mapped_exception = fault.exception();
 
+        // A fault is taken as itself when it is enabled and its priority is higher than the
+        // execution priority, so that it can preempt what runs (and what PRIMASK, BASEPRI and
+        // FAULTMASK mask). Otherwise it is escalated to HardFault.
         let enabled = self.configurable_fault_enabled(mapped_exception);
+        let preempts =
+            self.get_exception_priority(mapped_exception) < self.get_execution_priority();
 
-        if enabled {
+        if enabled && (preempts || mapped_exception == Exception::HardFault) {
             mapped_exception
         } else {
             self.set_hfsr_forced();
@@ -211,14 +211,6 @@ impl Processor {
         });
     }
 
-    fn is_lockup(exception: Exception, active_exception: Option<Exception>) -> bool {
-        exception == Exception::HardFault
-            && matches!(
-                active_exception,
-                Some(Exception::HardFault | Exception::NMI)
-            )
-    }
-
     fn handle_fault(&mut self, fault: Fault, fault_pc: u32) -> u32 {
         let status = self.take_pending_fault_status();
         self.handle_fault_with_status(fault, fault_pc, status)
@@ -235,7 +227,7 @@ impl Processor {
 
         self.record_fault_status(fault, status);
 
-        if Self::is_lockup(exception, active_exception) {
+        if self.is_lockup(exception) {
             self.queue_fault_trap(
                 fault,
                 exception,
@@ -248,7 +240,7 @@ impl Processor {
             return 12;
         }
 
-        match self.exception_entry(exception, fault_pc) {
+        match self.enter_exception(exception, fault_pc, status.refused_return) {
             Ok(()) => {
                 if self.get_fault_trap_mode().should_trap(exception) {
                     self.queue_fault_trap(
@@ -263,13 +255,12 @@ impl Processor {
             Err(entry_fault) => {
                 self.record_fault_status(entry_fault, FaultStatusContext::default());
                 self.set_hfsr_forced();
-                let trap_reason = if exception == Exception::HardFault
-                    || Self::is_lockup(Exception::HardFault, active_exception)
-                {
-                    FaultTrapReason::Lockup
-                } else {
-                    FaultTrapReason::Fault
-                };
+                let trap_reason =
+                    if exception == Exception::HardFault || self.is_lockup(Exception::HardFault) {
+                        FaultTrapReason::Lockup
+                    } else {
+                        FaultTrapReason::Fault
+                    };
                 self.queue_fault_trap(
                     entry_fault,
                     Exception::HardFault,
@@ -712,13 +703,13 @@ impl ExecutorHelper for Processor {
             #[cfg(feature = "has-fp")]
             Instruction::VMOV_reg_f64 { params } => self.exec_vmov_reg_f64(*params),
             #[cfg(feature = "has-fp")]
-            Instruction::VMOV_cr_scalar { .. } => unimplemented!(),
+            Instruction::VMOV_cr_scalar { params } => self.exec_vmov_cr_scalar(*params),
             #[cfg(feature = "has-fp")]
-            Instruction::VMOV_scalar_cr { .. } => unimplemented!(),
+            Instruction::VMOV_scalar_cr { params } => self.exec_vmov_scalar_cr(*params),
             #[cfg(feature = "has-fp")]
             Instruction::VMOV_cr_sp { params } => self.exec_vmov_cr_sp(params),
             #[cfg(feature = "has-fp")]
-            Instruction::VMOV_cr2_sp2 { .. } => unimplemented!(),
+            Instruction::VMOV_cr2_sp2 { params } => self.exec_vmov_cr2_sp2(*params),
             #[cfg(feature = "has-fp")]
             Instruction::VMOV_cr2_dp { params } => self.exec_vmov_cr2_dp(params),
 
@@ -729,6 +720,8 @@ impl ExecutorHelper for Processor {
             // --------------------------------------------
             #[cfg(feature = "has-fp")]
             Instruction::VMRS { rt } => self.exec_vmrs(*rt),
+            #[cfg(feature = "has-fp")]
+            Instruction::VMSR { rt } => self.exec_vmsr(*rt),
 
             // --------------------------------------------
             //
@@ -1109,8 +1102,7 @@ mod tests {
     fn test_lockup_always_traps_even_when_hardfault_trap_disabled() {
         let mut core = Processor::new();
         core.fault_trap_mode(crate::core::fault::FaultTrapMode::none());
-        core.psr.set_isr_number(Exception::HardFault.into());
-        core.mode = crate::ProcessorMode::HandlerMode;
+        core.test_set_active_exception(Exception::HardFault);
 
         let cycles = core.handle_fault(Fault::Forced, 0x0800_0100);
 

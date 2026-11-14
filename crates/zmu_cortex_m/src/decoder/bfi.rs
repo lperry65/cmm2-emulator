@@ -1,3 +1,4 @@
+use super::decode_UDF_t2;
 use crate::core::bits::Bits;
 use crate::core::instruction::{BfiParams, Instruction};
 use crate::core::register::Reg;
@@ -19,13 +20,7 @@ pub fn decode_BFI_t1(opcode: u32) -> Instruction {
     // In that case decode as UDF instead of underflowing in debug builds.
     let width = match msbit.checked_sub(lsbit) {
         Some(delta) => delta + 1,
-        None => {
-            return Instruction::UDF {
-                imm32: 0,
-                opcode: opcode.into(),
-                thumb32: true,
-            };
-        }
+        None => return decode_UDF_t2(opcode),
     };
 
     Instruction::BFI {

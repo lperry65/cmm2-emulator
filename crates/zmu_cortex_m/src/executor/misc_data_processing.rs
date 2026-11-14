@@ -39,12 +39,11 @@ pub trait IsaMiscDataProcessing {
 impl IsaMiscDataProcessing for Processor {
     fn exec_bfc(&mut self, params: &BfcParams) -> ExecuteResult {
         if self.condition_passed() {
-            if params.msbit >= params.lsbit {
-                let destination_upper_range = params.msbit + 1;
-                let mut result: u32 = self.get_r(params.rd);
-                result.set_bits(params.lsbit..destination_upper_range, 0);
-                self.set_r(params.rd, result);
-            }
+            // The decoder turns msbit below lsbit into UDF.
+            let destination_upper_range = params.msbit + 1;
+            let mut result: u32 = self.get_r(params.rd);
+            result.set_bits(params.lsbit..destination_upper_range, 0);
+            self.set_r(params.rd, result);
             return Ok(ExecuteSuccess::Taken { cycles: 1 });
         }
         Ok(ExecuteSuccess::NotTaken)
@@ -219,14 +218,11 @@ impl IsaMiscDataProcessing for Processor {
 
     fn exec_ubfx(&mut self, params: &BfxParams) -> ExecuteResult {
         if self.condition_passed() {
+            // The decoder turns a field past bit 31 into UDF, so msbit is at most 31.
             let msbit = params.lsb + params.widthminus1;
-            if msbit <= 31 {
-                let upper = msbit + 1;
-                let data = self.get_r(params.rn).get_bits(params.lsb..upper);
-                self.set_r(params.rd, data);
-            } else {
-                todo!();
-            }
+            let upper = msbit + 1;
+            let data = self.get_r(params.rn).get_bits(params.lsb..upper);
+            self.set_r(params.rd, data);
 
             return Ok(ExecuteSuccess::Taken { cycles: 1 });
         }
@@ -235,15 +231,12 @@ impl IsaMiscDataProcessing for Processor {
 
     fn exec_sbfx(&mut self, params: &BfxParams) -> ExecuteResult {
         if self.condition_passed() {
+            // The decoder turns a field past bit 31 into UDF, so msbit is at most 31.
             let msbit = params.lsb + params.widthminus1;
-            if msbit <= 31 {
-                let upper = msbit + 1;
-                let data = self.get_r(params.rn).get_bits(params.lsb..upper);
-                let data = sign_extend(data, msbit, 32) as i32;
-                self.set_r(params.rd, data as u32);
-            } else {
-                todo!();
-            }
+            let upper = msbit + 1;
+            let data = self.get_r(params.rn).get_bits(params.lsb..upper);
+            let data = sign_extend(data, params.widthminus1, 32) as i32;
+            self.set_r(params.rd, data as u32);
 
             return Ok(ExecuteSuccess::Taken { cycles: 1 });
         }
@@ -303,6 +296,45 @@ mod tests {
 
         assert_eq!(core.get_r(Reg::R0), 0xe000_e400);
         assert_eq!(core.get_r(Reg::R1), 0x00e0_00e4);
+    }
+
+    fn run(opcode: u32, core: &mut Processor) {
+        core.execute_internal(&crate::decoder::decode_32(opcode))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_bfc_and_bfi_over_all_32_bits() {
+        let mut core = Processor::new();
+        core.set_r(Reg::R0, 0x1234_5678);
+        core.set_r(Reg::R1, 0xffff_ffff);
+
+        // bfc r1, #0, #32
+        run(0xf36f_011f, &mut core);
+        assert_eq!(core.get_r(Reg::R1), 0);
+
+        // bfi r1, r0, #0, #32
+        run(0xf360_011f, &mut core);
+        assert_eq!(core.get_r(Reg::R1), 0x1234_5678);
+    }
+
+    #[test]
+    fn test_ubfx_and_sbfx_at_the_top_of_the_word() {
+        let mut core = Processor::new();
+        core.set_r(Reg::R0, 0x8000_0000);
+
+        // ubfx r1, r0, #28, #4
+        run(0xf3c0_7103, &mut core);
+        assert_eq!(core.get_r(Reg::R1), 0x8);
+
+        // sbfx r1, r0, #28, #4 sign extends from the top bit of the field, not of the word
+        run(0xf340_7103, &mut core);
+        assert_eq!(core.get_r(Reg::R1), 0xffff_fff8);
+
+        // sbfx r1, r0, #4, #4 reads zeros, so there is nothing to extend
+        core.set_r(Reg::R0, 0x0000_0070);
+        run(0xf340_1103, &mut core);
+        assert_eq!(core.get_r(Reg::R1), 0x7);
     }
 
     #[test]
