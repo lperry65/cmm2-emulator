@@ -2,7 +2,9 @@ use super::*;
 
 use crate::args::RunOptions;
 use crate::run_and_save::{run_and_save, run_and_save_saying};
-use crate::test_support::{PANICS, idle_cpu, scratch};
+use crate::test_support::{
+    Ended, PANICS, close_pty, idle_cpu, in_own_process, lflag, pty, scratch, spawning,
+};
 use cmm2_core::SdSlot;
 use std::io;
 use std::io::Write;
@@ -186,28 +188,9 @@ fn a_panic_puts_the_terminal_back_on_the_main_thread_and_not_on_another() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     with_the_hook();
     // A terminal as it is made, cooked: what raw mode saves and a panic puts back.
-    let (mut master, mut slave) = (0, 0);
-    // SAFETY: openpty fills in two descriptors, which are closed below.
-    unsafe {
-        assert_eq!(
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null()
-            ),
-            0
-        );
-    }
-    let lflag = || {
-        // SAFETY: tcgetattr fills a plain termios.
-        unsafe {
-            let mut termios: libc::termios = std::mem::zeroed();
-            libc::tcgetattr(slave, &mut termios);
-            termios.c_lflag
-        }
-    };
+    let pty = pty();
+    let slave = pty.1;
+    let lflag = || lflag(slave);
     let panic_in_a_run = || {
         let _ = catch_unwind(AssertUnwindSafe(|| {
             run_and_save_saying(
@@ -240,58 +223,43 @@ fn a_panic_puts_the_terminal_back_on_the_main_thread_and_not_on_another() {
     panic_in_a_run();
     assert_ne!(lflag(), in_raw_mode, "not restored from the main thread");
     std::mem::forget(raw);
-    // SAFETY: closing the two descriptors made above.
-    unsafe {
-        libc::close(master);
-        libc::close(slave);
-    }
+    close_pty(pty);
 }
 
-// A child forked from a process that has raw mode on gets a copy of what says so. The signal
-// tests fork like this while other tests have a terminal raw, and a child that put that terminal
-// back would be undoing what is not its own.
+// A child forked from a process that has raw mode on has the copy of `RAW` that says so. It is
+// not its terminal to put back, whatever it is that makes the child call `restore` (the signal
+// tests used to fork while other tests had a terminal raw). This has to be a real `fork`, as
+// it is the copy of the process that is tried, so it is not run in a process of its own as the
+// other tests of children are. The child shares every descriptor of this process, so a lock that
+// another test has would be the child's until it ends: no other test starts a process, or lets
+// go of a lock that it holds with `spawning`, meanwhile. The child touches nothing but the
+// terminal, and is waited for here.
 #[test]
 fn a_forked_child_does_not_put_the_terminal_back_that_its_parent_made_raw() {
     let _turn = PANICS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (mut master, mut slave) = (0, 0);
-    // SAFETY: openpty fills in two descriptors, which are closed below.
-    unsafe {
-        assert_eq!(
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null()
-            ),
-            0
-        );
-    }
-    let lflag = || {
-        // SAFETY: tcgetattr fills a plain termios.
-        unsafe {
-            let mut termios: libc::termios = std::mem::zeroed();
-            libc::tcgetattr(slave, &mut termios);
-            termios.c_lflag
-        }
-    };
+    let pty = pty();
+    let slave = pty.1;
     let raw = terminal::RawMode::enable_on(slave).unwrap();
-    let in_raw_mode = lflag();
+    let in_raw_mode = lflag(slave);
 
-    // SAFETY: the child only calls `restore` (a lock-free tcsetattr) and `_exit`.
+    let _alone = spawning();
+    // SAFETY: the child calls only `restore` (tcsetattr and getpid) and `_exit`, none of which
+    // takes a lock or allocates, as is needed after a fork in a threaded process.
     unsafe {
         let pid = libc::fork();
+        assert!(pid >= 0, "fork failed");
         if pid == 0 {
             terminal::restore();
             libc::_exit(0);
         }
         let mut status = 0;
-        libc::waitpid(pid, &mut status, 0);
+        assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
     }
     assert_eq!(
-        lflag(),
+        lflag(slave),
         in_raw_mode,
         "put back by a child that did not make it raw"
     );
@@ -299,58 +267,47 @@ fn a_forked_child_does_not_put_the_terminal_back_that_its_parent_made_raw() {
     // The process that made it raw still can.
     drop(raw);
     assert_ne!(
-        lflag(),
+        lflag(slave),
         in_raw_mode,
         "not put back by the process that made it raw"
     );
-    // SAFETY: closing the two descriptors made above.
-    unsafe {
-        libc::close(master);
-        libc::close(slave);
-    }
+    close_pty(pty);
 }
 
-// A panic in a `Drop` while a panic is being unwound, which aborts the process. The test
-// below runs this one in a process of its own (it is a test that does nothing without the
-// variable the other sets).
+// A panic in a `Drop` while a panic is being unwound aborts the process, so it is tried in a
+// process of its own.
 #[test]
-fn double_panic_in_a_process_of_its_own() {
-    if std::env::var_os("CMM2_TEST_DOUBLE_PANIC").is_none() {
-        return;
-    }
+fn a_double_panic_writes_everything_that_was_held_and_the_new_message_before_the_abort() {
     struct Bomb;
     impl Drop for Bomb {
         fn drop(&mut self) {
             panic!("the second panic");
         }
     }
-    with_the_hook();
-    let _ = run_and_save(
-        &mut idle_cpu(),
-        &SdSlot::new(),
-        &RunOptions::default(),
-        |_| -> () {
-            let _bomb = Bomb;
-            panic!("the first panic")
+    let ran = in_own_process(
+        concat!(
+            "panic_hook::tests::",
+            "a_double_panic_writes_everything_that_was_held_and_the_new_message_before_the_abort"
+        ),
+        "",
+        &[],
+        |_| {
+            with_the_hook();
+            let _ = run_and_save(
+                &mut idle_cpu(),
+                &SdSlot::new(),
+                &RunOptions::default(),
+                |_| -> () {
+                    let _bomb = Bomb;
+                    panic!("the first panic")
+                },
+            );
         },
-    );
-}
+    )
+    .unwrap();
 
-#[test]
-fn a_double_panic_writes_everything_that_was_held_and_the_new_message_before_the_abort() {
-    use std::os::unix::process::ExitStatusExt;
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "panic_hook::tests::double_panic_in_a_process_of_its_own",
-            "--nocapture",
-        ])
-        .env("CMM2_TEST_DOUBLE_PANIC", "1")
-        .output()
-        .unwrap();
-
-    let said = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.signal(), Some(libc::SIGABRT), "{said}");
+    let said = ran.stderr;
+    assert_eq!(ran.ended, Ended::Signal(libc::SIGABRT), "{said}");
     let first = said.find("the first panic").expect(&said);
     let second = said.find("the second panic").expect(&said);
     assert!(first < second, "oldest first: {said}");

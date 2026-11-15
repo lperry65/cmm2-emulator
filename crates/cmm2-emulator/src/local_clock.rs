@@ -97,10 +97,11 @@ mod tests {
     #[test]
     fn the_local_clock_agrees_with_the_date_command() {
         let before = LocalClock.now().local;
-        let output = std::process::Command::new("date")
-            .arg("+%Y %m %d %H %M")
-            .output()
-            .unwrap();
+        let output = crate::test_support::output_of(
+            std::process::Command::new("date").arg("+%Y %m %d %H %M"),
+            &[],
+        )
+        .unwrap();
         let after = LocalClock.now().local;
         let text = String::from_utf8(output.stdout).unwrap();
         let [year, month, day, hour, minute] = text

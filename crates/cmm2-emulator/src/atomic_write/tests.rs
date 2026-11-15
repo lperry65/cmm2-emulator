@@ -1,12 +1,12 @@
 use super::*;
-use crate::test_support::{age, files_in, mode, root, scratch};
+use crate::test_support::{age, files_in, mode, root, scratch_dir, spawning};
 use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 #[test]
 fn a_file_is_written_whole_and_replaced_whole() {
-    let dir = scratch("atomic-plain");
+    let dir = scratch_dir("atomic-plain");
     let file = dir.join("a.img");
     write_atomically(file.to_str().unwrap(), b"first").unwrap();
     assert_eq!(std::fs::read(&file).unwrap(), b"first");
@@ -14,12 +14,11 @@ fn a_file_is_written_whole_and_replaced_whole() {
     assert_eq!(std::fs::read(&file).unwrap(), b"second, longer");
     // The temporary file does not stay.
     assert_eq!(files_in(&dir), ["a.img"]);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn a_symlink_is_written_through_and_stays_a_symlink() {
-    let dir = scratch("atomic-link");
+    let dir = scratch_dir("atomic-link");
     let real = dir.join("real.img");
     let link = dir.join("link.img");
     std::fs::write(&real, b"old").unwrap();
@@ -30,12 +29,11 @@ fn a_symlink_is_written_through_and_stays_a_symlink() {
     assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
     assert_eq!(std::fs::read(&real).unwrap(), b"new");
     assert_eq!(files_in(&dir), ["link.img", "real.img"]);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn a_symlink_to_another_directory_is_written_there() {
-    let dir = scratch("atomic-link-dir");
+    let dir = scratch_dir("atomic-link-dir");
     let elsewhere = dir.join("elsewhere");
     std::fs::create_dir(&elsewhere).unwrap();
     std::fs::write(elsewhere.join("real.img"), b"old").unwrap();
@@ -47,12 +45,11 @@ fn a_symlink_to_another_directory_is_written_there() {
     // The temporary file was made beside the real file, and is gone from both.
     assert_eq!(files_in(&elsewhere), ["real.img"]);
     assert_eq!(files_in(&dir), ["elsewhere", "link.img"]);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn the_permissions_of_the_old_file_are_kept() {
-    let dir = scratch("atomic-mode");
+    let dir = scratch_dir("atomic-mode");
     let file = dir.join("a.img");
     std::fs::write(&file, b"old").unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
@@ -60,12 +57,11 @@ fn the_permissions_of_the_old_file_are_kept() {
     write_atomically(file.to_str().unwrap(), b"new").unwrap();
 
     assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o777, 0o640);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn the_temporary_file_is_never_taken_over_and_a_stale_one_does_not_block_the_save() {
-    let dir = scratch("atomic-unique");
+    let dir = scratch_dir("atomic-unique");
     let file = dir.join("a.img");
     // Somebody else's file with the name another process would use, and one that an
     // earlier crash left under this very process id (a container starts at the same one).
@@ -80,12 +76,11 @@ fn the_temporary_file_is_never_taken_over_and_a_stale_one_does_not_block_the_sav
     assert_eq!(std::fs::read(&file).unwrap(), b"newer");
     assert_eq!(std::fs::read(&other).unwrap(), b"theirs");
     assert_eq!(std::fs::read(&stale).unwrap(), b"stale");
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn a_dangling_symlink_is_written_through_and_the_target_is_made() {
-    let dir = scratch("atomic-dangling");
+    let dir = scratch_dir("atomic-dangling");
     let link = dir.join("link.img");
     symlink("real.img", &link).unwrap();
 
@@ -94,12 +89,11 @@ fn a_dangling_symlink_is_written_through_and_the_target_is_made() {
     assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
     assert_eq!(std::fs::read(dir.join("real.img")).unwrap(), b"first");
     assert_eq!(files_in(&dir), ["link.img", "real.img"]);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn a_chain_of_links_to_a_target_that_is_not_there_is_followed_to_its_end() {
-    let dir = scratch("atomic-chain");
+    let dir = scratch_dir("atomic-chain");
     std::fs::create_dir(dir.join("sub")).unwrap();
     symlink("sub/second", dir.join("first")).unwrap();
     // Relative to the directory of the link that holds it, which is sub.
@@ -118,12 +112,11 @@ fn a_chain_of_links_to_a_target_that_is_not_there_is_followed_to_its_end() {
             .unwrap()
             .is_symlink()
     );
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn a_loop_of_links_is_an_error() {
-    let dir = scratch("atomic-loop");
+    let dir = scratch_dir("atomic-loop");
     symlink("b", dir.join("a")).unwrap();
     symlink("a", dir.join("b")).unwrap();
 
@@ -131,12 +124,11 @@ fn a_loop_of_links_is_an_error() {
 
     assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
     assert_eq!(files_in(&dir), ["a", "b"]);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn a_failed_write_leaves_the_old_file_and_no_temporary_file() {
-    let dir = scratch("atomic-fail");
+    let dir = scratch_dir("atomic-fail");
     // The rename onto a directory fails, after the temporary file is made.
     let target = dir.join("a");
     std::fs::create_dir(&target).unwrap();
@@ -145,7 +137,6 @@ fn a_failed_write_leaves_the_old_file_and_no_temporary_file() {
     assert!(write_atomically(target.to_str().unwrap(), b"x").is_err());
 
     assert_eq!(files_in(&dir), ["a"]);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -158,7 +149,7 @@ fn a_name_with_no_directory_is_written_in_the_current_one() {
 
 #[test]
 fn an_old_temporary_file_that_nobody_holds_is_removed_and_the_others_are_kept() {
-    let dir = scratch("stale-temps");
+    let dir = scratch_dir("stale-temps");
     let held = dir.join(".cmm2.4242.9.tmp");
     let unheld = dir.join(".cmm2.4242.1.tmp");
     let fresh = dir.join(".cmm2.4242.2.tmp");
@@ -183,6 +174,10 @@ fn an_old_temporary_file_that_nobody_holds_is_removed_and_the_others_are_kept() 
     for file in [&held, &unheld] {
         age(file, 3600);
     }
+    // A process that another test starts while this has the lock would hold it until the
+    // process execs, and the lock would not be let go of when it is dropped below. So no
+    // process is started meanwhile.
+    let _alone = spawning();
     // A save that is going on: the file is locked as `create_locked` does, and old.
     let lock = File::open(&held).unwrap();
     assert!(try_lock(&lock));
@@ -199,12 +194,11 @@ fn an_old_temporary_file_that_nobody_holds_is_removed_and_the_others_are_kept() 
     drop(lock);
     remove_stale_temps(dir.join("a.img").to_str().unwrap());
     assert!(!held.exists());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn what_is_not_a_regular_file_is_never_opened_by_the_cleanup() {
-    let dir = scratch("stale-odd");
+    let dir = scratch_dir("stale-odd");
     // A FIFO would block an open for reading until someone writes, and a link to a device
     // would be opened as the device. Both are named like a temporary file and are old.
     let fifo = dir.join(".cmm2.4242.1.tmp");
@@ -224,7 +218,6 @@ fn what_is_not_a_regular_file_is_never_opened_by_the_cleanup() {
     // The opening itself refuses a link and a FIFO, if one is swapped in after the look.
     assert!(open_to_lock(&link).is_none());
     assert!(open_to_lock(&fifo).is_none());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -232,7 +225,7 @@ fn a_left_over_file_that_cannot_be_read_is_removed_through_a_write_open() {
     if root() {
         return;
     }
-    let dir = scratch("stale-wo");
+    let dir = scratch_dir("stale-wo");
     let write_only = dir.join(".cmm2.4242.1.tmp");
     let nothing = dir.join(".cmm2.4242.2.tmp");
     std::fs::write(&write_only, b"x").unwrap();
@@ -249,12 +242,12 @@ fn a_left_over_file_that_cannot_be_read_is_removed_through_a_write_open() {
     // is left (README has the command to remove it).
     assert!(!write_only.exists());
     assert!(nothing.exists());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn the_temporary_file_of_a_save_is_locked_while_it_is_open() {
-    let dir = scratch("locked-temp");
+    let dir = scratch_dir("locked-temp");
+    let _alone = spawning();
     let temp = dir.join(".cmm2.4242.1.tmp");
     let file = create_locked(&temp).unwrap();
 
@@ -264,7 +257,6 @@ fn the_temporary_file_of_a_save_is_locked_while_it_is_open() {
 
     drop(file);
     assert!(try_lock(&File::open(&temp).unwrap()));
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

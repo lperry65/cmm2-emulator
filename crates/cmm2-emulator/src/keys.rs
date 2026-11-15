@@ -242,10 +242,12 @@ mod real_firmware {
             std::fs::File::create(&path)
                 .and_then(|file| file.set_len(64 << 20))
                 .unwrap();
-            let made = std::process::Command::new("mkfs.vfat")
-                .args(["-F", "32"])
-                .arg(&path)
-                .output();
+            let made = crate::test_support::output_of(
+                std::process::Command::new("mkfs.vfat")
+                    .args(["-F", "32"])
+                    .arg(&path),
+                &[],
+            );
             let image = made.as_ref().is_ok_and(|made| made.status.success());
             if image {
                 let card = std::fs::read(&path).unwrap();

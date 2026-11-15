@@ -130,6 +130,13 @@ pub fn begin_run() {
     RUNNING.store(true, Ordering::Release);
 }
 
+/// The first signal that was caught, or 0 if none has been, for saying what stopped the run.
+// Nothing outside the tests says what stopped the run yet; the `expect` goes when something does.
+#[cfg_attr(not(test), expect(dead_code))]
+pub fn first() -> libc::c_int {
+    FIRST.load(Ordering::Acquire)
+}
+
 /// Ends the process with the signal that ended the run, if one did. Call it when the files are
 /// written and the output is flushed.
 pub fn die_if_caught() {
@@ -143,31 +150,7 @@ pub fn die_if_caught() {
 mod tests {
     use super::*;
 
-    #[derive(Debug, PartialEq, Eq)]
-    enum Ended {
-        Signal(i32),
-        Exit(i32),
-    }
-
-    // Runs `body` in a forked child and returns how it ended. The child only calls what is safe
-    // after a fork from a threaded process, and `_exit`s.
-    fn in_child(body: impl FnOnce()) -> Ended {
-        // SAFETY: fork; the child runs `body` (signal calls and atomics only) and _exits.
-        unsafe {
-            let pid = libc::fork();
-            if pid == 0 {
-                body();
-                libc::_exit(0);
-            }
-            let mut status = 0;
-            libc::waitpid(pid, &mut status, 0);
-            if libc::WIFSIGNALED(status) {
-                Ended::Signal(libc::WTERMSIG(status))
-            } else {
-                Ended::Exit(libc::WEXITSTATUS(status))
-            }
-        }
-    }
+    use crate::test_support::{Ended, close_pty, in_own_process, lflag, pty};
 
     // What main does: handlers in, and the run begun.
     fn start() {
@@ -180,17 +163,36 @@ mod tests {
         unsafe { libc::raise(signal) };
     }
 
+    // Runs `body` in a process of its own (see `in_own_process`) for the test of this name, and
+    // returns how it ended. A signal or a flag set here would be the whole test process's.
+    fn in_child(test: &str, body: impl FnOnce()) -> Ended {
+        in_child_case(test, "", body).unwrap()
+    }
+
+    // As `in_child` for a test that tries more than one case, `None` in a child that is for
+    // another one (see `in_own_process`).
+    fn in_child_case(test: &str, case: &str, body: impl FnOnce()) -> Option<Ended> {
+        in_own_process(&format!("signals::tests::{test}"), case, &[], |_| body())
+            .map(|ran| ran.ended)
+    }
+
     #[test]
     fn a_signal_sets_the_flag_and_does_not_end_the_process() {
         for signal in ENDING {
-            let ended = in_child(|| {
-                start();
-                raise(signal);
-                if !caught() {
-                    // SAFETY: _exit only ends the child.
-                    unsafe { libc::_exit(3) };
-                }
-            });
+            let Some(ended) = in_child_case(
+                "a_signal_sets_the_flag_and_does_not_end_the_process",
+                &signal.to_string(),
+                || {
+                    start();
+                    raise(signal);
+                    if !caught() {
+                        // SAFETY: _exit only ends the child.
+                        unsafe { libc::_exit(3) };
+                    }
+                },
+            ) else {
+                continue;
+            };
             assert_eq!(ended, Ended::Exit(0), "signal {signal}");
         }
     }
@@ -198,23 +200,35 @@ mod tests {
     #[test]
     fn die_if_caught_ends_the_process_with_the_signal() {
         for signal in ENDING {
-            let ended = in_child(|| {
-                start();
-                raise(signal);
-                die_if_caught();
-            });
+            let Some(ended) = in_child_case(
+                "die_if_caught_ends_the_process_with_the_signal",
+                &signal.to_string(),
+                || {
+                    start();
+                    raise(signal);
+                    die_if_caught();
+                },
+            ) else {
+                continue;
+            };
             assert_eq!(ended, Ended::Signal(signal));
         }
     }
 
     #[test]
     fn die_if_caught_does_nothing_when_nothing_was_caught() {
-        assert_eq!(in_child(die_if_caught), Ended::Exit(0));
+        assert_eq!(
+            in_child(
+                "die_if_caught_does_nothing_when_nothing_was_caught",
+                die_if_caught
+            ),
+            Ended::Exit(0)
+        );
     }
 
     #[test]
     fn a_second_signal_ends_the_process_at_once() {
-        let ended = in_child(|| {
+        let ended = in_child("a_second_signal_ends_the_process_at_once", || {
             start();
             raise(libc::SIGTERM);
             raise(libc::SIGTERM);
@@ -224,7 +238,7 @@ mod tests {
 
     #[test]
     fn a_signal_that_was_ignored_stays_ignored() {
-        let ended = in_child(|| {
+        let ended = in_child("a_signal_that_was_ignored_stays_ignored", || {
             // SAFETY: signal with SIG_IGN has no handler to get wrong.
             unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
             start();
@@ -238,92 +252,105 @@ mod tests {
     }
 
     #[test]
+    fn first_is_0_until_a_signal_is_caught_and_then_the_first_one() {
+        let ended = in_child(
+            "first_is_0_until_a_signal_is_caught_and_then_the_first_one",
+            || {
+                start();
+                let before = first();
+                raise(libc::SIGTERM);
+                let right = before == 0 && first() == libc::SIGTERM;
+                // SAFETY: _exit only ends the child.
+                unsafe { libc::_exit(if right { 0 } else { 3 }) };
+            },
+        );
+        assert_eq!(ended, Ended::Exit(0));
+    }
+
+    #[test]
     fn the_signal_is_recorded_and_the_wake_pipe_is_readable_once_it_is_caught() {
-        let ended = in_child(|| {
-            start();
-            let mut poll = libc::pollfd {
-                fd: wake_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: poll on one live pollfd, with no wait.
-            let before = unsafe { libc::poll(&mut poll, 1, 0) };
-            raise(libc::SIGHUP);
-            // SAFETY: as above.
-            let after = unsafe { libc::poll(&mut poll, 1, 0) };
-            let first = FIRST.load(Ordering::Acquire);
-            let right = before == 0 && after == 1 && caught() && first == libc::SIGHUP;
-            // SAFETY: _exit only ends the child.
-            unsafe { libc::_exit(if right { 0 } else { 3 }) };
-        });
+        let ended = in_child(
+            "the_signal_is_recorded_and_the_wake_pipe_is_readable_once_it_is_caught",
+            || {
+                start();
+                let mut poll = libc::pollfd {
+                    fd: wake_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll on one live pollfd, with no wait.
+                let before = unsafe { libc::poll(&mut poll, 1, 0) };
+                raise(libc::SIGHUP);
+                // SAFETY: as above.
+                let after = unsafe { libc::poll(&mut poll, 1, 0) };
+                let first = FIRST.load(Ordering::Acquire);
+                let right = before == 0 && after == 1 && caught() && first == libc::SIGHUP;
+                // SAFETY: _exit only ends the child.
+                unsafe { libc::_exit(if right { 0 } else { 3 }) };
+            },
+        );
         assert_eq!(ended, Ended::Exit(0));
     }
 
     #[test]
     fn a_signal_before_the_run_begins_ends_the_process_at_once() {
         for signal in ENDING {
-            let ended = in_child(|| {
-                catch();
-                raise(signal);
-            });
+            let Some(ended) = in_child_case(
+                "a_signal_before_the_run_begins_ends_the_process_at_once",
+                &signal.to_string(),
+                || {
+                    catch();
+                    raise(signal);
+                },
+            ) else {
+                continue;
+            };
             assert_eq!(ended, Ended::Signal(signal));
         }
     }
 
     #[test]
     fn a_signal_while_threads_are_made_waits_and_is_taken_after() {
-        let ended = in_child(|| {
-            start();
-            let waited = with_blocked(|| {
-                raise(libc::SIGTERM);
-                !caught()
-            });
-            let handled = caught();
-            // SAFETY: _exit only ends the child.
-            unsafe { libc::_exit(if waited && handled { 0 } else { 3 }) };
-        });
+        let ended = in_child(
+            "a_signal_while_threads_are_made_waits_and_is_taken_after",
+            || {
+                start();
+                let waited = with_blocked(|| {
+                    raise(libc::SIGTERM);
+                    !caught()
+                });
+                let handled = caught();
+                // SAFETY: _exit only ends the child.
+                unsafe { libc::_exit(if waited && handled { 0 } else { 3 }) };
+            },
+        );
         assert_eq!(ended, Ended::Exit(0));
-    }
-
-    // The local mode flags of the terminal on `fd`.
-    fn lflag(fd: libc::c_int) -> libc::tcflag_t {
-        // SAFETY: tcgetattr fills a plain termios.
-        unsafe {
-            let mut termios: libc::termios = zeroed();
-            assert_eq!(libc::tcgetattr(fd, &mut termios), 0);
-            termios.c_lflag
-        }
     }
 
     #[test]
     fn a_second_signal_puts_the_terminal_back_before_it_ends_the_process() {
-        let (mut master, mut slave) = (0, 0);
-        // SAFETY: openpty fills in two descriptors.
-        let opened = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        };
-        assert_eq!(opened, 0);
+        let pty = pty();
+        let slave = pty.1;
         let cooked = lflag(slave);
-        let ended = in_child(|| {
-            let raw = crate::terminal::RawMode::enable_on(slave).expect("a pty is a terminal");
-            // The drop that would put it back on the way out never runs.
-            std::mem::forget(raw);
-            start();
-            raise(libc::SIGTERM);
-            raise(libc::SIGTERM);
-        });
+        // The child has the slave open too (`slave` is its number there as well, which `fds`
+        // says), and raw mode is made there, so that this process's own is not touched.
+        let ended = in_own_process(
+            "signals::tests::a_second_signal_puts_the_terminal_back_before_it_ends_the_process",
+            "",
+            &[slave],
+            |fds| {
+                let raw = crate::terminal::RawMode::enable_on(fds[0]).expect("a pty is a terminal");
+                // The drop that would put it back on the way out never runs.
+                std::mem::forget(raw);
+                start();
+                raise(libc::SIGTERM);
+                raise(libc::SIGTERM);
+            },
+        )
+        .unwrap()
+        .ended;
         assert_eq!(ended, Ended::Signal(libc::SIGTERM));
         assert_eq!(lflag(slave), cooked);
-        // SAFETY: closing the two descriptors made above.
-        unsafe {
-            libc::close(master);
-            libc::close(slave);
-        }
+        close_pty(pty);
     }
 }
