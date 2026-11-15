@@ -1,4 +1,5 @@
-//! The host terminal in raw mode, so keys reach the guest one at a time and unechoed.
+//! The host terminal in raw mode, so keys reach the guest one at a time and unechoed. It is for
+//! Unix, as termios is (a port to Windows, issue 75, has its own console to put back).
 
 use std::cell::UnsafeCell;
 use std::mem::{MaybeUninit, zeroed};
@@ -76,8 +77,7 @@ impl Drop for RawMode {
 /// terminal back itself (setting it twice does no harm). A forked child leaves it alone (see
 /// `RAW_PID`); getpid is async-signal-safe too.
 pub fn restore() {
-    // SAFETY: getpid takes nothing and cannot fail.
-    if RAW.load(Ordering::Acquire) && RAW_PID.load(Ordering::Relaxed) == unsafe { libc::getpid() } {
+    if is_raw() {
         // SAFETY: RAW was set, so SAVED holds the termios that enable_on wrote, and nothing
         // writes it again while RAW is set. tcsetattr is async-signal-safe.
         unsafe {
@@ -88,6 +88,24 @@ pub fn restore() {
             );
         }
         RAW.store(false, Ordering::Release);
+    }
+}
+
+/// Whether this process has the terminal in raw mode.
+fn is_raw() -> bool {
+    // SAFETY: getpid takes nothing and cannot fail.
+    RAW.load(Ordering::Acquire) && RAW_PID.load(Ordering::Relaxed) == unsafe { libc::getpid() }
+}
+
+/// Whether a line feed written to `fd` leaves the cursor in its column, which is so for a
+/// terminal that does not turn LF into CR LF (raw mode, whichever terminal it is on, `/dev/tty`
+/// and a multiplexer's included). It is not so for a file or a pipe, which has no cursor.
+pub fn lf_keeps_column(fd: libc::c_int) -> bool {
+    // SAFETY: termios is plain data, and tcgetattr fills it in.
+    unsafe {
+        let mut termios: libc::termios = zeroed();
+        libc::tcgetattr(fd, &mut termios) == 0
+            && termios.c_oflag & (libc::OPOST | libc::ONLCR) != (libc::OPOST | libc::ONLCR)
     }
 }
 

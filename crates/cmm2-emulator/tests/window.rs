@@ -4,12 +4,14 @@ mod common;
 
 use common::*;
 
+const LIMIT_LINE: &str = "cmm2-emulator: instruction limit reached\n";
+
 #[test]
 fn window_shows_the_screen_and_ends_with_the_run() {
     let output = run_program("window", &SCREEN, &["--window", "--run", "40"]);
 
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert_eq!(stderr(&output), LIMIT_LINE);
 }
 
 #[test]
@@ -18,8 +20,8 @@ fn window_says_once_that_there_is_no_picture() {
 
     assert!(output.status.success());
     assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "cmm2-emulator: no picture: the LTDC is not enabled\n"
+        stderr(&output),
+        format!("cmm2-emulator: no picture: the LTDC is not enabled\n{LIMIT_LINE}")
     );
 }
 
@@ -32,7 +34,7 @@ fn window_goes_with_the_console() {
     );
 
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert_eq!(stderr(&output), LIMIT_LINE);
 }
 
 #[test]
@@ -44,7 +46,7 @@ fn window_keys_can_go_to_the_console() {
     );
 
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert_eq!(stderr(&output), LIMIT_LINE);
 }
 
 #[test]
@@ -56,5 +58,5 @@ fn unpaced_goes_with_the_live_modes() {
     );
 
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert_eq!(stderr(&output), LIMIT_LINE);
 }

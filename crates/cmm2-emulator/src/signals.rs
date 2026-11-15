@@ -131,8 +131,6 @@ pub fn begin_run() {
 }
 
 /// The first signal that was caught, or 0 if none has been, for saying what stopped the run.
-// Nothing outside the tests says what stopped the run yet; the `expect` goes when something does.
-#[cfg_attr(not(test), expect(dead_code))]
 pub fn first() -> libc::c_int {
     FIRST.load(Ordering::Acquire)
 }

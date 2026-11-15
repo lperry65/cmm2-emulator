@@ -8,6 +8,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+const LIMIT_LINE: &str = "cmm2-emulator: instruction limit reached\n";
+
 // Runs the program as `--console` with `args` after it; stdin is closed, so only the rules type.
 fn run_console(name: &str, args: &[&str]) -> Output {
     let mut all = vec!["--console"];
@@ -21,7 +23,7 @@ fn console_prints_the_guest_output_as_it_is() {
 
     assert!(output.status.success());
     assert_eq!(stdout(&output), "ready\r\n");
-    assert!(output.stderr.is_empty());
+    assert_eq!(stderr(&output), LIMIT_LINE);
 }
 
 #[test]
@@ -63,7 +65,10 @@ fn console_stops_at_an_address_without_a_summary() {
 
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(output.stderr.is_empty());
+    assert_eq!(
+        stderr(&output),
+        "cmm2-emulator: reached address 0x08000104\n"
+    );
 }
 
 #[test]
@@ -144,6 +149,6 @@ fn a_system_reset_in_the_console_restarts_the_guest_and_is_reported_on_stderr() 
     assert_eq!(stdout(&output), "ABC");
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        RESET_LINE.repeat(2)
+        RESET_LINE.repeat(2) + LIMIT_LINE
     );
 }

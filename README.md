@@ -93,8 +93,9 @@ The open issues at 8260358, from `gh issue list --state open`:
   ARMv7-M manual), 17 (readable disassembly in the trace).
 - Console and input: 66 (console input arrives faster than the baud rate), 48 (pasted lines are
   joined), 47 (a hard fault on `ESC O D`, the SS3 left arrow), 71 (the emulator exits silently on
-  `RUN` with the console on a terminal; every end has to say why, and that is being fixed), 62
-  (keyboard follow-ups), 53 (USB mouse), 54 (gamepad).
+  `RUN` with the console on a terminal; every end now says why, and what is left is that the line
+  cannot know where an escape sequence moves the cursor, and that the window-closed end has no
+  end-to-end test), 62 (keyboard follow-ups), 53 (USB mouse), 54 (gamepad).
 - Storage and the board's state: 63 (SPI3 for the SD card, `OPTION SD TIMING FAST`), 44 (a host
   folder as the SD card), 41 (the guest writes 32 zero bytes into the firmware region of flash), 69
   (remember the board between runs).
@@ -335,6 +336,23 @@ would read a whole card and then rename a file over its node). What cannot be se
 so can still fail when the run is over and lose it, is the rest: a full disk or quota, a file made
 immutable during the run, a network file system that goes away, a security module (SELinux,
 AppArmor) that says no.
+
+Every end of a `--console` or `--window` run says why, on one line of stderr, after the terminal is
+put back: `cmm2-emulator: quit key (Ctrl-]) pressed`, `cmm2-emulator: stopped by SIGTERM` (or
+`SIGINT`, `SIGHUP`; `signal <n>` for any other), `cmm2-emulator: reached address 0x08000104`
+(`--stop-at`), `cmm2-emulator: instruction limit reached` (`--run`) and `cmm2-emulator: window
+closed`. The exit codes are as they were: 0 for the quit key, the limit, the address and the window
+closing, 1 for a fault (which has its own line, `fault trap: ...`), and a signal ends the process
+by that signal. If the guest left the cursor part way along a row, the line starts on a new one.
+That is worked out from the bytes the guest wrote, which tell nothing of where an escape sequence
+moves the cursor: a colour change or a window title is known to move nothing, but any other escape
+(a screen drawn with cursor moves, say) is taken as leaving the cursor on a row with something on
+it, so the line goes on a new row that may already have something on it, or may leave an empty row
+before it. If the guest's output ends inside an escape sequence that was never finished (at the
+limit, say, or at a signal), the line starts with CAN, which cancels it, so that the line is not
+taken into it. A script that runs `--console --run N` and expects an empty stderr now finds
+`instruction limit reached` there. A run with no console and no window is not changed: its summary
+on stdout says how it ended.
 
 With `--console` the terminal is in raw mode, so Ctrl-C goes to the guest and the quit key is
 Ctrl-]; a signal sent from outside (SIGTERM, SIGHUP) still ends the run, and so does SIGINT with
