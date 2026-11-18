@@ -78,6 +78,8 @@ mod orn;
 mod orr;
 
 #[cfg(feature = "has-dsp-ext")]
+mod parallel;
+#[cfg(feature = "has-dsp-ext")]
 mod pkh;
 mod pld;
 mod pli;
@@ -114,8 +116,6 @@ mod teq;
 mod tst;
 
 mod movt;
-#[cfg(feature = "has-dsp-ext")]
-mod uadd8;
 mod udiv;
 mod umlal;
 mod umull;
@@ -296,11 +296,11 @@ use {
 
 #[cfg(feature = "has-dsp-ext")]
 use self::{
+    parallel::decode_PARALLEL_t1,
     pkh::decode_PKH_t1,
     sel::decode_SEL_t1,
     smla::decode_SMLA_t1,
     smul::decode_SMUL_t1,
-    uadd8::decode_UADD8_t1,
     uxtab::{decode_SXTAB_t1, decode_SXTAH_t1, decode_UXTAB_t1, decode_UXTAH_t1},
 };
 

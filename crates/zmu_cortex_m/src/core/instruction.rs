@@ -94,6 +94,41 @@ pub struct Reg3Params {
     pub rm: Reg,
     pub setflags: SetFlags,
 }
+/// What a parallel add or subtract does with the sum or difference of each lane.
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub enum ParallelResult {
+    /// Keep the low bits, and set the GE flags (the S and U forms)
+    Wrap,
+    /// Saturate to the range of the lane (the Q and UQ forms)
+    Saturate,
+    /// Keep bits 16:1 or 8:1 of the sum, so halve it (the SH and UH forms)
+    Halve,
+}
+
+/// How a parallel add or subtract pairs up the lanes of Rn and Rm.
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub enum ParallelLanes {
+    Add8,
+    Sub8,
+    Add16,
+    Sub16,
+    /// Rn low minus Rm high into the low half, Rn high plus Rm low into the high half
+    Asx,
+    /// Rn low plus Rm high into the low half, Rn high minus Rm low into the high half
+    Sax,
+}
+
+/// One of the 36 parallel adds and subtracts, as data.
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub struct ParallelOp {
+    pub signed: bool,
+    pub result: ParallelResult,
+    pub lanes: ParallelLanes,
+}
+
 #[allow(missing_docs)]
 #[derive(PartialEq, Debug, Copy, Clone)]
 pub struct Reg3NoSetFlagsParams {
@@ -1158,14 +1193,12 @@ pub enum Instruction {
     // Group: Parallel add / sub (DSP extension)
     //
     // --------------------------------------------
-    //SADD16, QADD16, SHADD16, UADD16, UQADD16, UHADD16
-    //SASX, QASX, SHASX, UASX, UQASX, UHSX
-    //SSAX, QSAX, SHSAX, USAX, UQSAX, UHSAX
-    //SSUB16, QSUB16, SHSUB16, USUB16, UQSUB16, UHSUB16
-    //SADD8, QADD8, SHADD8, UADD8, UQADD8, UHADD8
-    //SSUB8, QSUB8, SHSUB8, USUB8, UQSUB8, UHSUB8
-    UADD8 {
+    /// The 36 parallel adds and subtracts: SADD16, QADD16, SHADD16, UADD16, UQADD16, UHADD16, and
+    /// the same for ASX, SAX, SUB16, ADD8 and SUB8. `op` says which. Each has an A7.7 page, from
+    /// QADD16 (A7.7.103) to USUB8 (A7.7.217).
+    PARALLEL {
         params: Reg3NoSetFlagsParams,
+        op: ParallelOp,
     },
 
     // --------------------------------------------
@@ -2722,8 +2755,28 @@ impl fmt::Display for Instruction {
                 imm32, ref opcode, ..
             } => write!(f, "udf {imm32} (opcode = {opcode})"),
 
-            Self::UADD8 { params } => {
-                write!(f, "uadd8 {}, {}, {}", params.rd, params.rn, params.rm)
+            Self::PARALLEL { params, op } => {
+                let prefix = match (op.signed, op.result) {
+                    (true, ParallelResult::Wrap) => "s",
+                    (true, ParallelResult::Saturate) => "q",
+                    (true, ParallelResult::Halve) => "sh",
+                    (false, ParallelResult::Wrap) => "u",
+                    (false, ParallelResult::Saturate) => "uq",
+                    (false, ParallelResult::Halve) => "uh",
+                };
+                let lanes = match op.lanes {
+                    ParallelLanes::Add8 => "add8",
+                    ParallelLanes::Sub8 => "sub8",
+                    ParallelLanes::Add16 => "add16",
+                    ParallelLanes::Sub16 => "sub16",
+                    ParallelLanes::Asx => "asx",
+                    ParallelLanes::Sax => "sax",
+                };
+                write!(
+                    f,
+                    "{prefix}{lanes} {}, {}, {}",
+                    params.rd, params.rn, params.rm
+                )
             }
             Self::SEL { params } => write!(f, "sel {}, {}, {}", params.rd, params.rn, params.rm),
             // ARMv7-M
@@ -3397,9 +3450,7 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         Instruction::TST_imm { .. } => 4,
         Instruction::TST_reg { thumb32, .. } => isize_t(*thumb32),
 
-        Instruction::UADD8 { .. } => 4,
-        //UADD16
-        //UASX
+        Instruction::PARALLEL { .. } => 4,
         Instruction::UBFX { .. } => 4,
         Instruction::UDF { thumb32, .. } => isize_t(*thumb32),
         Instruction::UDIV { .. } => 4,

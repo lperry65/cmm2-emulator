@@ -53,6 +53,22 @@ The firmware needs a few things zmu does not do, so I changed the following.
   (they were in the general list before), so an armv7m build without it treats them as undefined,
   like SEL and UADD8. PKHTB's disassembly dropped its shift (`asr #n`, `asr #32` for an immediate of
   0); it shows it now.
+- DSP extension, the 36 parallel adds and subtracts: only UADD8 ran, and the other 35 (SADD8,
+  SADD16, SASX, SSAX, SSUB8, SSUB16, the Q, SH, UQ and UH forms of the same six, UADD16, UASX, USAX,
+  USUB8 and USUB16) were decoded as undefined. Galactic Raiders stops at UQSUB8 (`fac0 f051`; a
+  reviewer first read it as UQADD8, but op1 = 100 is the subtract). They are one decoder and one
+  executor now, with the sign, the kind (plain, saturating, halving) and the lane arrangement as
+  data (`Instruction::PARALLEL`, `decoder/parallel.rs`, `executor/parallel_add.rs`), and UADD8 is
+  one of them. Only the S and U forms write GE (a byte lane one bit, a halfword lane two; the flag
+  is `>= 0`, or for an unsigned add the carry out of the lane); none touches Q. Rd, Rn or Rm as SP
+  or PC is UNPREDICTABLE and decodes as UDF; without the DSP extension they are all undefined.
+  Checked against the pseudocode on each of the A7.7 pages, and against llvm-mc over 2 million
+  opcodes of the 0xFA00 to 0xFBFF range.
+- MRS read the GE bits for SYSm 5, 6 and 7 (IPSR, EPSR, IEPSR); the manual reads the APSR bits,
+  GE included, only when SYSm<2> is 0.
+- MSR with the mask 01 (`apsr_g`) or 11 (`apsr_nzcvqg`) was decoded as a branch: the table only
+  matched mask 10. They decode now, so a program can set GE for SEL. A mask of 00, or any mask but
+  10 for a SYSm above 3, is UNPREDICTABLE and decodes as UDF.
 - Rounding to an integer (FPRoundInt, FPToFixed): they now round on the bits of the value, not on
   the `BigFloat` approximation, which keeps 40 digits and so does not hold a double with a long
   mantissa exactly (a floor of such a whole number could come back one low). The rounding modes,

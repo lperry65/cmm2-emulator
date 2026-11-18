@@ -32,6 +32,8 @@ mod misc_data_processing;
 mod multiply;
 mod packing;
 mod parallel_add;
+#[cfg(all(test, feature = "has-dsp-ext"))]
+mod parallel_add_tests;
 mod shift;
 mod signed_multiply;
 mod status_register;
@@ -624,9 +626,9 @@ impl ExecutorHelper for Processor {
             //
             // --------------------------------------------
             #[cfg(feature = "has-dsp-ext")]
-            Instruction::UADD8 { params } => self.exec_uadd8(params),
+            Instruction::PARALLEL { params, op } => self.exec_parallel(params, *op),
             #[cfg(not(feature = "has-dsp-ext"))]
-            Instruction::UADD8 { .. } => Err(Fault::UndefInstr),
+            Instruction::PARALLEL { .. } => Err(Fault::UndefInstr),
 
             // --------------------------------------------
             //

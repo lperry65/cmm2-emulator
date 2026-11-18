@@ -120,6 +120,10 @@ pub(super) fn uses_a_register_the_manual_forbids(instruction: &Instruction) -> b
                 || is_pc(params.rn)
                 || (params.wback && (params.rn == params.rt || params.rn == params.rt2))
         }
+        // A7.7.121 and the other parallel adds and subtracts: d, n or m in {13, 15}
+        Instruction::PARALLEL { params, .. } => {
+            is_bad(params.rd) || is_bad(params.rn) || is_bad(params.rm)
+        }
         Instruction::LDREX { params } => params.rt == Reg::SP || is_pc(params.rn),
         Instruction::LDREXB { params } | Instruction::LDREXH { params } => {
             params.rt == Reg::SP || is_pc(params.rn)
@@ -186,7 +190,6 @@ pub(super) fn writes_pc_as_plain_register(instruction: &Instruction) -> bool {
         Instruction::MLA { params } | Instruction::MLS { params } => is_pc(params.rd),
         Instruction::SDIV { params }
         | Instruction::UDIV { params }
-        | Instruction::UADD8 { params }
         | Instruction::SEL { params } => is_pc(params.rd),
         Instruction::SMUL { params } => is_pc(params.rd),
         Instruction::SMLA { params } => is_pc(params.rd),

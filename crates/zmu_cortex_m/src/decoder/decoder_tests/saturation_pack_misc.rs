@@ -99,12 +99,17 @@ fn test_decode_uadd8() {
     // fa82 f24c       uadd8   r2, r2, ip
     assert_eq!(
         decode_32(0xfa82_f24c),
-        Instruction::UADD8 {
+        Instruction::PARALLEL {
             params: Reg3NoSetFlagsParams {
                 rd: Reg::R2,
                 rn: Reg::R2,
                 rm: Reg::R12,
-            }
+            },
+            op: ParallelOp {
+                signed: false,
+                result: ParallelResult::Wrap,
+                lanes: ParallelLanes::Add8,
+            },
         }
     );
 }
@@ -450,4 +455,19 @@ fn test_decode_bfc_msbit_below_lsbit_is_udf() {
         }
     );
     assert_udf_32(0xf36f_7103);
+}
+
+// None of the 36 parallel adds and subtracts is there without the DSP extension.
+#[test]
+#[cfg(not(feature = "has-dsp-ext"))]
+fn test_decode_parallel_add_and_subtract_without_dsp_ext_are_udf() {
+    for op1 in [0b000, 0b001, 0b010, 0b100, 0b101, 0b110] {
+        for (unsigned, op2) in [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)] {
+            let opcode = (0xfa82_u32 | op1 << 4) << 16 | 0xf103 | unsigned << 6 | op2 << 4;
+            assert!(
+                matches!(decode_32(opcode), Instruction::UDF { .. }),
+                "{opcode:#010x}"
+            );
+        }
+    }
 }

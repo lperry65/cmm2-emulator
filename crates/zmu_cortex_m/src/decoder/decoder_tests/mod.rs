@@ -1,14 +1,16 @@
 use crate::core::instruction::{
-    BfcParams, BfiParams, BfxParams, CondBranchParams, Imm32Carry, MovtParams, ParamsRegImm32,
-    Reg2DoubleParams, Reg2FullParams, Reg2ImmCarryParams, Reg2ImmParams, Reg2Params,
-    Reg2RdRmParams, Reg2RnRmParams, Reg2RtRnImm32Params, Reg2ShiftNParams,
+    BfcParams, BfiParams, BfxParams, CondBranchParams, Imm32Carry, MovtParams, MsrParams,
+    ParamsRegImm32, Reg2DoubleParams, Reg2FullParams, Reg2ImmCarryParams, Reg2ImmParams,
+    Reg2Params, Reg2RdRmParams, Reg2RnRmParams, Reg2RtRnImm32Params, Reg2ShiftNParams,
     Reg2ShiftNoSetFlagsParams, Reg2ShiftParams, Reg2UsizeParams, Reg3FullParams,
     Reg3NoSetFlagsParams, Reg3Params, Reg3RdRtRnImm32Params, Reg3RdRtRnParams, Reg3ShiftParams,
     Reg4NoSetFlagsParams, Reg643232Params, RegImm32AddParams, RegImmCarryNoSetFlagsParams,
     RegImmCarryParams, RegImmParams, SRType, SatParams, SetFlags,
 };
 #[cfg(feature = "has-dsp-ext")]
-use crate::core::instruction::{Reg3HighParams, Reg3UsizeParams, Reg4HighParams};
+use crate::core::instruction::{
+    ParallelLanes, ParallelOp, ParallelResult, Reg3HighParams, Reg3UsizeParams, Reg4HighParams,
+};
 
 #[cfg(feature = "has-fp")]
 use crate::core::instruction::{

@@ -40,14 +40,10 @@ impl IsaStatusRegister for Processor {
                         value.set_bits(24..27, 0);
                         value.set_bits(10..16, 0);
                     }
-                    if params.sysm.get_bit(2) {
-                        // GE-only reads (e.g. APSR_g, SYSm bit 2 = 1).
-                        // Meaningful only with the DSP extension; without DSP
-                        // the GE field does not exist and reads as zero (default).
-                        #[cfg(feature = "has-dsp-ext")]
-                        value.set_bits(16..20, self.psr.value.get_bits(16..20));
-                    } else {
-                        // NZCVQ flags; with DSP extension also include GE[3:0].
+                    // The APSR bits come only with SYSm<2> == 0; SYSm 5, 6 and 7 (IPSR, EPSR,
+                    // IEPSR) have none, GE included.
+                    if !params.sysm.get_bit(2) {
+                        // NZCVQ, and GE[3:0] with the DSP extension.
                         value.set_bits(27..32, self.psr.value.get_bits(27..32));
                         #[cfg(feature = "has-dsp-ext")]
                         value.set_bits(16..20, self.psr.value.get_bits(16..20));
@@ -1447,5 +1443,43 @@ mod tests {
             !processor.psr.get_ge3(),
             "GE3 must stay clear without DSP ext"
         );
+    }
+
+    // A7.7.82 and B5.2.2: MRS reads the APSR bits (NZCVQ, and GE with the DSP extension) only when
+    // SYSm<2> is 0; the IPSR when SYSm<0> is 1; the EPSR reads as zero. So SYSm 5, 6 and 7
+    // (IPSR, EPSR, IEPSR) must not show the GE bits. NZCVQ and GE are all set, to see what leaks.
+    fn mrs_with_every_psr_field_set(sysm: u8) -> u32 {
+        let mut processor = Processor::new();
+        processor.psr.value = 0xf80f_0000;
+        processor.psr.set_isr_number(9);
+        processor.set_r(Reg::R1, 0x1234_5678);
+        processor.exec_mrs(MrsParams { rd: Reg::R1, sysm }).unwrap();
+        processor.get_r(Reg::R1)
+    }
+
+    #[test]
+    fn test_exec_mrs_ge_bits_follow_sysm_bit_2() {
+        // the GE bits exist only with the DSP extension
+        let ge = if cfg!(feature = "has-dsp-ext") {
+            0x000f_0000
+        } else {
+            0
+        };
+        let apsr = 0xf800_0000 | ge;
+        for (sysm, expected) in [
+            (0, apsr),     // APSR
+            (1, apsr | 9), // IAPSR
+            (2, apsr),     // EAPSR
+            (3, apsr | 9), // XPSR
+            (5, 9),        // IPSR
+            (6, 0),        // EPSR
+            (7, 9),        // IEPSR
+        ] {
+            assert_eq!(
+                mrs_with_every_psr_field_set(sysm),
+                expected,
+                "MRS with SYSm = {sysm}"
+            );
+        }
     }
 }

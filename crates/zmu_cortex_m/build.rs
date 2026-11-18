@@ -347,7 +347,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("11110011101011111000000000000010", "WFE_t2"),
         ("11110011101011111000000000000001", "YIELD_t2"),
         ("11110011101011111000000000000000", "NOP_t2"),
-        ("111100111000....10001000........", "MSR_reg_t1"),
+        ("111100111000....1000..00........", "MSR_reg_t1"),
         ("1111001110.0....0.........0.....", "USAT_t1"),
         ("11110011011011110.........0.....", "BFC_t1"),
         ("111100110110....0.........0.....", "BFI_t1"),
@@ -479,8 +479,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // DSP-extension-only instructions
     if cargo_feature_enabled("has-dsp-ext") {
         thumb32_entries.extend([
-            // SIMD parallel add
-            ("111110101000....1111....0100....", "UADD8_t1"),
+            // The 36 parallel adds and subtracts: op1 in hw1<6:4>, the sign in hw2<6> and the
+            // kind (plain, saturating, halving) in hw2<5:4>. The decoder refuses the unused ones.
+            ("111110101.......1111....0.......", "PARALLEL_t1"),
             // Select bytes using GE flags
             ("111110101010....1111....1000....", "SEL_t1"),
             // Halfword multiply (SMULXY)
