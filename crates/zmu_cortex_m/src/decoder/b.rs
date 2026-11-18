@@ -45,6 +45,13 @@ pub fn decode_B_t2(opcode: u16) -> Instruction {
 pub fn decode_B_t3(opcode: u32) -> Instruction {
     let cond: u16 = opcode.get_bits(22..26) as u16;
 
+    // A conditional branch has a condition other than 111x (Table A5-13, op = not x111xxx): those
+    // are the hints, MSR, MRS and the barriers, which the table matches itself, and anything else
+    // there is UNDEFINED
+    if cond >> 1 == 0b111 {
+        return super::decode_UDF_t2(opcode);
+    }
+
     let imm = build_imm_6_11(opcode);
 
     match Condition::from_u16(cond) {

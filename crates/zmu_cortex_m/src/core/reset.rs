@@ -36,6 +36,9 @@ impl Reset for Processor {
 impl Processor {
     /// `TakeReset()` (B1.5.5): the state is reset first, then the vectors are read.
     fn take_reset(&mut self) -> Result<(), Fault> {
+        // The local exclusive monitor is Open Access (ClearExclusiveLocal in TakeReset)
+        self.exclusive_tag = None;
+
         // All basic registers to zero.
         self.r0_12.fill(0);
 

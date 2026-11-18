@@ -170,6 +170,62 @@ pub struct Reg3FullParams {
     pub wback: bool,
 }
 
+/// The coprocessor instructions of Table A5-30, the second of each pair being the `2` form
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub enum CoprocKind {
+    CDP,
+    CDP2,
+    LDC,
+    LDC2,
+    MCR,
+    MCR2,
+    MCRR,
+    MCRR2,
+    MRC,
+    MRC2,
+    MRRC,
+    MRRC2,
+    STC,
+    STC2,
+}
+
+/// The loads and stores that are made as if unprivileged (A7.7.67 and the others): the address is
+/// Rn plus an 8-bit offset, and nothing is written back
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub enum UnprivilegedAccess {
+    LDRT,
+    LDRBT,
+    LDRHT,
+    LDRSBT,
+    LDRSHT,
+    STRT,
+    STRBT,
+    STRHT,
+}
+
+impl UnprivilegedAccess {
+    /// whether it is a store
+    #[must_use]
+    pub fn is_store(self) -> bool {
+        matches!(self, Self::STRT | Self::STRBT | Self::STRHT)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::LDRT => "ldrt",
+            Self::LDRBT => "ldrbt",
+            Self::LDRHT => "ldrht",
+            Self::LDRSBT => "ldrsbt",
+            Self::LDRSHT => "ldrsht",
+            Self::STRT => "strt",
+            Self::STRBT => "strbt",
+            Self::STRHT => "strht",
+        }
+    }
+}
+
 #[allow(missing_docs)]
 #[derive(PartialEq, Debug, Copy, Clone)]
 pub struct Reg2FullParams {
@@ -1482,14 +1538,28 @@ pub enum Instruction {
     LDMDB {
         params: LoadAndStoreMultipleParams,
     },
+    /// LDRT, LDRBT, LDRHT, LDRSBT, LDRSHT, STRT, STRBT and STRHT: the access is made as if the
+    /// core were unprivileged (`AccType_UNPRIV`), which only the MPU can tell from the ordinary
+    /// one. `params` has the offset added to the base, no write back
+    UNPRIVILEGED {
+        access: UnprivilegedAccess,
+        params: Reg2FullParams,
+    },
 
     // --------------------------------------------
     //
     // Group: Miscellaneous instructions
     //
     // --------------------------------------------
-    //CLREX
-    //DBG
+    /// Clear Exclusive: the local exclusive monitor goes to Open Access (A7.7.23)
+    CLREX,
+    /// Debug hint (A7.7.32): `option` is for the debug system, and does nothing to the core
+    DBG {
+        option: u8,
+    },
+    /// Consumption of Speculative Data Barrier (A7.7.31): a NOP on a core that does not speculate
+    /// on data
+    CSDB,
     /// Data Memory Barrier
     DMB,
     /// Data Synchronization Barrier
@@ -1562,41 +1632,14 @@ pub enum Instruction {
     // Group: Coprocessor instructions
     //
     // --------------------------------------------
-    //CDP, CDP2
-    MCR {
-        rt: Reg,
+    /// A coprocessor instruction for a coprocessor that this core does not have (A5.3.18,
+    /// Table A5-30): any of the 14, with the coprocessor number. It takes the `UsageFault` with
+    /// UFSR.NOCP (B1.5, A7.7.72 and the others). Those for CP10 and CP11, the floating-point
+    /// unit, are the floating-point instructions and are decoded as such, or as UDF.
+    COPROC {
+        kind: CoprocKind,
         coproc: u8,
-        opc1: u8,
-        opc2: u8,
-        crn: u8,
-        crm: u8,
     },
-    MCR2 {
-        rt: Reg,
-        coproc: u8,
-        opc1: u8,
-        opc2: u8,
-        crn: u8,
-        crm: u8,
-    },
-    //MCRR, MCRR2
-    //MRC, MRC2
-    //MRRC, MRRC2
-    LDC_imm {
-        coproc: u8,
-        imm32: u32,
-        crd: u8,
-        rn: Reg,
-    },
-
-    LDC2_imm {
-        coproc: u8,
-        imm32: u32,
-        crd: u8,
-        rn: Reg,
-    },
-
-    //STC, STC2
     UDF {
         imm32: u32,
         opcode: ThumbCode,
@@ -2294,6 +2337,9 @@ impl fmt::Display for Instruction {
                 if affect_fault { "f" } else { "" }
             ),
             Self::DMB => write!(f, "dmb"),
+            Self::CLREX => write!(f, "clrex"),
+            Self::DBG { option } => write!(f, "dbg #{option}"),
+            Self::CSDB => write!(f, "csdb"),
             Self::DSB => write!(f, "dsb"),
             Self::EOR_reg { params, thumb32 } => write!(
                 f,
@@ -2370,6 +2416,14 @@ impl fmt::Display for Instruction {
             Self::LDREX { params } => {
                 write!(f, "ldrex {}, {}, #{}", params.rt, params.rn, params.imm32)
             }
+            Self::UNPRIVILEGED { access, params } => write!(
+                f,
+                "{} {}, [{}, #{}]",
+                access.name(),
+                params.rt,
+                params.rn,
+                params.imm32
+            ),
             Self::LDREXB { params } => write!(f, "ldrexb {}, {}", params.rt, params.rn),
             Self::LDREXH { params } => write!(f, "ldrexh {}, {}", params.rt, params.rn),
 
@@ -3396,41 +3450,9 @@ impl fmt::Display for Instruction {
             Self::WFE { .. } => write!(f, "wfe"),
             Self::WFI { .. } => write!(f, "wfi"),
             Self::YIELD { .. } => write!(f, "yield"),
-            // ARMv7-M
-            Self::MCR {
-                ref rt,
-                ref coproc,
-                ref opc1,
-                ref opc2,
-                ref crn,
-                ref crm,
-            } => write!(f, "mcr"),
-
-            // ARMv7-M
-            Self::MCR2 {
-                ref rt,
-                ref coproc,
-                ref opc1,
-                ref opc2,
-                ref crn,
-                ref crm,
-            } => write!(f, "mcr2"),
-
-            // ARMv7-M
-            Self::LDC_imm {
-                ref coproc,
-                ref imm32,
-                ref crd,
-                ref rn,
-            } => write!(f, "ldc"),
-
-            // ARMv7-M
-            Self::LDC2_imm {
-                ref coproc,
-                ref imm32,
-                ref crd,
-                ref rn,
-            } => write!(f, "ldc2"),
+            Self::COPROC { kind, coproc } => {
+                write!(f, "{} p{coproc}", format!("{kind:?}").to_lowercase())
+            }
         }
     }
 }
@@ -3476,7 +3498,7 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         Instruction::CBZ { .. } => 2,
         Instruction::CBNZ { .. } => 2,
         //CDP
-        //CLREX
+        Instruction::CLREX => 4,
         Instruction::CLZ { .. } => 4,
         Instruction::CMN_imm { .. } => 4,
         Instruction::CMN_reg { thumb32, .. } => isize_t(*thumb32),
@@ -3484,6 +3506,8 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         Instruction::CMP_reg { thumb32, .. } => isize_t(*thumb32),
         Instruction::CPS { .. } => 2,
 
+        Instruction::CSDB => 4,
+        Instruction::DBG { .. } => 4,
         Instruction::DMB => 4,
         Instruction::DSB => 4,
 
@@ -3493,8 +3517,6 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         Instruction::ISB => 4,
         Instruction::IT { .. } => 2,
 
-        Instruction::LDC_imm { .. } => 4,
-        Instruction::LDC2_imm { .. } => 4,
         Instruction::LDM { thumb32, .. } => isize_t(*thumb32),
         //LDMDB
         Instruction::LDR_imm { thumb32, .. } => isize_t(*thumb32),
@@ -3503,7 +3525,7 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         Instruction::LDRB_imm { thumb32, .. } => isize_t(*thumb32),
         //LDRB_lit
         Instruction::LDRB_reg { thumb32, .. } => isize_t(*thumb32),
-        //LDRBT
+        Instruction::UNPRIVILEGED { .. } => 4,
         Instruction::LDRD_imm { .. } => 4,
         //LDRD_lit
         Instruction::LDREX { .. } => 4,
@@ -3512,11 +3534,9 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         Instruction::LDRH_imm { thumb32, .. } => isize_t(*thumb32),
         //LDRH_lit
         Instruction::LDRH_reg { thumb32, .. } => isize_t(*thumb32),
-        //LDRHT
         Instruction::LDRSB_imm { thumb32, .. } => isize_t(*thumb32),
         //LDRSB_lit
         Instruction::LDRSB_reg { thumb32, .. } => isize_t(*thumb32),
-        //LDRSBT
         Instruction::LDRSH_imm { thumb32, .. } => isize_t(*thumb32),
         //LDRSH_lit
         Instruction::LDRSH_reg { thumb32, .. } => isize_t(*thumb32),
@@ -3525,8 +3545,7 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         Instruction::LSR_imm { thumb32, .. } => isize_t(*thumb32),
         Instruction::LSR_reg { thumb32, .. } => isize_t(*thumb32),
 
-        Instruction::MCR { .. } => 4,
-        Instruction::MCR2 { .. } => 4,
+        Instruction::COPROC { .. } => 4,
         Instruction::MLA { .. } => 4,
         Instruction::MLS { .. } => 4,
         Instruction::MOV_imm { thumb32, .. } => isize_t(*thumb32),

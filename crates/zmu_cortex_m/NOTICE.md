@@ -622,6 +622,132 @@ also on, `build.rs` stops.
   ±1 s of noise), so none that shows. The real-firmware tests all pass: nothing in the firmware
   faults on alignment.
 
+- Batch 4 of issue 77, the base instructions that were missing or decoded wrongly. Each entry says
+  what was checked independently and what that could not cover.
+- CLREX (A7.7.23) was hardwired to UDF; it is `Instruction::CLREX` now, and it opens the local
+  exclusive monitor. The monitor had no state at all (`exclusive_monitors_pass` always said yes, so
+  every STREX stored and returned 0). It is now Figure A3-6 of the manual (`core/monitor.rs`,
+  `Processor::exclusive_tag`): a load-exclusive tags the word of its address and goes to Exclusive
+  Access; a store-exclusive stores and returns 0 only if the monitor is in Exclusive Access and its
+  address is in the tagged word, otherwise it stores nothing and returns 1, and either way the
+  monitor ends Open Access (Table A3-2). CLREX, exception entry (`ExceptionTaken`, B1.5.6),
+  exception return (B1.5.8) and reset (B1.5.5) open it. What the manual leaves IMPLEMENTATION
+  DEFINED and I chose: the tagged block is one word (a = 2, A3.4.3), whatever the size of the load,
+  so a STREXB to another byte of the tagged word passes; a store-exclusive to another word fails and
+  closes the monitor; an ordinary store, to the tagged word or not, does not touch the monitor
+  (Table A3-2, Store(t)); a size that does not match the load's is not tracked. The Cortex-M7 TRM
+  was not available to say which options the chip takes. Unicorn (QEMU, Cortex-M7, Thumb mode)
+  agreed on 24,000 random sequences of 2 to 10 load-exclusives, store-exclusives and CLREX on
+  matched widths (8,000 each of byte, halfword, word, no mismatch). It differs in the choices above:
+  it tags the exact address and also compares the memory value at the store, so it fails a
+  STREXB/STREXH to another byte or halfword of the tagged word (502 of 3,000 byte and 527 of 3,000
+  halfword sequences that had an alias) and fails a STREX after an ordinary store of a different
+  value to the tagged word (about 1% of 3,000 sequences per width). It cannot check exception entry
+  and return or reset (the plain Thumb mode has no exceptions of the M-profile), which the unit
+  tests check. The firmware has 68 exclusive instructions (the atomic bit set and clear loops of its
+  HAL); a failing STREX there only makes the loop retry.
+- The hint space (A5.3.4, Table A5-14, A7.7.31, A7.7.32): CSDB and every unallocated hint decoded as
+  B T3 with a condition of 111x (a taken branch with a garbage offset), and `dbg #0` as UDF. One
+  decoder now (`decoder/hint.rs`) reads op1 (hw2<10:8>, not 000 is UNDEFINED) and op2: NOP, YIELD,
+  WFE, WFI, SEV, CSDB (`Instruction::CSDB`), DBG #0 to #15 (`Instruction::DBG`), and every other op2
+  executes as a NOP. CSDB only orders speculation of data values and of the flags, which this core
+  does not do, so it has no effect (A7.7.31 makes it UNPREDICTABLE inside an IT block; it executes
+  as a NOP there too). B T3 refuses a condition of 111x (Table A5-13: a conditional branch has op =
+  not x111xxx), so no hint, MSR, MRS or barrier encoding can decode as a branch, and a hw1 with that
+  condition that is none of them is UDF. The (0) bits hw2<13> and hw2<11> of the diagrams are not
+  tested (the hint space of the table has them free); the hint space with them set is 768 opcodes,
+  of which llvm 18 and 21 reject 756 outright and soft-fail 12. hw1 0xF3A0 to 0xF3AE (the (1) bits
+  of hw1 clear) are UDF through the B T3 guard while hw2 with the (0) bits set execute as hints;
+  both are UNPREDICTABLE, so both are allowed. llvm decodes op2 0x0d, 0x0f, 0x1d, 0x2d as PACBTI,
+  BTI, PAC and AUT (Armv8.1-M), which are unallocated hints, NOPs, on Armv7-M. Unicorn: 10,120
+  vectors (every op2 but YIELD, WFE and WFI, which stop its execution loop; 40 each) with random
+  registers and flags, no mismatch. Swept against llvm-mc: hw1 0xF3AF with all 65,536 hw2, and
+  0xF3A0 to 0xF3AE with hw2 0x8000 to 0x80FF: 69,376 opcodes; no difference but the ones above, the
+  opcodes llvm calls UNPREDICTABLE (hw1 with the should-be-one bits clear, which are UDF here), and
+  hw2 with bit 15 clear, which are other instructions (USAT and USAT16 with Rn = PC).
+- LDRT, LDRBT, LDRHT, LDRSBT, LDRSHT (UDF unless Rn = PC) and STRT, STRBT, STRHT (decoded as STR
+  immediate T4 and its byte and halfword forms, which lost the unprivileged access) are
+  `Instruction::UNPRIVILEGED` (`decoder/unprivileged.rs`, `executor/load_and_store.rs`): address =
+  Rn + imm8, no write back. Rn = PC is the literal form of the load of that width (the pages say SEE
+  it) and UNDEFINED for a store; Rt = SP or PC is UNPREDICTABLE and decodes as UDF. zmu has no MPU
+  model: `peripheral/mpu.rs` is a stub whose `validate_address` accepts every address. The access
+  goes through it with `AccType::UnPriv` (as the FP state saving already does) and is then the
+  ordinary access (a real MPU needs the access type passed down to the memory access, as
+  `fp_generic.rs` does for lazy stacking, because the UNALIGN_TRP UsageFault comes before the MPU
+  check and an access crossing a region is checked in each part; that is for when it exists), which
+  is what the architecture gives in Thread mode with nPRIV set and everywhere without an MPU. The
+  rule the MPU must follow when it exists: an access made by these eight instructions is checked
+  against the permissions of an unprivileged access whatever the mode (CheckPermission, ispriv =
+  acctype != AccType_UNPRIV && FindPriv(), B2.3.8), and the MPU fault is MemManage; the default
+  memory map applies the same (B3.5, B3.5.4). Unicorn (plain Thumb mode has no privilege split, so
+  these are the ordinary accesses): 160,000 vectors, 20,000 of each of the eight, random base
+  (aligned or not), offset (0 and 255 weighted), registers (SP as base too), flags and memory;
+  registers, flags and a checksum of the memory matched in all. Swept against llvm-mc: hw1 0xF800 to
+  0xF9FF with hw2 bits 11:8 = 1110, all Rt and imm8: 2,097,152 opcodes. All 430,080 decodes as one
+  of the eight agree with llvm on name, Rt, Rn and offset; the rest of the space is the same
+  instructions as before (the other forms of the loads and stores, checked by comparing the decode
+  to the build before the change: only these eight forms and the 3,840 STRT encodings with Rt = SP,
+  which were STR, changed).
+- Coprocessor instructions (A5.3.18, Table A5-30). The table had MCR with hw2<4> clear, which is
+  CDP, so CDP and CDP2 decoded as a no-op MCR, real MCR as UDF, and VMLA and VMLS (not VNMLA and
+  VNMLS, which already fell into CDP and were UDF) as a silent no-op MCR; LDC and LDC2 (immediate)
+  were silent no-ops; MRC, MRRC, MCRR, STC, LDC (literal) and CDP were UDF. All 14 kinds
+  (`decoder/coproc.rs`, `Instruction::COPROC`) now raise `Fault::Nocp` (UsageFault with UFSR.NOCP,
+  recorded in `record_fault_status` as before) for any coprocessor number but 10 and 11. The manual:
+  only CP10 and CP11 are implemented on Armv7-M (B3.2.20), the CPACR here keeps only those two
+  fields (the rest would read back zero, which is how software tests for a coprocessor), and the
+  Cortex-M7 has no other. A coprocessor instruction for a coprocessor that does not exist or is not
+  enabled takes NOCP (A5.3.18 note); I did not find a Cortex-M7 statement about CP0 to CP7 beyond
+  that, and the TRM was not available. CP10 and CP11 with the FPU built in exist: the FP
+  instructions are decoded first, and any other encoding for those numbers decodes as `COPROC` too,
+  and the executor looks at CPACR (A2.6, A5.3.18): UFSR.UNDEFINSTR with the FPU enabled, NOCP with
+  it disabled (`exec_coprocessor`). VMLA, VMLS, VNMLA and VNMLS are such encodings until FP batch 5
+  adds them (the VMLA and VMLS half is the new behaviour; they were silent no-ops). An encoding
+  inside a pattern that an FP decoder owns and refuses (for example VLDM with P = 0, U = 0, W = 1)
+  is still UDF whatever CPACR says, as before. Without the FPU (the armv7m and armv6m builds) CP10
+  and CP11 are absent coprocessors like the rest and take NOCP; one existing test
+  (`test_resolved_overlaps_decode_as_resolved`) expected MCRR p10 to be UDF and now expects a
+  coprocessor instruction. The encodings the pages call UNDEFINED or UNPREDICTABLE decode as UDF:
+  LDC and STC with P = U = W = 0, op1 11xxxx, MCR with Rt = SP or PC, MRC with Rt = SP, MCRR and
+  MRRC with SP or PC in either (and MRRC with Rt = Rt2), STC with Rn = PC, LDC literal with W = 1 or
+  P = 0 (the architecture raises NOCP before anything else for an absent coprocessor, but
+  UNPREDICTABLE allows UDF). Swept against llvm-mc: all 2,048 hw1 of 0xEC00 to 0xEFFF and 0xFC00 to
+  0xFFFF, all 16 coprocessor numbers, Rt of 0, 1, 13 and 15 and 8 values of hw2<7:0>: 1,048,576
+  opcodes. All 567,616 decodes as a coprocessor instruction agree with llvm on kind and coprocessor
+  number; the 91,840 that llvm accepts and this tree refuses are all the UNPREDICTABLE shapes above
+  (checked by class); llvm also decodes 2,048 `stc2l p10` (unindexed 0xFC.. forms) generically.
+  FLDMX and FSTMX (VLDM and VSTM of doubles with an odd imm8, deprecated but valid, "SEE FLDMX" at
+  VLDM in A7.7, D2.3.1) were a silent no-op (FLDMX, as LDC) or UDF (FSTMX); they are now coprocessor
+  instructions that give UNDEFINSTR (FPU on) or NOCP (off). The firmware has both as real code
+  (libgcc's `__gnu_Unwind_Restore_VFP` and `__gnu_Unwind_Save_VFP`), reached only by EHABI
+  unwinding, which MMBasic does not do. FP batch 5 will implement them. The FP decode is untouched
+  (the FP tests pass unchanged); 12 FP encodings that llvm calls invalid decode as FP here, as they
+  did before. Executed on the core with CPACR at reset: every kind x 14 numbers gives CFSR.NOCP and
+  the UsageFault with registers and memory untouched.
+- MSR and MRS (B5.2.2, B5.2.3): MSR now refuses Rn = SP or PC and a SYSm outside 0 to 3, 5 to 9 and
+  16 to 20 (for any mask), and MRS refuses Rd = SP or PC and the same SYSm set; all UDF. The MRS
+  decoder also read Rd from five bits (8..13); it is four now (cosmetic: the table pattern fixes
+  hw2<12> = 0). Rd = PC is refused in `decoder/mrs.rs` only. Armv6-M has SYSm {0..3, 5..9, 16, 20}
+  and the armv6m build now uses that set (it used the v7-M one before). The SYSm 8 to 20 execution
+  (MSP, PSP, PRIMASK, BASEPRI, BASEPRI_MAX, FAULTMASK, CONTROL) was re-read against the pseudocode
+  and is right. Swept against llvm-mc (hw1 0xF380 to 0xF38F and 0xF3EF, hw2 0x8000 to 0x8FFF;
+  139,264 opcodes): every MSR and MRS this tree decodes is accepted by llvm without a warning; llvm
+  calls the remainder UNPREDICTABLE or invalid.
+- Other encodings the audit marked wrong: SSAT16 and USAT16 (batch 3), MRS and GE (batch 1a) were
+  already fixed, CSDB, STRT and the MCR family are above. I found nothing else wrong in the sweeps
+  apart from what is listed.
+- Firmware: the real firmware tests (boot to the prompt at 611,000,000 instructions and
+  1,036,007,876 cycles, the BASIC lines, the USB, SD and RTC runs) print the same instruction and
+  cycle counts (28 figures compared) before and after batch 4, and all pass; no STREX there changed
+  its result in a way that alters the flow (a failing one would loop and move the counts).
+- Mutation checks: 31 mutations of the new code (monitor, CLREX, hints, B T3, the unprivileged
+  accesses, the coprocessor decode and executor, MSR and MRS) were run against the whole unit test
+  suite; 27 were caught at once and the entry-clears-the-monitor one after a test was added. Three
+  are equivalent: the STRT Rn = PC rule in `unpredictable.rs` (the decoder already refuses it), the
+  unprivileged executor's own condition check (the ordinary executor it calls checks it, and the MPU
+  hook is a stub), and the hint executor's condition check (it only changes the result kind of a
+  skipped hint). Five planted bugs in the Unicorn comparison were all seen.
+
 `cargo clippy -p zmu_cortex_m --all-targets -- -D warnings` is clean (the crate denies
 `clippy::pedantic`; the test code had unseparated long literals, `assert!` with `==`, and a few
 casts).

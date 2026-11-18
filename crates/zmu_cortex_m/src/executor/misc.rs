@@ -1,7 +1,7 @@
 use crate::Processor;
 
 use crate::{
-    core::{condition::Condition, exception::ExceptionHandling},
+    core::{condition::Condition, exception::ExceptionHandling, monitor::Monitor},
     executor::{ExecuteSuccess, ExecutorHelper},
 };
 
@@ -9,6 +9,8 @@ use super::ExecuteResult;
 
 /// Branching operations
 pub trait IsaMisc {
+    fn exec_clrex(&mut self) -> ExecuteResult;
+    fn exec_hint(&self) -> ExecuteResult;
     fn exec_dmb(&self) -> ExecuteResult;
     fn exec_dsb(&self) -> ExecuteResult;
     fn exec_isb(&self) -> ExecuteResult;
@@ -23,6 +25,24 @@ pub trait IsaMisc {
 }
 
 impl IsaMisc for Processor {
+    /// CLREX: the local monitor goes to Open Access (A7.7.23)
+    fn exec_clrex(&mut self) -> ExecuteResult {
+        if self.condition_passed() {
+            self.clear_exclusive_monitor();
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    /// The hints that have no effect on the core: DBG, and CSDB, which only orders speculation
+    /// that this core does not do (A7.7.31, A7.7.32)
+    fn exec_hint(&self) -> ExecuteResult {
+        if self.condition_passed() {
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
     fn exec_dmb(&self) -> ExecuteResult {
         if self.condition_passed() {
             return Ok(ExecuteSuccess::Taken { cycles: 4 });

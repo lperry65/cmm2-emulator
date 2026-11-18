@@ -68,6 +68,11 @@ pub(super) fn uses_a_register_the_manual_forbids(instruction: &Instruction) -> b
         | Instruction::LDRSB_imm { params, .. }
         | Instruction::LDRSH_imm { params, .. } => params.rt == Reg::SP || clashes(params),
         Instruction::LDR_imm { params, .. } => clashes(params),
+        // A7.7.67 and the others: Rt = SP or PC is UNPREDICTABLE, and a store with Rn = PC is
+        // UNDEFINED (the loads with Rn = PC are the literal forms, which are other instructions)
+        Instruction::UNPRIVILEGED { access, params } => {
+            is_bad(params.rt) || (access.is_store() && is_pc(params.rn))
+        }
         Instruction::LDRB_reg { params, .. }
         | Instruction::LDRH_reg { params, .. }
         | Instruction::LDRSB_reg { params, .. }
@@ -243,7 +248,6 @@ pub(super) fn writes_pc_as_plain_register(instruction: &Instruction) -> bool {
         | Instruction::REVSH { params, .. } => is_pc(params.rd),
         Instruction::MOVT { params } => is_pc(params.rd),
         Instruction::SSAT { params } | Instruction::USAT { params } => is_pc(params.rd),
-        Instruction::MRS { params } => is_pc(params.rd),
 
         // loads: LDR may load PC, the others may not. Rt = PC with a plain offset is PLD,
         // decoded as such before it gets here.

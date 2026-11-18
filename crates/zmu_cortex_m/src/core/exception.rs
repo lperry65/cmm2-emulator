@@ -8,6 +8,7 @@ use crate::ProcessorMode;
 use crate::bus::Bus;
 use crate::core::bits::Bits;
 use crate::core::fault::{Fault, FaultStatusContext, RefusedReturn};
+use crate::core::monitor::Monitor;
 #[cfg(feature = "has-fp")]
 use crate::core::register::ExtensionRegOperations;
 #[cfg(feature = "has-fp")]
@@ -649,7 +650,8 @@ impl ExceptionHandlingHelpers for Processor {
         self.set_shcsr_exception_active(exception, true);
         self.execution_priority = self.get_execution_priority();
 
-        // ClearExclusiveLocal(;)
+        // ClearExclusiveLocal(): the thread's load-exclusive does not survive the handler
+        self.clear_exclusive_monitor();
         // SetEventRegister();
         // InstructionSynchronizationBarrier();
         Ok(())
@@ -1114,6 +1116,8 @@ impl ExceptionHandling for Processor {
                 self.sleeping = true;
             }
 
+            // ClearExclusiveLocal() (B1.5.8): the handler's load-exclusive does not survive either
+            self.clear_exclusive_monitor();
             self.exception_returned = true;
             Ok(())
         } else {

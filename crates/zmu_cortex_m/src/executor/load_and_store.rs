@@ -12,12 +12,13 @@ use crate::{
         fault::Fault,
         instruction::{
             Reg2DoubleParams, Reg2FullParams, Reg2RtRnImm32Params, Reg2RtRnParams, Reg3FullParams,
-            Reg3RdRtRnImm32Params, Reg3RdRtRnParams, RegImm32AddParams,
+            Reg3RdRtRnImm32Params, Reg3RdRtRnParams, RegImm32AddParams, UnprivilegedAccess,
         },
         monitor::Monitor,
         operation::{shift, sign_extend, zero_extend, zero_extend_u16},
         register::{Apsr, BaseReg, Reg},
     },
+    peripheral::mpu::{AccType, Mpu},
 };
 
 /// `CCR.UNALIGN_TRP`, bit 3 (B3.2.8).
@@ -132,9 +133,46 @@ pub trait IsaLoadAndStore {
     fn exec_strd_imm(&mut self, params: &Reg2DoubleParams) -> ExecuteResult;
 
     fn exec_ldr_lit(&mut self, params: &RegImm32AddParams) -> ExecuteResult;
+
+    fn exec_unprivileged(
+        &mut self,
+        access: UnprivilegedAccess,
+        params: &Reg2FullParams,
+    ) -> ExecuteResult;
 }
 
 impl IsaLoadAndStore for Processor {
+    /// LDRT, LDRBT, LDRHT, LDRSBT, LDRSHT, STRT, STRBT and STRHT. They differ from the ordinary
+    /// immediate loads and stores only in `AccType_UNPRIV`, which the MPU is the one to look at, so
+    /// the address goes through its hook as an unprivileged access and the rest is the ordinary
+    /// access. `Processor` has no MPU yet (`validate_address` accepts everything); the one it gets
+    /// must refuse these in privileged mode by the unprivileged regions' permissions (B3.5).
+    /// A real MPU will need the access type passed down to the memory access itself
+    /// (`MemU_unpriv`, as `fp_generic.rs` does for lazy stacking), not this one check up front: the
+    /// `UNALIGN_TRP` `UsageFault` comes before the MPU check, and an access that crosses a region
+    /// has to be checked in each part.
+    fn exec_unprivileged(
+        &mut self,
+        access: UnprivilegedAccess,
+        params: &Reg2FullParams,
+    ) -> ExecuteResult {
+        if !self.condition_passed() {
+            return Ok(ExecuteSuccess::NotTaken);
+        }
+        let address = self.get_r(params.rn).wrapping_add(params.imm32);
+        self.validate_address(address, AccType::UnPriv, access.is_store())?;
+        match access {
+            UnprivilegedAccess::LDRT => self.exec_ldr_imm(params),
+            UnprivilegedAccess::LDRBT => self.exec_ldrb_imm(params),
+            UnprivilegedAccess::LDRHT => self.exec_ldrh_imm(params),
+            UnprivilegedAccess::LDRSBT => self.exec_ldrsb_imm(params),
+            UnprivilegedAccess::LDRSHT => self.exec_ldrsh_imm(params),
+            UnprivilegedAccess::STRT => self.exec_str_imm(params),
+            UnprivilegedAccess::STRBT => self.exec_strb_imm(params),
+            UnprivilegedAccess::STRHT => self.exec_strh_imm(params),
+        }
+    }
+
     fn exec_ldr_reg(&mut self, params: &Reg3FullParams) -> ExecuteResult {
         if self.condition_passed() {
             let rm = self.get_r(params.rm);
@@ -474,7 +512,7 @@ impl IsaLoadAndStore for Processor {
 
             require_aligned(address, 3)?;
 
-            self.set_exclusive_monitors(address, 4);
+            self.set_exclusive_monitors(address);
 
             let data = self.read32_data(address)?;
             self.set_r(params.rt, data);
@@ -487,7 +525,7 @@ impl IsaLoadAndStore for Processor {
     fn exec_ldrexb(&mut self, params: Reg2RtRnParams) -> ExecuteResult {
         if self.condition_passed() {
             let address = self.get_r(params.rn);
-            self.set_exclusive_monitors(address, 1);
+            self.set_exclusive_monitors(address);
 
             let data = self.read8_data(address)?;
 
@@ -505,7 +543,7 @@ impl IsaLoadAndStore for Processor {
             let address = self.get_r(params.rn);
 
             require_aligned(address, 1)?;
-            self.set_exclusive_monitors(address, 2);
+            self.set_exclusive_monitors(address);
 
             let data = self.read16_data(address)?;
 
@@ -524,7 +562,7 @@ impl IsaLoadAndStore for Processor {
 
             require_aligned(address, 3)?;
 
-            if self.exclusive_monitors_pass(address, 4) {
+            if self.exclusive_monitors_pass(address) {
                 self.write32_data(address, self.get_r(params.rt))?;
                 self.set_r(params.rd, 0);
             } else {
@@ -543,7 +581,7 @@ impl IsaLoadAndStore for Processor {
             }
             let address = self.get_r(params.rn);
 
-            if self.exclusive_monitors_pass(address, 1) {
+            if self.exclusive_monitors_pass(address) {
                 self.write8_data(address, self.get_r(params.rt) as u8)?;
                 self.set_r(params.rd, 0);
             } else {
@@ -564,7 +602,7 @@ impl IsaLoadAndStore for Processor {
 
             require_aligned(address, 1)?;
 
-            if self.exclusive_monitors_pass(address, 2) {
+            if self.exclusive_monitors_pass(address) {
                 self.write16_data(address, self.get_r(params.rt) as u16)?;
                 self.set_r(params.rd, 0);
             } else {

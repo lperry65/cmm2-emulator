@@ -427,8 +427,9 @@ fn test_ldrd_literal_is_ldrd_with_pc_as_the_base() {
 // (RESOLVED_OVERLAPS), and do not depend on the order of a hash map.
 #[test]
 fn test_resolved_overlaps_decode_as_resolved() {
-    // VSTM with P = 0, U = 0, W = 0 is not VMOV (bit 4 clear), so it is MCRR, which is undefined
-    assert!(is_udf(&decode_32(0xec40_0a02)));
+    // VSTM with P = 0, U = 0, W = 0 is not VMOV (bit 4 clear), so it is MCRR, which no FP
+    // instruction is: a coprocessor instruction that the executor makes UNDEFINSTR or NOCP
+    assert!(matches!(decode_32(0xec40_0a02), Instruction::COPROC { .. }));
     // add sp, sp, sp is the T1 encoding
     assert!(!is_udf(&decode_16(0x44ed)));
 }
@@ -442,10 +443,11 @@ fn test_multiple_register_transfers_with_p_equal_to_u_are_undefined() {
         0xec10_0a01, // VLDM_T2
         0xec00_0b02, // VSTM_T1
         0xec10_0b02, // VLDM_T1
-        0xec51_0a01, // in the MRRC space
     ] {
         assert!(is_udf(&decode_32(opcode)), "{opcode:#010x}");
     }
+    // the MRRC space is MRRC, which no FP instruction is: a coprocessor instruction
+    assert!(matches!(decode_32(0xec51_0a01), Instruction::COPROC { .. }));
     // vstmia r0, {s0, s1} (P = 0, U = 1) and vldmdb r0!, {s0, s1} (P = 1, U = 0, W = 1) are fine
     assert!(!is_udf(&decode_32(0xec80_0a02)));
     assert!(!is_udf(&decode_32(0xed30_0a02)));

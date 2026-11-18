@@ -173,6 +173,9 @@ pub struct Processor {
     /// An exception return was made in the current instruction: an exception taken at its end is
     /// tail-chained, and the IT state it restored is not advanced.
     pub(crate) exception_returned: bool,
+    /// The local exclusive monitor (A3.4.1): the word that the last Load-Exclusive tagged while it
+    /// is in Exclusive Access, and `None` while it is Open Access.
+    pub(crate) exclusive_tag: Option<u32>,
     pub exit_code: u32,
 
     ///
@@ -395,6 +398,7 @@ impl Processor {
             boot_address: 0,
             dwt_runs_in_sleep: false,
             exception_returned: false,
+            exclusive_tag: None,
             running: true,
             exit_code: 0,
             cycle_count: 0,

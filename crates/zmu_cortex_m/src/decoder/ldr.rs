@@ -138,19 +138,6 @@ pub fn decode_LDR_reg_t2(opcode: u32) -> Instruction {
 }
 
 #[allow(non_snake_case)]
-pub fn decode_LDRBT_t1(opcode: u32) -> Instruction {
-    // Rn = PC is the literal form
-    if opcode.get_bits(16..20) == 0b1111 {
-        return super::ldrb::decode_LDRB_lit_t1(opcode);
-    }
-    Instruction::UDF {
-        imm32: 0,
-        opcode: opcode.into(),
-        thumb32: true,
-    }
-}
-
-#[allow(non_snake_case)]
 pub fn decode_LDRD_imm_t1(opcode: u32) -> Instruction {
     Instruction::LDRD_imm {
         params: Reg2DoubleParams {
@@ -212,57 +199,5 @@ pub fn decode_LDREX_t1(opcode: u32) -> Instruction {
             rn: From::from(opcode.get_bits(16..20) as u8),
             imm32: opcode.get_bits(0..8) << 2,
         },
-    }
-}
-
-#[allow(non_snake_case)]
-pub fn decode_LDRHT_t1(opcode: u32) -> Instruction {
-    // Rn = PC is the literal form
-    if opcode.get_bits(16..20) == 0b1111 {
-        return super::ldrh::decode_LDRH_lit_t1(opcode);
-    }
-    Instruction::UDF {
-        imm32: 0,
-        opcode: opcode.into(),
-        thumb32: true,
-    }
-}
-
-#[allow(non_snake_case)]
-pub fn decode_LDRSBT_t1(opcode: u32) -> Instruction {
-    // Rn = PC is the literal form
-    if opcode.get_bits(16..20) == 0b1111 {
-        return super::ldrsb::decode_LDRSB_lit_t1(opcode);
-    }
-    Instruction::UDF {
-        imm32: 0,
-        opcode: opcode.into(),
-        thumb32: true,
-    }
-}
-
-#[allow(non_snake_case)]
-pub fn decode_LDRSHT(opcode: u32) -> Instruction {
-    // Rn = PC is the literal form
-    if opcode.get_bits(16..20) == 0b1111 {
-        return super::ldrsh::decode_LDRSH_lit_t1(opcode);
-    }
-    Instruction::UDF {
-        imm32: 0,
-        opcode: opcode.into(),
-        thumb32: true,
-    }
-}
-
-#[allow(non_snake_case)]
-pub fn decode_LDRT_t1(opcode: u32) -> Instruction {
-    // Rn = PC is the literal form
-    if opcode.get_bits(16..20) == 0b1111 {
-        return decode_LDR_lit_t2(opcode);
-    }
-    Instruction::UDF {
-        imm32: 0,
-        opcode: opcode.into(),
-        thumb32: true,
     }
 }

@@ -21,6 +21,8 @@ use crate::{CachedInstruction, Processor};
 mod address_wrap_tests;
 mod branch;
 mod coproc;
+#[cfg(all(test, not(feature = "armv6m")))]
+mod coprocessor_tests;
 mod divide;
 #[cfg(test)]
 mod dsp_test_support;
@@ -31,12 +33,16 @@ mod dual_multiply_tests;
 mod exception;
 #[cfg(all(test, not(feature = "armv6m")))]
 mod exception_return_tests;
+#[cfg(all(test, not(feature = "armv6m")))]
+mod exclusive_monitor_tests;
 #[cfg(feature = "has-dsp-ext")]
 mod extend16;
 #[cfg(all(test, feature = "has-dsp-ext"))]
 mod extend16_tests;
 #[cfg(test)]
 mod guest_never_panics_tests;
+#[cfg(test)]
+mod hint_tests;
 #[cfg(test)]
 mod ldmdb_tests;
 mod load_and_store;
@@ -76,6 +82,8 @@ mod std_data_processing;
 mod sum_abs_diff;
 #[cfg(all(test, feature = "has-dsp-ext"))]
 mod sum_abs_diff_tests;
+#[cfg(all(test, not(feature = "armv6m")))]
+mod unprivileged_tests;
 #[cfg(feature = "has-dsp-ext")]
 mod word_multiply;
 #[cfg(all(test, feature = "has-dsp-ext"))]
@@ -835,6 +843,7 @@ impl ExecutorHelper for Processor {
             Instruction::LDRD_imm { params } => self.exec_ldrd_imm(params),
 
             Instruction::LDR_lit { params, .. } => self.exec_ldr_lit(params),
+            Instruction::UNPRIVILEGED { access, params } => self.exec_unprivileged(*access, params),
 
             // --------------------------------------------
             //
@@ -858,6 +867,8 @@ impl ExecutorHelper for Processor {
             // Group: Miscellaneous
             //
             // --------------------------------------------
+            Instruction::CLREX => self.exec_clrex(),
+            Instruction::DBG { .. } | Instruction::CSDB => self.exec_hint(),
             Instruction::DMB => self.exec_dmb(),
             Instruction::DSB => self.exec_dsb(),
             Instruction::ISB => self.exec_isb(),
@@ -890,10 +901,7 @@ impl ExecutorHelper for Processor {
             // Group: Coprocessor instructions
             //
             // --------------------------------------------
-            Instruction::MCR { .. } => self.exec_mcr(),
-            Instruction::MCR2 { .. } => self.exec_mcr2(),
-            Instruction::LDC_imm { .. } => self.exec_ldc_imm(),
-            Instruction::LDC2_imm { .. } => self.exec_ldc2_imm(),
+            Instruction::COPROC { coproc, .. } => self.exec_coprocessor(*coproc),
             // --------------------------------------------
             //
             // Group: Floating-point load and store instructions

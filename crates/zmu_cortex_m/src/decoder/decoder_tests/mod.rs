@@ -27,15 +27,18 @@ use super::*;
 use crate::core::register::Reg;
 
 mod branch_control;
+mod coprocessor;
 mod data_proc;
 #[cfg(feature = "has-fp")]
 mod floating_point;
 #[cfg(feature = "has-fp")]
 mod fp_registers;
 mod fundamentals;
+mod hints;
 mod load_store;
 mod multiply_divide;
 mod saturation_pack_misc;
+mod special_registers;
 mod system_barrier;
 mod unpredictable;
 

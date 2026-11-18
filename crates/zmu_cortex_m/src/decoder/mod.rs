@@ -17,7 +17,6 @@ mod bfc;
 mod bfi;
 mod cbz;
 mod clrex;
-mod dbg;
 mod sbfx;
 mod ssat;
 mod ubfx;
@@ -44,7 +43,7 @@ mod bx;
 mod clz;
 mod cmn;
 mod cmp;
-mod cpd;
+mod coproc;
 mod cps;
 
 mod dmb;
@@ -53,11 +52,11 @@ mod dsb;
 mod eor;
 #[cfg(feature = "has-dsp-ext")]
 mod extend16;
+mod hint;
 
 mod isb;
 mod it;
 
-mod ldc;
 mod ldm;
 mod ldr;
 mod ldrb;
@@ -69,7 +68,6 @@ mod long_multiply;
 mod lsl;
 mod lsr;
 
-mod mcr;
 mod mla;
 mod mls;
 mod mov;
@@ -118,7 +116,6 @@ mod smul;
 mod smull;
 #[cfg(feature = "has-dsp-ext")]
 mod smulw;
-mod stc;
 mod stm;
 mod str;
 mod strex;
@@ -134,6 +131,7 @@ mod movt;
 mod udiv;
 mod umlal;
 mod umull;
+mod unprivileged;
 #[cfg(feature = "has-dsp-ext")]
 mod usad8;
 mod uxt;
@@ -216,21 +214,25 @@ use {
         decode_CMP_imm_t1, decode_CMP_imm_t2, decode_CMP_reg_t1, decode_CMP_reg_t2,
         decode_CMP_reg_t3,
     },
-    cpd::{decode_CDP_t1, decode_CDP2_t2},
+    coproc::{
+        decode_CDP_t1, decode_CDP2_t2, decode_LDC_imm_t1, decode_LDC_lit_t1, decode_LDC2_imm_t2,
+        decode_LDC2_lit_t2, decode_MCR_t1, decode_MCR2_t2, decode_MCRR_t1, decode_MCRR2_t2,
+        decode_MRC_t1, decode_MRC2_t2, decode_MRRC_t1, decode_MRRC2_t2, decode_STC_t1,
+        decode_STC2_t2,
+    },
     cps::decode_CPS_t1,
-    dbg::decode_DBG_t1,
     dmb::decode_DMB_t1,
     dsb::decode_DSB_t1,
     eor::{decode_EOR_imm_t1, decode_EOR_reg_t1, decode_EOR_reg_t2},
+    hint::decode_HINT_t1,
     isb::decode_ISB_t1,
     it::decode_IT_t1,
-    ldc::{decode_LDC_imm_t1, decode_LDC_lit_t1, decode_LDC2_imm_t2, decode_LDC2_lit_t2},
     ldm::{decode_LDM_t1, decode_LDM_t2, decode_LDMDB_t1},
     ldr::{
         decode_LDR_imm_t1, decode_LDR_imm_t2, decode_LDR_imm_t3, decode_LDR_imm_t4,
         decode_LDR_lit_t1, decode_LDR_lit_t2, decode_LDR_reg_t1, decode_LDR_reg_t2,
-        decode_LDRBT_t1, decode_LDRD_imm_t1, decode_LDRD_lit_t1, decode_LDREX_t1, decode_LDREXB_t1,
-        decode_LDREXH_t1, decode_LDRHT_t1, decode_LDRSBT_t1, decode_LDRSHT, decode_LDRT_t1,
+        decode_LDRD_imm_t1, decode_LDRD_lit_t1, decode_LDREX_t1, decode_LDREXB_t1,
+        decode_LDREXH_t1,
     },
     ldrb::{
         decode_LDRB_imm_t1, decode_LDRB_imm_t2, decode_LDRB_imm_t3, decode_LDRB_lit_t1,
@@ -250,10 +252,6 @@ use {
     },
     lsl::{decode_LSL_imm_t2, decode_LSL_reg_t1, decode_LSL_reg_t2},
     lsr::{decode_LSR_imm_t1, decode_LSR_imm_t2, decode_LSR_reg_t1, decode_LSR_reg_t2},
-    mcr::{
-        decode_MCR_t1, decode_MCR2_t2, decode_MCRR_t1, decode_MCRR2_t2, decode_MRC_t1,
-        decode_MRC2_t2,
-    },
     mla::decode_MLA_t1,
     mls::decode_MLS_t1,
     mov::{
@@ -265,7 +263,7 @@ use {
     msr::decode_MSR_reg_t1,
     mul::{decode_MUL_t1, decode_MUL_t2},
     mvn::{decode_MVN_imm_t1, decode_MVN_reg_t1, decode_MVN_reg_t2},
-    nop::{decode_NOP_t1, decode_NOP_t2},
+    nop::decode_NOP_t1,
     orn::{decode_ORN_imm_t1, decode_ORN_reg_t1},
     orr::{decode_ORR_imm_t1, decode_ORR_reg_t1, decode_ORR_reg_t2},
     pld::{decode_PLD_imm_t1, decode_PLD_imm_t2, decode_PLD_lit_t1, decode_PLD_reg_t1},
@@ -283,11 +281,10 @@ use {
     sbc::{decode_SBC_imm_t1, decode_SBC_reg_t1, decode_SBC_reg_t2},
     sbfx::decode_SBFX_t1,
     sdiv::decode_SDIV_t1,
-    sev::{decode_SEV_t1, decode_SEV_t2},
+    sev::decode_SEV_t1,
     smlal::decode_SMLAL_t1,
     smull::decode_SMULL_t1,
     ssat::decode_SSAT_t1,
-    stc::{decode_STC_t1, decode_STC2_t2},
     stm::{decode_STM_t1, decode_STM_t2, decode_STMDB_t1},
     strex::{decode_STREX_t1, decode_STREXB_t1, decode_STREXH_t1},
     sub::{
@@ -304,11 +301,15 @@ use {
     udiv::decode_UDIV_t1,
     umlal::decode_UMLAL_t1,
     umull::decode_UMULL_t1,
+    unprivileged::{
+        decode_LDRBT_t1, decode_LDRHT_t1, decode_LDRSBT_t1, decode_LDRSHT_t1, decode_LDRT_t1,
+        decode_STRBT_t1, decode_STRHT_t1, decode_STRT_t1,
+    },
     usat::decode_USAT_t1,
     uxt::{decode_UXTB_t1, decode_UXTB_t2, decode_UXTH_t1, decode_UXTH_t2},
-    wfe::{decode_WFE_t1, decode_WFE_t2},
-    wfi::{decode_WFI_t1, decode_WFI_t2},
-    yield_::{decode_YIELD_t1, decode_YIELD_t2},
+    wfe::decode_WFE_t1,
+    wfi::decode_WFI_t1,
+    yield_::decode_YIELD_t1,
 };
 
 #[cfg(feature = "has-dsp-ext")]
