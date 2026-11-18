@@ -8,7 +8,7 @@ use cmm2_core::{Cpu, Firmware, Irqs, cmm2_memory};
 
 // A directory under the temp directory that is this test's own.
 pub(crate) fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("cmm2-main-{}-{name}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("cmm2-main-{}-{name}", crate::run_id::run_id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir(&dir).unwrap();
     dir

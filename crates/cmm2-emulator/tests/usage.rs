@@ -4,9 +4,8 @@ mod common;
 
 use common::*;
 use std::path::PathBuf;
-use std::process::Command;
 
-const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--console-keys] [--unpaced] [--flash <file>] [--sd <file>] [--rng-seed <number>]";
+const USAGE: &str = "usage: cmm2-emulator [--firmware <file>] [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--console-keys] [--unpaced] [--flash <file>] [--sd <file> | --no-sd] [--burn <file>] [--rng-seed <number>] | --version | --lookup <address>";
 
 // Writes a file with the given vector table words to a unique temp path.
 fn temp_firmware(name: &str, sp: u32, reset: u32) -> PathBuf {
@@ -20,7 +19,7 @@ fn temp_firmware(name: &str, sp: u32, reset: u32) -> PathBuf {
 
 #[test]
 fn version_flag_prints_name_and_version() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let output = emulator()
         .arg("--version")
         .output()
         .expect("failed to run cmm2-emulator");
@@ -34,7 +33,7 @@ fn version_flag_prints_name_and_version() {
 
 #[test]
 fn unknown_argument_is_rejected() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let output = emulator()
         .arg("--bogus")
         .output()
         .expect("failed to run cmm2-emulator");
@@ -44,20 +43,6 @@ fn unknown_argument_is_rejected() {
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
         format!("cmm2-emulator: unknown argument '--bogus'\n{USAGE}\n")
-    );
-}
-
-#[test]
-fn no_arguments_prints_usage() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
-        .output()
-        .expect("failed to run cmm2-emulator");
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        format!("{USAGE}\n")
     );
 }
 
@@ -197,9 +182,32 @@ fn console_keys_without_the_window_is_a_usage_error() {
 
 #[test]
 fn bad_run_options_are_usage_errors() {
-    let cases: [(&[&str], &str); 15] = [
-        (&["--run", "10"], "--run needs --firmware"),
-        (&["--trace-from", "5"], "--trace-from needs --firmware"),
+    let cases: [(&[&str], &str); 17] = [
+        (
+            &["--trace-from", "5"],
+            "--trace-from needs --trace or --trace-mmio",
+        ),
+        (
+            &["--burn", "a", "--firmware", "b", "--run", "9"],
+            "--burn puts the firmware on the board and --firmware runs one that is not on it, \
+             not both",
+        ),
+        (
+            &["--firmware", "f", "--console", "--no-sd"],
+            "--no-sd is for the board, which --firmware does not use",
+        ),
+        (
+            &["--burn", "a", "--burn", "b"],
+            "--burn is given twice, which one is meant?",
+        ),
+        (
+            &["--firmware", "a", "--firmware", "b", "--run", "9"],
+            "unknown argument '--firmware'",
+        ),
+        (
+            &["--sd", "c", "--no-sd"],
+            "--sd puts a card in the socket and --no-sd takes it out, not both",
+        ),
         (&["--firmware", "f", "--trace-from"], ""),
         (
             &["--firmware", "f", "--trace-from", "abc"],
@@ -213,8 +221,6 @@ fn bad_run_options_are_usage_errors() {
             &["--firmware", "f", "--trace-from", "5"],
             "--trace-from needs --trace or --trace-mmio",
         ),
-        (&["--stop-at", "0x1000"], "--stop-at needs --firmware"),
-        (&["--trace-mmio"], "--trace-mmio needs --firmware"),
         (&["--firmware", "f", "--run"], ""),
         (&["--firmware", "f", "--run", "abc"], "bad count 'abc'"),
         (&["--firmware", "f", "--run", "0x"], "bad count '0x'"),
@@ -266,9 +272,8 @@ fn trace_without_anything_to_run_is_a_usage_error() {
 
 #[test]
 fn bad_console_options_are_usage_errors() {
-    let cases: [(&[&str], &str); 6] = [
-        (&["--console"], "--console needs --firmware"),
-        (&["--on", "a", "b"], "--on needs --firmware"),
+    let cases: [(&[&str], &str); 5] = [
+        (&["--on", "a", "b"], "--on needs --console"),
         (
             &["--firmware", "f", "--run", "1", "--on", "a", "b"],
             "--on needs --console",
@@ -314,4 +319,15 @@ fn an_empty_file_name_is_a_usage_error_for_every_file_option() {
             "{option}"
         );
     }
+}
+
+#[test]
+fn an_empty_firmware_name_is_loaded_and_fails_there_as_it_did() {
+    let output = run(&["--firmware", ""]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).starts_with("cmm2-emulator: : "),
+        "{}",
+        stderr(&output)
+    );
 }

@@ -2,18 +2,30 @@
 
 use std::fmt;
 
-pub const USAGE: &str = "usage: cmm2-emulator --version | --lookup <address> | --firmware <file> [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--console-keys] [--unpaced] [--flash <file>] [--sd <file>] [--rng-seed <number>]";
+pub const USAGE: &str = "usage: cmm2-emulator [--firmware <file>] [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--console-keys] [--unpaced] [--flash <file>] [--sd <file> | --no-sd] [--burn <file>] [--rng-seed <number>] | --version | --lookup <address>";
 
+// One of these is made per process, so the size of the run variant costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Version,
     Lookup(u32),
-    /// Print the vector table.
+    /// Print the vector table of a firmware image: `--firmware` alone.
     Vectors(String),
     Run {
-        firmware: String,
+        start: Start,
         options: RunOptions,
     },
+}
+
+/// Which machine a run is of.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Start {
+    /// The board, as it was last left: no `--firmware`.
+    Board,
+    /// A scratch machine from the image in the file named by `--firmware`: nothing of the board
+    /// is read or written, and `--flash` and `--sd` are its only files.
+    File(String),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -31,6 +43,9 @@ pub struct RunOptions {
     pub screenshot: Option<String>,
     /// Show the screen in a window while the guest runs.
     pub window: bool,
+    /// The window is on because the board's start has one unless told otherwise, and not
+    /// because `--window` was given.
+    pub window_by_default: bool,
     /// The window's keys go to the console, as bytes, and not to the USB keyboard.
     pub console_keys: bool,
     /// Run the live modes as fast as the host allows, not at the machine's own speed.
@@ -41,6 +56,10 @@ pub struct RunOptions {
     /// A card image for the SD socket, which has to exist already and is written back at the
     /// end if the guest changed the card.
     pub sd: Option<String>,
+    /// Takes the card out of the socket, so that the board no longer remembers one.
+    pub no_sd: bool,
+    /// An image to burn onto the board before it starts: copied into the board's directory.
+    pub burn: Option<String>,
     /// Fixes the RNG's values, so that a run repeats; without it they come from the host's
     /// entropy and differ from run to run, as the chip's do.
     pub rng_seed: Option<u64>,
@@ -61,7 +80,10 @@ pub enum ArgError {
     BadCount(String),
     BadSeed(String),
     BadAddress(String),
-    NeedsFirmware(String),
+    /// An option that is only for the board, with `--firmware`, which is a machine of its own.
+    BoardOnly(String),
+    /// `--burn` puts a firmware on the board and `--firmware` runs one that is not on it.
+    BurnAndFirmware,
     NeedsConsole(String),
     NeedsWindow(String),
     ConsoleMmioNeedsFile,
@@ -69,6 +91,10 @@ pub enum ArgError {
     BadKeys(String),
     /// A file option was given an empty name, as an unset shell variable gives.
     EmptyName(String),
+    /// `--sd` puts a card in and `--no-sd` takes it out, so both is a contradiction.
+    SdAndNoSd,
+    /// An option that names the one file that a run burns, given twice.
+    Repeated(String),
     NothingToRun,
 }
 
@@ -80,9 +106,15 @@ impl fmt::Display for ArgError {
             ArgError::BadCount(arg) => writeln!(f, "cmm2-emulator: bad count '{arg}'")?,
             ArgError::BadSeed(arg) => writeln!(f, "cmm2-emulator: bad seed '{arg}'")?,
             ArgError::BadAddress(arg) => writeln!(f, "cmm2-emulator: bad address '{arg}'")?,
-            ArgError::NeedsFirmware(option) => {
-                writeln!(f, "cmm2-emulator: {option} needs --firmware")?
-            }
+            ArgError::BoardOnly(option) => writeln!(
+                f,
+                "cmm2-emulator: {option} is for the board, which --firmware does not use"
+            )?,
+            ArgError::BurnAndFirmware => writeln!(
+                f,
+                "cmm2-emulator: --burn puts the firmware on the board and --firmware runs one \
+                 that is not on it, not both"
+            )?,
             ArgError::NeedsConsole(option) => {
                 writeln!(f, "cmm2-emulator: {option} needs --console")?
             }
@@ -100,9 +132,17 @@ impl fmt::Display for ArgError {
                 f,
                 "cmm2-emulator: {option} needs a file name, not an empty one"
             )?,
+            ArgError::Repeated(option) => writeln!(
+                f,
+                "cmm2-emulator: {option} is given twice, which one is meant?"
+            )?,
             ArgError::NothingToRun => {
                 writeln!(f, "cmm2-emulator: nothing to run, give --run or --stop-at")?
             }
+            ArgError::SdAndNoSd => writeln!(
+                f,
+                "cmm2-emulator: --sd puts a card in the socket and --no-sd takes it out, not both"
+            )?,
         }
         write!(f, "{USAGE}")
     }
@@ -111,38 +151,54 @@ impl fmt::Display for ArgError {
 impl std::error::Error for ArgError {}
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, ArgError> {
-    let mut args = args.into_iter();
-    match args.next().as_deref() {
-        None => Err(ArgError::Usage),
+    let args: Vec<String> = args.into_iter().collect();
+    let second = || args.get(1).ok_or(ArgError::Usage);
+    match args.first().map(String::as_str) {
         Some("--version") => Ok(Command::Version),
-        Some("--lookup") => {
-            let arg = args.next().ok_or(ArgError::Usage)?;
-            parse_address(&arg).map(Command::Lookup)
-        }
-        Some("--firmware") => {
-            let firmware = args.next().ok_or(ArgError::Usage)?;
-            let options = parse_run_options(args)?;
-            if options == RunOptions::default() {
-                return Ok(Command::Vectors(firmware));
-            }
-            check_console(&options)?;
-            check_trace_from(&options)?;
-            if !options.console
-                && !options.window
-                && options.run.is_none()
-                && options.stop_at.is_none()
-            {
-                return Err(ArgError::NothingToRun);
-            }
-            Ok(Command::Run { firmware, options })
-        }
-        Some(
-            option @ ("--run" | "--stop-at" | "--trace" | "--trace-mmio" | "--trace-from"
-            | "--console" | "--on" | "--screenshot" | "--window" | "--console-keys"
-            | "--unpaced" | "--flash" | "--sd" | "--rng-seed"),
-        ) => Err(ArgError::NeedsFirmware(option.to_string())),
-        Some(arg) => Err(ArgError::Unknown(arg.to_string())),
+        Some("--lookup") => parse_address(second()?).map(Command::Lookup),
+        _ => parse_run(args),
     }
+}
+
+/// A run of the board (no `--firmware`), or of the image that `--firmware` names, which is a
+/// machine of its own whatever else is on the line.
+fn parse_run(args: Vec<String>) -> Result<Command, ArgError> {
+    let (firmware, mut options) = parse_run_options(args.into_iter())?;
+    if firmware.is_some() && options.burn.is_some() {
+        return Err(ArgError::BurnAndFirmware);
+    }
+    if options.sd.is_some() && options.no_sd {
+        return Err(ArgError::SdAndNoSd);
+    }
+    let Some(file) = firmware else {
+        // Switching a board on shows its screen, unless the run is for a terminal (`--console`)
+        // or for a number of instructions or an address (`--run`, `--stop-at`).
+        if !options.console && options.run.is_none() && options.stop_at.is_none() {
+            options.window_by_default = !options.window;
+            options.window = true;
+        }
+        check_console(&options)?;
+        check_trace_from(&options)?;
+        return Ok(Command::Run {
+            start: Start::Board,
+            options,
+        });
+    };
+    if options.no_sd {
+        return Err(ArgError::BoardOnly("--no-sd".to_string()));
+    }
+    if options == RunOptions::default() {
+        return Ok(Command::Vectors(file));
+    }
+    check_console(&options)?;
+    check_trace_from(&options)?;
+    if !options.console && !options.window && options.run.is_none() && options.stop_at.is_none() {
+        return Err(ArgError::NothingToRun);
+    }
+    Ok(Command::Run {
+        start: Start::File(file),
+        options,
+    })
 }
 
 /// The value of a file option, which has to be there and cannot be empty (an unset shell
@@ -155,10 +211,19 @@ fn file_name(args: &mut impl Iterator<Item = String>, option: &str) -> Result<St
     }
 }
 
-fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOptions, ArgError> {
+fn parse_run_options(
+    mut args: impl Iterator<Item = String>,
+) -> Result<(Option<String>, RunOptions), ArgError> {
     let mut options = RunOptions::default();
+    let mut firmware = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            // A second `--firmware` is "unknown", as it was before `--firmware` could come
+            // anywhere, and an empty name is loaded (and fails) as it was; `--burn`, which is new,
+            // says what is wrong.
+            "--firmware" if firmware.is_some() => return Err(ArgError::Unknown(arg)),
+            "--firmware" => firmware = Some(args.next().ok_or(ArgError::Usage)?),
+            "--burn" if options.burn.is_some() => return Err(ArgError::Repeated(arg)),
             "--run" => options.run = Some(parse_count(&args.next().ok_or(ArgError::Usage)?)?),
             "--stop-at" => {
                 options.stop_at = Some(parse_address(&args.next().ok_or(ArgError::Usage)?)?)
@@ -174,6 +239,8 @@ fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOption
             "--unpaced" => options.unpaced = true,
             "--flash" => options.flash = Some(file_name(&mut args, "--flash")?),
             "--sd" => options.sd = Some(file_name(&mut args, "--sd")?),
+            "--no-sd" => options.no_sd = true,
+            "--burn" => options.burn = Some(file_name(&mut args, "--burn")?),
             "--rng-seed" => {
                 let seed = args.next().ok_or(ArgError::Usage)?;
                 options.rng_seed = Some(parse_count(&seed).map_err(|_| ArgError::BadSeed(seed))?)
@@ -187,7 +254,7 @@ fn parse_run_options(mut args: impl Iterator<Item = String>) -> Result<RunOption
             _ => return Err(ArgError::Unknown(arg)),
         }
     }
-    Ok(options)
+    Ok((firmware, options))
 }
 
 fn check_console(options: &RunOptions) -> Result<(), ArgError> {
@@ -275,7 +342,7 @@ mod tests {
     #[test]
     fn run_options_come_in_any_order() {
         let want = Command::Run {
-            firmware: "f.bin".into(),
+            start: Start::File("f.bin".into()),
             options: RunOptions {
                 run: Some(0x10),
                 stop_at: Some(0x0800_0100),
@@ -328,7 +395,7 @@ mod tests {
     #[test]
     fn console_runs_without_a_limit() {
         let want = Command::Run {
-            firmware: "f.bin".into(),
+            start: Start::File("f.bin".into()),
             options: RunOptions {
                 console: true,
                 ..RunOptions::default()
@@ -383,7 +450,7 @@ mod tests {
         assert_eq!(
             parse_args(&["--firmware", "f", "--window"]),
             Ok(Command::Run {
-                firmware: "f".into(),
+                start: Start::File("f".into()),
                 options: RunOptions {
                     window: true,
                     ..RunOptions::default()
@@ -391,14 +458,6 @@ mod tests {
             })
         );
         assert!(!run_options(&["--run", "9"]).window);
-    }
-
-    #[test]
-    fn window_needs_the_firmware() {
-        assert_eq!(
-            parse_args(&["--window"]),
-            Err(ArgError::NeedsFirmware("--window".into()))
-        );
     }
 
     #[test]
@@ -428,14 +487,6 @@ mod tests {
     }
 
     #[test]
-    fn console_keys_needs_the_firmware() {
-        assert_eq!(
-            parse_args(&["--console-keys"]),
-            Err(ArgError::NeedsFirmware("--console-keys".into()))
-        );
-    }
-
-    #[test]
     fn rng_seed_takes_a_decimal_or_hex_number() {
         assert_eq!(
             run_options(&["--console", "--rng-seed", "42"]).rng_seed,
@@ -461,14 +512,6 @@ mod tests {
     }
 
     #[test]
-    fn rng_seed_needs_the_firmware() {
-        assert_eq!(
-            parse_args(&["--rng-seed", "1"]),
-            Err(ArgError::NeedsFirmware("--rng-seed".into()))
-        );
-    }
-
-    #[test]
     fn rng_seed_alone_has_nothing_to_run() {
         assert_eq!(
             parse_args(&["--firmware", "f", "--rng-seed", "1"]),
@@ -480,14 +523,6 @@ mod tests {
     fn unpaced_turns_the_pacing_off() {
         assert!(run_options(&["--console", "--unpaced"]).unpaced);
         assert!(!run_options(&["--console"]).unpaced);
-    }
-
-    #[test]
-    fn unpaced_needs_the_firmware() {
-        assert_eq!(
-            parse_args(&["--unpaced"]),
-            Err(ArgError::NeedsFirmware("--unpaced".into()))
-        );
     }
 
     #[test]
@@ -510,14 +545,6 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_needs_the_firmware() {
-        assert_eq!(
-            parse_args(&["--screenshot", "s.ppm"]),
-            Err(ArgError::NeedsFirmware("--screenshot".into()))
-        );
-    }
-
-    #[test]
     fn screenshot_alone_has_nothing_to_run() {
         assert_eq!(
             parse_args(&["--firmware", "f", "--screenshot", "s.ppm"]),
@@ -533,14 +560,6 @@ mod tests {
         assert_eq!(
             parse_args(&["--firmware", "f", "--run", "9", "--flash"]),
             Err(ArgError::Usage)
-        );
-    }
-
-    #[test]
-    fn flash_needs_the_firmware() {
-        assert_eq!(
-            parse_args(&["--flash", "f.flash"]),
-            Err(ArgError::NeedsFirmware("--flash".into()))
         );
     }
 
@@ -582,14 +601,6 @@ mod tests {
     }
 
     #[test]
-    fn sd_needs_the_firmware() {
-        assert_eq!(
-            parse_args(&["--sd", "card.img"]),
-            Err(ArgError::NeedsFirmware("--sd".into()))
-        );
-    }
-
-    #[test]
     fn sd_alone_has_nothing_to_run() {
         assert_eq!(
             parse_args(&["--firmware", "f", "--sd", "card.img"]),
@@ -615,27 +626,6 @@ mod tests {
             parse_args(&["--firmware", "f", "--run", "1", "--on", "a", "b"]),
             Err(ArgError::NeedsConsole("--on".into()))
         );
-    }
-
-    #[test]
-    fn console_and_on_need_the_firmware() {
-        assert_eq!(
-            parse_args(&["--console"]),
-            Err(ArgError::NeedsFirmware("--console".into()))
-        );
-        assert_eq!(
-            parse_args(&["--on", "a", "b"]),
-            Err(ArgError::NeedsFirmware("--on".into()))
-        );
-    }
-
-    fn run_options(args: &[&str]) -> RunOptions {
-        let mut all = vec!["--firmware", "f"];
-        all.extend_from_slice(args);
-        match parse_args(&all) {
-            Ok(Command::Run { options, .. }) => options,
-            other => panic!("not a run: {other:?}"),
-        }
     }
 
     #[test]
@@ -684,18 +674,6 @@ mod tests {
     }
 
     #[test]
-    fn trace_from_needs_a_trace() {
-        assert_eq!(
-            parse_args(&["--firmware", "f", "--run", "9", "--trace-from", "5"]),
-            Err(ArgError::TraceFromNeedsTrace)
-        );
-        assert_eq!(
-            parse_args(&["--trace-from", "5"]),
-            Err(ArgError::NeedsFirmware("--trace-from".into()))
-        );
-    }
-
-    #[test]
     fn a_bad_key_escape_is_reported_with_its_option_value() {
         assert_eq!(
             parse_args(&["--firmware", "f", "--console", "--on", "a", "\\q"]),
@@ -725,5 +703,217 @@ mod tests {
         for bad in ["\\q", "\\x4", "\\x", "\\xZZ", "ab\\"] {
             assert_eq!(parse_keys(bad), Err(ArgError::BadKeys(bad.into())), "{bad}");
         }
+    }
+
+    fn run_options(args: &[&str]) -> RunOptions {
+        let mut all = vec!["--firmware", "f"];
+        all.extend_from_slice(args);
+        match parse_args(&all) {
+            Ok(Command::Run { options, .. }) => options,
+            other => panic!("not a run: {other:?}"),
+        }
+    }
+
+    fn board_options(args: &[&str]) -> RunOptions {
+        match parse_args(args) {
+            Ok(Command::Run {
+                start: Start::Board,
+                options,
+            }) => options,
+            other => panic!("not a board run: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trace_from_needs_a_trace() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--run", "9", "--trace-from", "5"]),
+            Err(ArgError::TraceFromNeedsTrace)
+        );
+        assert_eq!(
+            parse_args(&["--trace-from", "5"]),
+            Err(ArgError::TraceFromNeedsTrace)
+        );
+    }
+
+    #[test]
+    fn no_arguments_start_the_board_with_its_window() {
+        let options = board_options(&[]);
+        assert_eq!(
+            options,
+            RunOptions {
+                window: true,
+                window_by_default: true,
+                ..RunOptions::default()
+            }
+        );
+    }
+
+    #[test]
+    fn only_a_window_nobody_asked_for_is_by_default() {
+        assert!(board_options(&[]).window_by_default);
+        assert!(board_options(&["--unpaced"]).window_by_default);
+        for args in [&["--window"][..], &["--window", "--unpaced"]] {
+            let options = board_options(args);
+            assert!(options.window && !options.window_by_default, "{args:?}");
+        }
+        for args in [
+            &["--console"][..],
+            &["--run", "9"],
+            &["--console", "--window"],
+        ] {
+            assert!(!board_options(args).window_by_default, "{args:?}");
+        }
+        assert!(!run_options(&["--window"]).window_by_default);
+    }
+
+    #[test]
+    fn firmware_alone_prints_the_vectors_as_it_always_did() {
+        assert_eq!(
+            parse_args(&["--firmware", "f.bin"]),
+            Ok(Command::Vectors("f.bin".into()))
+        );
+    }
+
+    #[test]
+    fn a_scratch_run_never_defaults_to_the_window() {
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--sd", "c"]),
+            Err(ArgError::NothingToRun)
+        );
+        assert!(!run_options(&["--console"]).window);
+    }
+
+    #[test]
+    fn the_console_or_a_limit_takes_the_window_off_the_boards_default() {
+        for args in [
+            &["--console"][..],
+            &["--run", "9"],
+            &["--stop-at", "0x08000100"],
+        ] {
+            assert!(!board_options(args).window, "{args:?}");
+        }
+        assert!(board_options(&["--trace", "t"]).window);
+        assert!(board_options(&["--unpaced"]).window);
+        assert!(board_options(&["--console", "--window"]).window);
+    }
+
+    #[test]
+    fn without_firmware_every_option_is_for_the_board() {
+        let options = board_options(&[
+            "--run",
+            "9",
+            "--flash",
+            "x",
+            "--sd",
+            "c",
+            "--rng-seed",
+            "1",
+            "--trace",
+            "t",
+        ]);
+        assert_eq!(options.run, Some(9));
+        assert_eq!(options.flash.as_deref(), Some("x"));
+        assert_eq!(options.sd.as_deref(), Some("c"));
+        assert_eq!(board_options(&["--console", "--on", "a", "b"]).on.len(), 1);
+        assert_eq!(
+            parse_args(&["--on", "a", "b"]),
+            Err(ArgError::NeedsConsole("--on".into()))
+        );
+        assert!(board_options(&["--console-keys"]).console_keys);
+    }
+
+    #[test]
+    fn burn_takes_a_file_and_goes_with_the_other_board_options() {
+        let options = board_options(&["--burn", "f.bin", "--console", "--run", "9", "--sd", "c"]);
+        assert_eq!(options.burn.as_deref(), Some("f.bin"));
+        assert!(board_options(&["--burn", "f.bin"]).window);
+        assert_eq!(board_options(&[]).burn, None);
+        assert_eq!(parse_args(&["--burn"]), Err(ArgError::Usage));
+        assert_eq!(
+            parse_args(&["--burn", ""]),
+            Err(ArgError::EmptyName("--burn".into()))
+        );
+    }
+
+    #[test]
+    fn burn_and_firmware_together_are_refused_in_either_order() {
+        for args in [
+            &["--burn", "a", "--firmware", "b", "--run", "9"][..],
+            &["--firmware", "b", "--burn", "a"],
+        ] {
+            assert_eq!(parse_args(args), Err(ArgError::BurnAndFirmware), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn firmware_with_any_options_is_a_scratch_run() {
+        for args in [
+            &["--console"][..],
+            &["--window"],
+            &["--run", "9"],
+            &["--console", "--on", "a", "b"],
+            &["--unpaced", "--console"],
+            &["--flash", "x", "--console"],
+            &["--sd", "c", "--run", "9"],
+            &["--rng-seed", "1", "--console"],
+            &["--console", "--trace", "t"],
+        ] {
+            let mut all = vec!["--firmware", "f"];
+            all.extend_from_slice(args);
+            assert!(
+                matches!(
+                    parse_args(&all),
+                    Ok(Command::Run {
+                        start: Start::File(_),
+                        ..
+                    })
+                ),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_sd_is_for_the_board() {
+        assert!(board_options(&["--no-sd"]).no_sd);
+        assert!(!board_options(&["--console"]).no_sd);
+        assert_eq!(
+            parse_args(&["--firmware", "f", "--console", "--no-sd"]),
+            Err(ArgError::BoardOnly("--no-sd".into()))
+        );
+    }
+
+    #[test]
+    fn sd_and_no_sd_together_are_refused() {
+        assert_eq!(
+            parse_args(&["--sd", "c", "--no-sd"]),
+            Err(ArgError::SdAndNoSd)
+        );
+        assert_eq!(
+            parse_args(&["--no-sd", "--sd", "c"]),
+            Err(ArgError::SdAndNoSd)
+        );
+    }
+
+    #[test]
+    fn a_second_firmware_or_burn_is_refused_and_an_empty_one_too() {
+        assert_eq!(
+            parse_args(&["--firmware", "a", "--firmware", "b"]),
+            Err(ArgError::Unknown("--firmware".into()))
+        );
+        assert_eq!(
+            parse_args(&["--burn", "a", "--burn", "b"]),
+            Err(ArgError::Repeated("--burn".into()))
+        );
+        // An empty firmware name is loaded, and fails there, as it did.
+        assert_eq!(
+            parse_args(&["--firmware", ""]),
+            Ok(Command::Vectors(String::new()))
+        );
+        assert_eq!(
+            parse_args(&["--burn", ""]),
+            Err(ArgError::EmptyName("--burn".into()))
+        );
     }
 }

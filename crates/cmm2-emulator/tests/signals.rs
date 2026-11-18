@@ -5,7 +5,7 @@ mod common;
 use common::*;
 use std::io::Read;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 // The tests that read /proc look at what the kernel says about the emulator's own process and
@@ -37,9 +37,9 @@ fn wait_until_catching(child: &std::process::Child) {
 }
 
 // Starts the emulator on `code` with `args`, with SIGHUP ignored as nohup leaves it.
-fn spawn_with_sighup_ignored(name: &str, code: &[u16], args: &[&str]) -> std::process::Child {
+fn spawn_with_sighup_ignored(name: &str, code: &[u16], args: &[&str]) -> Guard {
     let path = temp_program(name, code);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"));
+    let mut command = emulator();
     command
         .args(["--firmware", path.to_str().unwrap()])
         .args(args)
@@ -52,7 +52,7 @@ fn spawn_with_sighup_ignored(name: &str, code: &[u16], args: &[&str]) -> std::pr
             Ok(())
         });
     }
-    command.spawn().expect("failed to run cmm2-emulator")
+    command.spawn_guarded()
 }
 
 // The local mode flags of the terminal on `fd`.
@@ -107,7 +107,7 @@ fn a_signal_ends_a_batch_run_with_no_limit_and_the_flash_is_written() {
         let path = temp_program(name, &count_in_flash(SPIN));
         let trace = temp_path(name, "trace");
         // A stop address the guest never reaches, and no limit: only the signal ends it.
-        let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        let mut child = emulator()
             .args([
                 "--firmware",
                 path.to_str().unwrap(),
@@ -119,8 +119,7 @@ fn a_signal_ends_a_batch_run_with_no_limit_and_the_flash_is_written() {
             .arg("--trace")
             .arg(&trace)
             .stdout(Stdio::piped())
-            .spawn()
-            .expect("failed to run cmm2-emulator");
+            .spawn_guarded();
         // The trace file has something in it once the run is under way. A signal before that
         // would end the process without a save, as it has nothing to save.
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -190,12 +189,11 @@ fn two_signals_in_a_row_leave_the_terminal_as_it_was() {
     let path = temp_program("signal-pty", &ECHO);
     // SAFETY: dup of a descriptor this test owns; the new one is handed to the child.
     let stdin = unsafe { OwnedFd::from_raw_fd(libc::dup(slave)) };
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let mut child = emulator()
         .args(["--firmware", path.to_str().unwrap(), "--console"])
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::null())
-        .spawn()
-        .expect("failed to run cmm2-emulator");
+        .spawn_guarded();
     let deadline = Instant::now() + Duration::from_secs(20);
     while lflag(slave) == cooked {
         assert!(Instant::now() < deadline, "the terminal never went raw");
@@ -224,7 +222,7 @@ fn the_threads_the_run_makes_have_the_signals_blocked_and_the_main_one_takes_the
     let flash = flash_path("signal-threads");
     let _ = std::fs::remove_file(&flash);
     let path = temp_program("signal-threads", &ECHO);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let mut child = emulator()
         .args([
             "--firmware",
             path.to_str().unwrap(),
@@ -236,8 +234,7 @@ fn the_threads_the_run_makes_have_the_signals_blocked_and_the_main_one_takes_the
         .env("SDL_VIDEODRIVER", "dummy")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
-        .expect("failed to run cmm2-emulator");
+        .spawn_guarded();
     // The guest says "ready" once everything is made and the run has started.
     let mut out = child.stdout.take().unwrap();
     let mut seen = Vec::new();
@@ -284,10 +281,9 @@ fn a_signal_ends_a_load_that_is_stuck_at_once() {
     for (name, signal) in [("stuck-int", libc::SIGINT), ("stuck-term", libc::SIGTERM)] {
         let fifo = temp_path(name, "fifo");
         make_fifo(&fifo);
-        let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        let mut child = emulator()
             .args(["--firmware", fifo.to_str().unwrap(), "--run", "10"])
-            .spawn()
-            .expect("failed to run cmm2-emulator");
+            .spawn_guarded();
         wait_until_catching(&child);
         std::thread::sleep(Duration::from_millis(200));
         assert!(child.try_wait().unwrap().is_none(), "{name}: not stuck");

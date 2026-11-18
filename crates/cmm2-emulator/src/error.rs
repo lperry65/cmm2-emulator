@@ -1,5 +1,6 @@
 //! What can end a run in an error, and how the errors of one run are said.
 
+use crate::board::BoardError;
 use crate::output::Output;
 use crate::window::WindowError;
 use cmm2_core::{
@@ -54,6 +55,8 @@ pub(crate) enum RunError {
         path: String,
         size: usize,
     },
+    /// The board's directory, its lock, or what it remembers.
+    Board(BoardError),
     /// The guest faulted; the text is the core's description.
     Fault(String),
 }
@@ -78,6 +81,7 @@ impl fmt::Display for RunError {
                 f,
                 "{path}: {size} bytes is smaller than the {MIN_IMAGE_SIZE} bytes (512 KB) of the smallest card"
             ),
+            RunError::Board(err) => err.fmt(f),
             RunError::Fault(description) => f.write_str(description),
         }
     }

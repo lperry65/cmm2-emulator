@@ -9,7 +9,7 @@ use common::*;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 // How long a test waits for the emulator before it gives up.
@@ -94,7 +94,7 @@ impl Session {
         unsafe { libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK) };
         let cooked = lflag(slave);
         let image = temp_program(name, code);
-        let mut command = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"));
+        let mut command = emulator();
         command
             .args(["--firmware", image.to_str().unwrap(), "--console"])
             .args(args)

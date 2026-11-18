@@ -4,7 +4,7 @@ mod common;
 
 use common::*;
 use std::io::{Read, Write};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -88,13 +88,12 @@ fn a_fault_in_the_console_goes_to_stderr_and_exits_with_one() {
 #[test]
 fn piped_keys_reach_the_guest_and_the_quit_key_ends_the_run() {
     let path = temp_program("console-piped", &ECHO);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let mut child = emulator()
         .args(["--firmware", path.to_str().unwrap()])
         .args(["--console", "--run", "500000000"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
-        .expect("failed to run cmm2-emulator");
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut out = child.stdout.take().unwrap();
     let (sender, receiver) = mpsc::channel();

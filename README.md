@@ -25,7 +25,9 @@ first-boot setup and a system reset to the `>` prompt and runs BASIC there. What
 - A USB keyboard, driven from the window through the firmware's real USB host stack, so
   `KEYDOWN()`, `INKEY$` and Ctrl-C work as on the board. The console over a terminal also works.
 - An SD card on a disk image (`--sd`), in the firmware's default SPI mode.
-- Saved flash and options between runs (`--flash`), and the board's DS3231 clock chip.
+- A board that remembers itself between runs: its firmware, its settings, the DS3231 clock chip
+  and the SD card in its socket (see "The board"; `--flash` and `--sd` still name files of their
+  own).
 - Real-time pacing at the machine's 480 MHz clock (built; it has no effect while the host is
   slower than the machine).
 
@@ -98,7 +100,7 @@ The open issues at 8260358, from `gh issue list --state open`:
   end-to-end test), 62 (keyboard follow-ups), 53 (USB mouse), 54 (gamepad).
 - Storage and the board's state: 63 (SPI3 for the SD card, `OPTION SD TIMING FAST`), 44 (a host
   folder as the SD card), 41 (the guest writes 32 zero bytes into the firmware region of flash), 69
-  (remember the board between runs).
+  (remember the board between runs: built, see "The board"; the issue is not closed yet).
 - Window and platform: 39 (scaling, full screen and aspect controls), 75 (Windows).
 - Firmware and end-to-end: 57 (firmware 5.07, the version the Gen 2 shipped with), 49 (run
   Galactic Raiders as an end-to-end test), 25 (boot to the MMBasic idle loop: the acceptance is only
@@ -133,12 +135,13 @@ The repository is a Cargo workspace with three members, two of them mine:
 
 In `cmm2-emulator`, `main.rs` is a short entry point over modules: `args` (the command line),
 `batch` (a run with no console or window), `live` (a run with the console or a window), `machine`
-(building the machine), `storage`, `saveable`, `atomic_write` and `run_and_save` (the `--flash` and
-`--sd` files, read at the start and saved safely at the end), `panic_hook`, `signals`, `output` and
-`error`, `trace`, `slice`, `report` and `inspect`, `script` (the `--on` keys), `pacing`,
-`terminal`, `keys`, `usb_keys`, `window` and `local_clock`. The unit tests of a module are in
-`<module>/tests.rs` beside it, or in the file itself for some of the smaller ones, and the
-command-line and real-firmware tests are in `crates/*/tests/`, split by topic.
+(building the machine), `board` (the board's directory, its lock and what it remembers) and
+`launch` (which run is on the board), `storage`, `saveable`, `atomic_write` and `run_and_save` (the
+`--flash` and `--sd` files, read at the start and saved safely at the end), `panic_hook`,
+`signals`, `output` and `error`, `trace`, `slice`, `report` and `inspect`, `script` (the `--on`
+keys), `pacing`, `terminal`, `keys`, `usb_keys`, `window` and `local_clock`. The unit tests of a
+module are in `<module>/tests.rs` beside it, or in the file itself for some of the smaller ones,
+and the command-line and real-firmware tests are in `crates/*/tests/`, split by topic.
 
 ## Building
 
@@ -151,11 +154,12 @@ Building needs the SDL2 development files (`libsdl2-dev` on Debian and Ubuntu). 
 it on Linux only so far; Windows is planned (issue 75).
 
 Nearly all the ignored tests run the real firmware: they need your copy of the `.bin` and take a
-while. `cargo test --workspace -- --ignored --list` counts 68 of them (counted on 2026-11-14 in a
-clean `git archive` of 8260358; listing needs no firmware): 44 in `cmm2-core` (43 in the nine files
-of `crates/cmm2-core/tests/`, and a display speed test in `display/tests.rs`), 23 in `cmm2-emulator`
-(3 in `tests/real_firmware.rs` and 20 in the tests of `keys.rs` and `usb_keys.rs`), and one in
-`zmu_cortex_m`. Two of the 68 do not use the firmware: the display speed test, which times the
+while. `cargo test --workspace -- --ignored --list` counts 69 of them (counted on 2026-11-18 in the
+working tree after the board was added, on top of 4bd964d; listing needs no firmware): 44 in
+`cmm2-core` (43 in the nine files of `crates/cmm2-core/tests/`, and a display speed test in
+`display/tests.rs`), 24 in `cmm2-emulator` (3 in `tests/real_firmware.rs`, 1 in
+`tests/board_burn.rs` and 20 in the tests of `keys.rs` and `usb_keys.rs`), and one in
+`zmu_cortex_m`. Two of the 69 do not use the firmware: the display speed test, which times the
 compositing, and the `zmu_cortex_m` one, a decode dump run by hand with `ZMU_DUMP_IMAGE` and
 `ZMU_DUMP_OUT`. To run the others, point `CMM2_FIRMWARE` at the `.bin`; a release build is a good
 deal faster:
@@ -163,6 +167,107 @@ deal faster:
 ```
 CMM2_FIRMWARE=/path/to/CMM2_MMBasic_7.00.00b5.bin cargo test --workspace --release -- --ignored
 ```
+
+### The board
+
+A real board is burned once and then keeps its firmware, its settings and the card in its socket
+until you change them. I wanted the emulator to be the same, so a plain `cmm2-emulator` switches
+the board on as it was last left, with the window (the screen and the USB keyboard), as a board
+with a monitor and a keyboard does. `--console` replaces the window with the terminal console
+(`--window` as well gives both), and `--run`, `--stop-at`, `--on`, `--unpaced`, `--trace`,
+`--screenshot`, `--rng-seed` and the rest apply to the board run.
+
+The board is a directory, and the directory is the board. It is `cmm2-emulator` in `$XDG_DATA_HOME`
+(a relative `XDG_DATA_HOME` is ignored, as the XDG specification has it), or
+`~/.local/share/cmm2-emulator` when that is not set. The environment variable `CMM2_EMULATOR_HOME`
+names the directory itself instead, which is what the tests use so that they never touch mine, and
+a different one is a different board. It holds `firmware.bin` (my copy of the image),
+`settings.flash` (the `--flash` file below: the stored program, the saved options and the clock),
+`sd.path` (the card in the socket) and `board.lock`.
+
+```
+cmm2-emulator --burn CMM2_MMBasic_7.00.00b5.bin    # burn it, once, and start the board
+cmm2-emulator                                      # from then on: as it was left
+```
+
+`--burn <file>` burns the firmware. The image is loaded before anything is made, and the loader
+checks it as it always did: an image that reaches 0x08120000 is refused, and so is one whose vector
+table is not sensible (the stack pointer in RAM, a Thumb reset handler inside the image). What a
+burn cannot know is whether the image is whole: a firmware image has no checksum to ask, so a copy
+that was cut short, or damaged, and still has a sensible vector table is burned. I considered
+checking that the handlers in the vector table point inside the image, and took it out: the real
+image has only four distinct handlers, so it would decide for hardly any cut. A burn says what it
+burned on one line of standard error (the size, the initial stack pointer and the reset handler),
+so the size can be compared with the file I meant. The image is then written into the board with a
+temporary file in the same directory, synced and renamed into place, so a burn that fails (a full
+disk, say) leaves the old firmware where it was, and moving or changing the `.bin` afterwards does
+nothing until I burn it again. If `firmware.bin` is a symbolic link, the rename replaces the link
+itself and what it pointed to is not written; the cleanup of old temporary files looks only in the
+board directory. Burning keeps the settings: the file holds only what the user changes and never
+the firmware (as the `--flash` section below has it), so I expect it to survive a new firmware, but
+I have only tested that a burn leaves it alone, not that another firmware version accepts it. The
+board then starts: the first run, with nothing in the directory yet, makes the directory (mode
+0700, as the XDG specification has it), burns and starts, and the first-boot questions come up in
+the window (or the console) as before. `--burn` goes with `--console`, `--run`, `--sd` and the
+other board options. The burn is done before the machine is built, so a start that then fails (a
+card that has gone, see below) has burned all the same. A plain start with nothing burned prints
+how to burn and which directory it looked in, exits with status 1 and makes nothing, not even the
+lock file.
+
+`--firmware <file>` is not the board. It runs that image as a scratch machine, as before the board
+existed: the file is read, nothing is read from or written to the board directory, and `--flash`
+and `--sd` are its only files. Every command line in the sections below that names `--firmware` is
+such a run, so CI and scripts have no hidden state. `--firmware <file>` alone prints the vector
+table. `--burn` together with `--firmware` is a usage error (status 2), and so is a second `--burn`
+or a second `--firmware`. `--no-sd` is for the board and is refused with `--firmware`. Options may
+come in any order, and `--firmware` may now come anywhere on the line (it had to come first, so
+`--run 10 --firmware f` was an error and is a scratch run now); `--version` and `--lookup` still
+have to come first.
+
+A board can only be switched on once. A run on the board takes a lock (flock) on `board.lock` for
+as long as it goes, and a second one, burning included, says that the board is already switched on
+and exits with status 1. Only the lock is looked at, not the other process. The lock file is opened
+to write (NFS wants that for an exclusive lock, flock being emulated with byte-range locks there),
+and only if that is refused with a permission error (EACCES, or EPERM for an immutable file,
+`chattr +i`), or because the file system is read-only, is a lock file that is there opened to read.
+A plain start that races a first burn may say that nothing is burned, as that is looked at before
+the lock; the next one says the board is switched on. A file system that cannot lock refuses the
+board with a message that says which way the file was opened. Only `--burn` makes the directory; a
+plain start never does. A board directory that cannot be written switches on if `board.lock` is
+already in it (a directory with no lock file in it cannot be switched on: the error is `board.lock:
+Permission denied`), but the run cannot be saved in it: the board's own settings file is in the
+directory, so a plain `--run 10` exits with status 1 and says that its directory is not writable,
+and only a run with `--flash` to a file elsewhere goes. What is in the directory is written as the
+`--flash` and `--sd` files are. An empty `CMM2_EMULATOR_HOME` is an error and not the same as
+unset, so that a script with an unset variable does not land on the usual board.
+
+`--flash <file>` without `--firmware` means this settings file instead of the board's own, for a
+separate set of settings; the board's firmware is still used, so that run still takes the board's
+lock. The card in the socket is remembered by `--sd <file>` without `--firmware`: its absolute path
+goes in `sd.path`, once the file has been read as a card, and the next start puts it in again. The
+file stays where it is (it is not copied), and a new `--sd` replaces it. A name that ends in a
+blank is kept as it is; one that ends in a line end is refused, as the record could not keep it. If
+the file has gone, or cannot be used, the start fails with an error that says so and tells me to
+give another with `--sd <file>` or take the card out with `--no-sd`, which forgets it and leaves
+the socket empty. If I write `sd.path` by hand, any line ends after the path are fine; anything
+that is not an absolute path in UTF-8, or a directory in its place, gets the same advice, and
+`--sd` and `--no-sd` replace or remove such a record (a directory only if it is empty: I do not
+delete what is in one).
+
+The window is the default when there is none of `--console`, `--run` and `--stop-at`, so there is
+no `--no-window`: `--console` on its own (or `--run`, `--stop-at`) runs the board without one. A
+window that cannot be opened is an error, and it says how to go without one: to use `--console`
+when the window is the default of a plain start, and to drop `--window` when I typed it
+(`--console` would keep that window). When it is the default window of a plain start, with
+`SDL_VIDEODRIVER` not set, and SDL has fallen back to its KMSDRM or offscreen driver (which it does
+with no display), the start is refused: KMSDRM would take over the physical screen and offscreen
+draws nowhere, so the run would seem to do nothing. A `--window` that I typed, an `SDL_VIDEODRIVER`
+that I set, and every `--firmware` run are not refused and are as they were before the board, so a
+headless script with `--window` and `--screenshot` still works. I tested the refusal on offscreen
+with no `DISPLAY`, `WAYLAND_DISPLAY` or `XDG_RUNTIME_DIR`; the KMSDRM row is covered by a unit test
+of the rule only, as SDL fails by itself on a machine with no DRM device, and I have not tried a
+real console on KMSDRM. The board's directory name has to be UTF-8, and on Windows (issue 75, not
+built) `%LOCALAPPDATA%` is where I mean it to live.
 
 ### Trying it
 
@@ -189,7 +294,8 @@ writes none. `--firmware <file>` alone prints the initial stack pointer and the 
 `--lookup 0x<address>` names the peripheral register at an address, and `--version` prints the
 version.
 
-To use it interactively, connect the console to your terminal:
+To use a firmware file interactively, as a scratch machine, connect the console to your terminal
+(the board has its own way, above):
 
 ```
 cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console
@@ -235,7 +341,8 @@ I checked it with a flash file that had been through the first boot: the same se
 same value as `42` and as `0x2A`, printed the same three numbers for `PRINT RND;RND;RND`, and
 another seed, or none, printed others.
 
-To see the screen, add `--window`. It opens an SDL window that shows what the firmware has drawn
+To see the screen of a scratch run, add `--window` (the board run has it unless there is
+`--console`, `--run` or `--stop-at`). It opens an SDL window that shows what the firmware has drawn
 and scales it to fit, and closing the window ends the run. It works with or without `--console`
 (without it the run goes on until the window is closed, or `--run` or `--stop-at` ends it).
 
@@ -288,54 +395,55 @@ boot text) took about 6 s of CPU time on 2026-11-14, on a loaded machine (a load
 in the reviewer's repeat). That is slower than the 70 to 77 million a second that I measured for the
 boot in my local speed notes, so the two disagree, and I do not know which is right.
 
-`--flash <file>` keeps the board's settings between runs, as a real board does. If the file exists
-it is loaded at the start, and the flash and the clock are written back to it when the run ends.
-That is the quit key, the window closed, the `--run` limit, `--stop-at`, a fault, a SIGINT, SIGTERM
-or SIGHUP (Ctrl-C in a terminal that is not in raw mode, `kill`, the terminal being closed), and a
-panic in the emulator, which is saved from and then goes on as a panic (the terminal is put back
-before its message prints, and while the run goes the message is held back until the files are
-written, and then said, as standard error may be a pipe that nobody is reading and a message with a
-backtrace may not fit in it). A panic that comes while another is being unwound (a `Drop` that
-panics) is an abort, and nothing is saved then; what was held and the new message are written at
-once, so that they are not lost with it. The write goes through a temporary file in the same
-directory (named `.cmm2.<pid>.<time>.tmp`, so that one left by a crash is never in the way), which
-is synced and renamed over the file, and then the directory is synced, so a crash never leaves half
-a file. A directory that cannot be synced (not readable, or a file system with no such thing) is a
-warning on stderr, as the file is in its place by then. A crash does leave that temporary file, as
-big as the card. A save holds an advisory lock (`flock`) on its temporary file while it is open,
-which goes when the process does, however it ends. When a run starts, the `.cmm2.<pid>.<time>.tmp`
-files in the directory that have not been changed for a minute and that can be locked are removed:
-nobody is writing them. So a live emulator's file on this host is never touched, whatever the pid in
-its name means to this host (another host or container sharing the directory) and whatever the clock
-does. On a file system whose locks are not shared between hosts (NFS mounted with `local_lock=flock`
-or `nolock`, say) a lock does not show a save on another host, and then a left-over file of a save
-that is going on there could be removed by an emulator starting here, and that save would fail when
-it renames it (the old file is kept and nothing is lost, but the run's changes are). Where locking
-does not work at all the lock fails and nothing is removed, so a left-over file there has to be
-removed by hand. Another one that is left is a file with no read and no write right (mode 000),
-which cannot be locked: `rm .cmm2.*.tmp` in the directory clears it. The files that are looked at
-are only regular files (a FIFO, or a link, with such a name is left alone). The name has to be
-digits only, with a process id above 0, to count. A symlink is followed, even a dangling one (the
-first save creates what it points to), so the file it points to is the one replaced and the link
-stays. The file keeps its permissions. It does not keep its owner, which only a privileged process
-can set, and a hard link to the old file stops seeing the contents, as the file is replaced and not
-written in place. What the save needs is a directory it can make a file in, so the file's own
-permissions do not matter (a read-only file is replaced and keeps its mode). That is looked at when
-the run starts, with the effective user's rights, and a `--flash` file that could not be saved is an
-error then, naming why: the directory does not exist (or a part of the path is not a directory, or
-the links loop), a directory on the path cannot be searched, the directory is not writable (or is
-append-only), the file system is read-only, the file is immutable or append-only (`chattr +i`,
-`+a`), or it is another user's file in a sticky directory such as /tmp (unless the user has
-CAP_FOWNER, which is looked at and not just being root). A file that cannot be read is refused in
-words as well. A name that is empty (an unset shell variable), or ends in a slash, or in `.` or
-`..`, or is longer than the file system allows (255 bytes on most) is refused too, and so is a link
-that leads to such a name. The temporary file has a short name of its own, so that a name of any
-allowed length can be saved. Both files have to be regular files: a device, a FIFO or a directory is
-refused before anything is opened (a FIFO would hang the load, and `sudo` with `--sd /dev/mmcblk0`
-would read a whole card and then rename a file over its node). What cannot be seen at the start, and
-so can still fail when the run is over and lose it, is the rest: a full disk or quota, a file made
-immutable during the run, a network file system that goes away, a security module (SELinux,
-AppArmor) that says no.
+`--flash <file>` is the file that keeps the board's settings between runs, as a real board does;
+the board's own is `settings.flash` in its directory, saved and loaded in the same way, and
+`--flash` names another. If the file exists it is loaded at the start, and the flash and the clock
+are written back to it when the run ends. That is the quit key, the window closed, the `--run`
+limit, `--stop-at`, a fault, a SIGINT, SIGTERM or SIGHUP (Ctrl-C in a terminal that is not in raw
+mode, `kill`, the terminal being closed), and a panic in the emulator, which is saved from and then
+goes on as a panic (the terminal is put back before its message prints, and while the run goes the
+message is held back until the files are written, and then said, as standard error may be a pipe
+that nobody is reading and a message with a backtrace may not fit in it). A panic that comes while
+another is being unwound (a `Drop` that panics) is an abort, and nothing is saved then; what was
+held and the new message are written at once, so that they are not lost with it. The write goes
+through a temporary file in the same directory (named `.cmm2.<pid>.<time>.tmp`, so that one left by
+a crash is never in the way), which is synced and renamed over the file, and then the directory is
+synced, so a crash never leaves half a file. A directory that cannot be synced (not readable, or a
+file system with no such thing) is a warning on stderr, as the file is in its place by then. A
+crash does leave that temporary file, as big as the card. A save holds an advisory lock (`flock`)
+on its temporary file while it is open, which goes when the process does, however it ends. When a
+run starts, the `.cmm2.<pid>.<time>.tmp` files in the directory that have not been changed for a
+minute and that can be locked are removed: nobody is writing them. So a live emulator's file on
+this host is never touched, whatever the pid in its name means to this host (another host or
+container sharing the directory) and whatever the clock does. On a file system whose locks are not
+shared between hosts (NFS mounted with `local_lock=flock` or `nolock`, say) a lock does not show a
+save on another host, and then a left-over file of a save that is going on there could be removed
+by an emulator starting here, and that save would fail when it renames it (the old file is kept and
+nothing is lost, but the run's changes are). Where locking does not work at all the lock fails and
+nothing is removed, so a left-over file there has to be removed by hand. Another one that is left
+is a file with no read and no write right (mode 000), which cannot be locked: `rm .cmm2.*.tmp` in
+the directory clears it. The files that are looked at are only regular files (a FIFO, or a link,
+with such a name is left alone). The name has to be digits only, with a process id above 0, to
+count. A symlink is followed, even a dangling one (the first save creates what it points to), so
+the file it points to is the one replaced and the link stays. The file keeps its permissions. It
+does not keep its owner, which only a privileged process can set, and a hard link to the old file
+stops seeing the contents, as the file is replaced and not written in place. What the save needs is
+a directory it can make a file in, so the file's own permissions do not matter (a read-only file is
+replaced and keeps its mode). That is looked at when the run starts, with the effective user's
+rights, and a `--flash` file that could not be saved is an error then, naming why: the directory
+does not exist (or a part of the path is not a directory, or the links loop), a directory on the
+path cannot be searched, the directory is not writable (or is append-only), the file system is
+read-only, the file is immutable or append-only (`chattr +i`, `+a`), or it is another user's file
+in a sticky directory such as /tmp (unless the user has CAP_FOWNER, which is looked at and not just
+being root). A file that cannot be read is refused in words as well. A name that is empty (an unset
+shell variable), or ends in a slash, or in `.` or `..`, or is longer than the file system allows
+(255 bytes on most) is refused too, and so is a link that leads to such a name. The temporary file
+has a short name of its own, so that a name of any allowed length can be saved. Both files have to
+be regular files: a device, a FIFO or a directory is refused before anything is opened (a FIFO
+would hang the load, and `sudo` with `--sd /dev/mmcblk0` would read a whole card and then rename a
+file over its node). What cannot be seen at the start, and so can still fail when the run is over
+and lose it, is the rest: a full disk or quota, a file made immutable during the run, a network
+file system that goes away, a security module (SELinux, AppArmor) that says no.
 
 Every end of a `--console` or `--window` run says why, on one line of stderr, after the terminal is
 put back: `cmm2-emulator: quit key (Ctrl-]) pressed`, `cmm2-emulator: stopped by SIGTERM` (or

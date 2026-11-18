@@ -4,7 +4,6 @@ mod common;
 
 use common::*;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 #[test]
@@ -231,14 +230,13 @@ fn an_old_fifo_named_like_a_temporary_file_does_not_hang_the_start() {
     );
     let flash = dir.join("board.flash");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let mut child = emulator()
         .args([
             "--firmware",
             temp_program("stale-fifo", &THREE).to_str().unwrap(),
         ])
         .args(["--run", "10", "--flash", flash.to_str().unwrap()])
-        .spawn()
-        .expect("failed to run cmm2-emulator");
+        .spawn_guarded();
     let status = wait_for(&mut child);
 
     assert!(status.success());

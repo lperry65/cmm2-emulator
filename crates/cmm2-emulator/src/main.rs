@@ -1,9 +1,11 @@
 mod args;
 mod atomic_write;
 mod batch;
+mod board;
 mod error;
 mod inspect;
 mod keys;
+mod launch;
 mod live;
 mod local_clock;
 mod machine;
@@ -12,6 +14,8 @@ mod pacing;
 mod panic_hook;
 mod report;
 mod run_and_save;
+#[cfg(test)]
+mod run_id;
 mod saveable;
 mod script;
 mod signals;
@@ -29,10 +33,8 @@ use std::panic::{catch_unwind, resume_unwind};
 use std::process::ExitCode;
 
 use args::Command;
-use batch::run_firmware;
 use error::{RunError, say};
 use inspect::{show_register, show_vectors};
-use live::run_live;
 use output::Output;
 use panic_hook::{install_panic_hook, say_late_panic};
 
@@ -69,10 +71,7 @@ fn run() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Vectors(path) => finish(show_vectors(&path)),
-        Command::Run { firmware, options } if options.console || options.window => {
-            finish(run_live(&firmware, options))
-        }
-        Command::Run { firmware, options } => finish(run_firmware(&firmware, &options)),
+        Command::Run { start, options } => finish(launch::run(start, options)),
     }
 }
 

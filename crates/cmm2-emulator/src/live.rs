@@ -2,7 +2,7 @@
 
 use crate::args::RunOptions;
 use crate::error::{RunError, note_cut_short, note_output, say, settle};
-use crate::machine::{Machine, build_machine, plug_in_keyboard};
+use crate::machine::{Machine, plug_in_keyboard};
 use crate::output::{Output, is_signal_end};
 use crate::pacing::{Pacer, RealTime};
 use crate::report::{output_result, print_console, report_resets, write_screenshot};
@@ -65,20 +65,29 @@ fn signal_name(signal: libc::c_int) -> String {
 /// keyboard unless `--console-keys`. Without `--console` the guest's output is printed at the
 /// end. The `--flash` and `--sd` files are written whichever way the run ends, and when the
 /// emulator panics.
-pub(crate) fn run_live(path: &str, mut options: RunOptions) -> Result<bool, RunError> {
+pub(crate) fn run_live(machine: Machine, mut options: RunOptions) -> Result<bool, RunError> {
     let Machine {
         mut cpu,
         console,
         sd,
         trace,
-    } = build_machine(path, &options)?;
+    } = machine;
     // The window's keys are the USB keyboard's, unless it is asked to type into the console.
     let usb_keys = (options.window && !options.console_keys).then(|| plug_in_keyboard(&cpu));
     let mut window = options
         .window
-        .then(|| signals::with_blocked(|| Window::open(usb_keys)))
+        .then(|| signals::with_blocked(|| Window::open(usb_keys, options.window_by_default)))
         .transpose()
-        .map_err(RunError::Window)?;
+        // The way out depends on how the window came to be asked for: `--console` takes the
+        // default one away, and a `--window` that was typed has to be dropped (`--console` would
+        // keep it).
+        .map_err(|err| {
+            RunError::Window(err.advising(if options.window_by_default {
+                "use --console to run without a window"
+            } else {
+                "drop --window to run without a window"
+            }))
+        })?;
     let raw = options.console.then(RawMode::enable).flatten();
     // Only a terminal has a cursor that the guest's output can leave part way along a line, and it
     // matters to a line said on standard error only when that is a terminal too. Whether a line

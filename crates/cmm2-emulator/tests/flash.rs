@@ -5,7 +5,7 @@ mod common;
 use common::*;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 #[test]
 fn the_flash_file_keeps_the_flash_between_runs() {
@@ -92,13 +92,12 @@ fn the_flash_file_is_written_when_the_quit_key_ends_the_run() {
     let flash = flash_path("flash-quit");
     let _ = std::fs::remove_file(&flash);
     let path = temp_program("flash-quit", &count_in_flash(SPIN));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let mut child = emulator()
         .args(["--firmware", path.to_str().unwrap(), "--console", "--flash"])
         .arg(&flash)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .spawn()
-        .expect("failed to run cmm2-emulator");
+        .spawn_guarded();
     child.stdin.as_mut().unwrap().write_all(b"\x1D").unwrap();
     let status = child.wait().unwrap();
 

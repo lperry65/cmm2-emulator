@@ -5,7 +5,7 @@ mod common;
 use common::*;
 use std::io::Read;
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -84,7 +84,9 @@ fn a_save_that_fails_at_the_end_is_said_after_the_screenshot() {
     let flash = dir.join("board.flash");
     let trace = temp_path("late-save", "trace");
     let path = temp_program("late-save", &THREE);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    // Removed when the test ends, one that fails with the directory read-only included.
+    let _cleanup = Cleanup(vec![dir.clone(), trace.clone(), path.clone()]);
+    let mut child = emulator()
         .args([
             "--firmware",
             path.to_str().unwrap(),
@@ -98,8 +100,7 @@ fn a_save_that_fails_at_the_end_is_said_after_the_screenshot() {
         .arg(&trace)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to run cmm2-emulator");
+        .spawn_guarded();
     let deadline = Instant::now() + Duration::from_secs(30);
     while std::fs::metadata(&trace).map_or(0, |meta| meta.len()) == 0 {
         assert!(Instant::now() < deadline, "the run never began");
@@ -110,7 +111,6 @@ fn a_save_that_fails_at_the_end_is_said_after_the_screenshot() {
     // SAFETY: kill only sends the signal to the child, which is still running.
     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
     let status = wait_for(&mut child);
-    mode(&dir, 0o755);
     let mut said = String::new();
     child
         .stderr
@@ -133,7 +133,4 @@ fn a_save_that_fails_at_the_end_is_said_after_the_screenshot() {
             flash.display()
         )
     );
-    std::fs::remove_dir_all(&dir).unwrap();
-    std::fs::remove_file(&trace).unwrap();
-    std::fs::remove_file(&path).unwrap();
 }

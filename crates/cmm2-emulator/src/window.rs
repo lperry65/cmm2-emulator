@@ -33,18 +33,50 @@ const REDRAW: Duration = Duration::from_millis(16);
 
 /// An SDL call failed; SDL reports its errors as text.
 #[derive(Debug)]
-pub struct WindowError(String);
+pub struct WindowError {
+    what: String,
+    /// Says how to run without a window: set for a window that could not be opened.
+    advice: Option<&'static str>,
+}
+
+impl WindowError {
+    fn new(what: impl Into<String>) -> WindowError {
+        WindowError {
+            what: what.into(),
+            advice: None,
+        }
+    }
+
+    /// The same error, with the way out added: what to give or drop to run without a window.
+    pub fn advising(mut self, advice: &'static str) -> WindowError {
+        self.advice = Some(advice);
+        self
+    }
+}
 
 impl fmt::Display for WindowError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "window: {}", self.0)
+        write!(f, "window: {}", self.what)?;
+        if let Some(advice) = self.advice {
+            write!(f, " ({advice})")?;
+        }
+        Ok(())
     }
 }
 
 impl std::error::Error for WindowError {}
 
 fn sdl<T, E: ToString>(result: Result<T, E>) -> Result<T, WindowError> {
-    result.map_err(|err| WindowError(err.to_string()))
+    result.map_err(|err| WindowError::new(err.to_string()))
+}
+
+/// Whether a window is refused for the video driver SDL ended up with. KMSDRM takes over the
+/// physical screen and offscreen draws nowhere, and SDL falls back to them when there is no
+/// display, so the board's plain start (`implicit`) would seem to do nothing or to take the
+/// screen. A window that was asked for (`--window`), or a driver that was asked for
+/// (`SDL_VIDEODRIVER`, `chosen`), is as it always was.
+fn refuses(driver: &str, chosen: bool, implicit: bool) -> bool {
+    implicit && !chosen && matches!(driver, "KMSDRM" | "offscreen")
 }
 
 pub struct Window {
@@ -64,9 +96,19 @@ pub struct Window {
 impl Window {
     /// With `usb`, the keys go to the USB keyboard as soon as the firmware polls it; without,
     /// they are always the console's.
-    pub fn open(usb: Option<UsbKeys>) -> Result<Window, WindowError> {
+    ///
+    /// `implicit` is a window that the board's start opens because nothing said otherwise, which
+    /// is refused when SDL had to fall back to a driver that shows nothing (see `refuses`).
+    pub fn open(usb: Option<UsbKeys>, implicit: bool) -> Result<Window, WindowError> {
         let context = sdl(sdl2::init())?;
         let video = sdl(context.video())?;
+        let driver = video.current_video_driver();
+        let chosen = std::env::var_os("SDL_VIDEODRIVER").is_some_and(|name| !name.is_empty());
+        if refuses(driver, chosen, implicit) {
+            return Err(WindowError::new(format!(
+                "no display to open a window on (SDL fell back to its {driver} video driver)"
+            )));
+        }
         // Printable keys arrive as text, which has the layout and shift applied.
         video.text_input().start();
         let window = sdl(video
@@ -273,6 +315,42 @@ mod tests {
     }
 
     #[test]
+    fn only_the_boards_implicit_window_is_refused_a_driver_that_shows_nothing() {
+        // (driver, chosen with SDL_VIDEODRIVER, implicit, refused)
+        let table = [
+            ("KMSDRM", false, true, true),
+            ("offscreen", false, true, true),
+            ("KMSDRM", true, true, false),
+            ("offscreen", true, true, false),
+            ("KMSDRM", false, false, false),
+            ("offscreen", false, false, false),
+            ("KMSDRM", true, false, false),
+            ("offscreen", true, false, false),
+            ("x11", false, true, false),
+            ("wayland", false, true, false),
+            ("dummy", false, true, false),
+            ("dummy", true, true, false),
+        ];
+        for (driver, chosen, implicit, refused) in table {
+            assert_eq!(
+                refuses(driver, chosen, implicit),
+                refused,
+                "{driver} {chosen} {implicit}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_advice_is_only_where_it_was_added_and_is_the_one_given() {
+        let err = WindowError::new("x11 not available");
+        assert_eq!(err.to_string(), "window: x11 not available");
+        assert_eq!(
+            err.advising("drop --window").to_string(),
+            "window: x11 not available (drop --window)"
+        );
+    }
+
+    #[test]
     fn the_picture_fills_a_window_of_its_own_shape() {
         assert_eq!(bounds(fit((800, 600), (800, 600))), (0, 0, 800, 600));
         assert_eq!(bounds(fit((1600, 1200), (800, 600))), (0, 0, 1600, 1200));
@@ -434,7 +512,7 @@ mod tests {
         let mut keyboard = HidKeyboard::new(report.clone());
         keyboard.setup([0x00, 0x09, 1, 0, 0, 0, 0, 0]);
         keyboard.in_token(0, 8);
-        let mut window = Window::open(Some(UsbKeys::new(report.clone()))).unwrap();
+        let mut window = Window::open(Some(UsbKeys::new(report.clone())), false).unwrap();
         let mut typed: Vec<u8> = Vec::new();
 
         // Before the firmware polls, the keys are the console's.

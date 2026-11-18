@@ -5,7 +5,7 @@ mod common;
 use common::*;
 use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 // Waits until the emulator is blocked, which an unpaced run, always at work, is not: its state in
@@ -68,14 +68,13 @@ fn a_run_blocked_writing_to_a_pipe_nobody_reads_ends_on_a_signal() {
     let path = temp_program("signal-blocked", &SPAM);
     // Never read from: the pipe is full, and the emulator blocks in its first write.
     let (_reader, writer) = full_pipe();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let mut child = emulator()
         .args(["--firmware", path.to_str().unwrap()])
         .args(["--console", "--unpaced", "--flash"])
         .arg(&flash)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(writer))
-        .spawn()
-        .expect("failed to run cmm2-emulator");
+        .spawn_guarded();
     wait_until_blocked(&child);
 
     // SAFETY: kill only sends the signal to the child, which is still running.
@@ -96,13 +95,12 @@ fn a_batch_run_blocked_writing_its_trace_to_a_pipe_nobody_reads_ends_on_a_signal
     let path = temp_program("signal-trace-blocked", &SPAM);
     // The trace of the peripherals goes to stdout, which is full and never read.
     let (_reader, writer) = full_pipe();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let mut child = emulator()
         .args(["--firmware", path.to_str().unwrap()])
         .args(["--trace-mmio", "--stop-at", "0x08000FF0", "--flash"])
         .arg(&flash)
         .stdout(Stdio::from(writer))
-        .spawn()
-        .expect("failed to run cmm2-emulator");
+        .spawn_guarded();
     wait_until_blocked(&child);
 
     // SAFETY: kill only sends the signal to the child, which is still running.
@@ -144,13 +142,12 @@ fn a_run_blocked_writing_its_trace_file_to_a_stalled_reader_ends_on_a_signal() {
         } else {
             "/dev/stdout".to_string()
         };
-        let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        let mut child = emulator()
             .args(["--firmware", path.to_str().unwrap(), "--run", "100000000"])
             .args(["--trace", &trace, "--flash"])
             .arg(&flash)
             .stdout(Stdio::from(writer))
-            .spawn()
-            .expect("failed to run cmm2-emulator");
+            .spawn_guarded();
         wait_until_blocked(&child);
 
         // SAFETY: kill only sends the signal to the child, which is still running.
@@ -179,15 +176,14 @@ fn a_run_blocked_writing_to_a_standard_error_nobody_reads_ends_on_a_signal() {
     let path = temp_program("signal-stderr", &RESET_FOR_EVER);
     // The pipe is full and never read, and the guest is a line of it for each reset.
     let (_reader, writer) = full_pipe();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let mut child = emulator()
         .args(["--firmware", path.to_str().unwrap()])
         .args(["--console", "--unpaced", "--flash"])
         .arg(&flash)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::from(writer))
-        .spawn()
-        .expect("failed to run cmm2-emulator");
+        .spawn_guarded();
     wait_until_blocked(&child);
 
     // SAFETY: kill only sends the signal to the child, which is still running.
@@ -222,14 +218,13 @@ fn a_run_blocked_writing_to_a_terminal_nobody_reads_ends_on_a_signal() {
     // SAFETY: dup of a descriptor this test owns; the new one is handed to the child.
     let tty = unsafe { OwnedFd::from_raw_fd(libc::dup(slave)) };
     // Nothing reads the other end, so the terminal fills and the run waits in a write.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let mut child = emulator()
         .args(["--firmware", path.to_str().unwrap()])
         .args(["--console", "--unpaced", "--flash"])
         .arg(&flash)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(tty))
-        .spawn()
-        .expect("failed to run cmm2-emulator");
+        .spawn_guarded();
     wait_until_blocked(&child);
 
     // SAFETY: kill only sends the signal to the child, which is still running.
@@ -275,7 +270,7 @@ fn output_to_the_master_of_a_terminal_arrives() {
     // A run that prints its summary to the master, which is not a thing to be reopened: that
     // would make a new pair, and the summary would go nowhere.
     let path = temp_program("master", &THREE);
-    let status = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let status = emulator()
         .args(["--firmware", path.to_str().unwrap(), "--run", "1000"])
         .stdout(Stdio::from(as_stdout))
         .status()

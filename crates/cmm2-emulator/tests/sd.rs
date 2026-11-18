@@ -6,7 +6,7 @@ use common::*;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 const WRITE_CARD_END_ADDRESS: &str = "0x08000188";
 
@@ -83,13 +83,12 @@ fn changes_made_to_the_sd_file_during_a_clean_run_are_kept() {
     // written back over it.
     let (card, _) = sd_card("sd-host-edit");
     let path = temp_program("sd-host-edit", &ECHO);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let mut child = emulator()
         .args(["--firmware", path.to_str().unwrap(), "--console", "--sd"])
         .arg(&card)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
-        .expect("failed to run cmm2-emulator");
+        .spawn_guarded();
     // The guest says "ready" once the card is in and it is running.
     let mut out = child.stdout.take().unwrap();
     let mut seen = Vec::new();

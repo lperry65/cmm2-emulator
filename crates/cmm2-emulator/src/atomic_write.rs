@@ -43,7 +43,18 @@ const MAX_LINKS: usize = 40;
 /// file's name, and so that two emulators on one file, or a temporary file that an earlier
 /// crash left under a repeated process id (in a container), do not get in the way.
 pub(crate) fn write_atomically(path: &str, bytes: &[u8]) -> io::Result<()> {
-    let target = resolve(Path::new(path))?;
+    write_over(path, resolve(Path::new(path))?, bytes)
+}
+
+/// `write_atomically`, but a symbolic link at `path` is replaced by the new file and not followed:
+/// what it points to is left alone, and the link is never missing, as the rename puts the new
+/// file in its place in one step. This is for the board's own files, which are the board's
+/// and not the user's to link elsewhere.
+pub(crate) fn replace_atomically(path: &str, bytes: &[u8]) -> io::Result<()> {
+    write_over(path, PathBuf::from(path), bytes)
+}
+
+fn write_over(path: &str, target: PathBuf, bytes: &[u8]) -> io::Result<()> {
     let dir = match target.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -70,14 +81,28 @@ pub(crate) fn write_atomically(path: &str, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Takes an advisory lock on the open file, without waiting: whether it was got. The lock goes
-/// with the open file description, so it is gone when the file is closed or the process is, however
-/// that happens, and another open of the same file (by another process, or here) cannot have it
-/// while it is held.
-fn try_lock(file: &File) -> bool {
+/// Takes an advisory lock on the open file, without waiting: whether it was got, or the error
+/// if the file system cannot lock at all. The lock goes with the open file description, so it is
+/// gone when the file is closed or the process is, however that happens, and another open of the
+/// same file (by another process, or here) cannot have it while it is held.
+pub(crate) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
     // SAFETY: flock only takes a descriptor that is open, as this is.
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    // EWOULDBLOCK is another holder, and is the same number as EAGAIN.
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(err)
+    }
+}
+
+/// `try_lock_exclusive` for a file that is only to be kept from the cleanup: an error is no lock.
+fn try_lock(file: &File) -> bool {
+    try_lock_exclusive(file).unwrap_or(false)
 }
 
 /// Makes the temporary file, which must not be there, and locks it at once, for as long as it is
@@ -112,6 +137,12 @@ pub(crate) fn remove_stale_temps(path: &str) {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
     };
+    remove_stale_temps_in(dir);
+}
+
+/// `remove_stale_temps` for the directory itself, with no name to resolve: nothing is followed to
+/// find it, so a link put where a file name would have been cannot lead the cleanup elsewhere.
+pub(crate) fn remove_stale_temps_in(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -173,7 +204,10 @@ fn is_temp_name(name: &str) -> bool {
 /// Fills `file` with `bytes` and the permissions `target` has, if it exists, and syncs it.
 fn write_synced(file: &mut File, target: &Path, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)?;
-    if let Ok(old) = std::fs::metadata(target) {
+    // A link left in place (see `replace_atomically`) has no permissions to keep.
+    if let Ok(old) = std::fs::symlink_metadata(target)
+        && !old.is_symlink()
+    {
         file.set_permissions(old.permissions())?;
     }
     file.sync_all()

@@ -2,7 +2,7 @@
 
 use crate::args::RunOptions;
 use crate::error::{RunError, settle};
-use crate::machine::{Machine, build_machine};
+use crate::machine::Machine;
 use crate::output::Output;
 use crate::report::{output_result, print_console, print_summary, report_resets, write_screenshot};
 use crate::run_and_save::run_and_save;
@@ -14,13 +14,13 @@ use std::io::{BufWriter, Write};
 
 /// Returns whether the run ended without a fault. The run goes in slices so that a signal ends
 /// it too, as `run_live` does.
-pub(crate) fn run_firmware(path: &str, options: &RunOptions) -> Result<bool, RunError> {
+pub(crate) fn run_firmware(machine: Machine, options: &RunOptions) -> Result<bool, RunError> {
     let Machine {
         mut cpu,
         console,
         sd,
         trace,
-    } = build_machine(path, options)?;
+    } = machine;
 
     let limit = options.run.unwrap_or(u64::MAX);
     signals::begin_run();

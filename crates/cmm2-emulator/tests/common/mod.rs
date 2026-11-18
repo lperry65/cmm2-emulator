@@ -7,12 +7,110 @@
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+// The emulator, with a board directory that can never be made (a path under /dev/null), so that
+// a test that reaches for the board and has not given itself one fails and does not touch the
+// owner's own board. A test of the board sets its own with `.env(HOME_VARIABLE, ...)`. This is the
+// only place that names the binary (tests/guard.rs sees to that), so every test goes through it.
+pub const HOME_VARIABLE: &str = "CMM2_EMULATOR_HOME";
+pub const NO_BOARD: &str = "/dev/null/no-board";
+const EMULATOR: &str = env!("CARGO_BIN_EXE_cmm2-emulator");
+
+pub fn emulator() -> Command {
+    let mut command = Command::new(EMULATOR);
+    // The other places the board could be looked for are as impossible, so that a test that
+    // removes `CMM2_EMULATOR_HOME` (or sets it to nothing, which counts as unset in a shell) still
+    // cannot reach the owner's board.
+    command
+        .env(HOME_VARIABLE, NO_BOARD)
+        .env("XDG_DATA_HOME", NO_BOARD)
+        .env("HOME", NO_BOARD)
+        .env("USERPROFILE", NO_BOARD);
+    command
+}
+
+// A child process that is killed, by its handle, and waited for when this is dropped, so that a
+// test that fails with the emulator still running (or never gets as far as stopping it) does not
+// leave it going: a live run does not end when its standard input does. It stands for the
+// `Child` (it derefs to it); `release` gives the child back for a test that waits for it itself.
+pub struct Guard(Option<Child>);
+
+impl Guard {
+    pub fn new(child: Child) -> Guard {
+        Guard(Some(child))
+    }
+
+    pub fn release(mut self) -> Child {
+        self.0.take().unwrap()
+    }
+}
+
+impl std::ops::Deref for Guard {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        self.0.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for Guard {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.0.as_mut().unwrap()
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+// `spawn`, into a `Guard`.
+pub trait SpawnGuarded {
+    fn spawn_guarded(&mut self) -> Guard;
+}
+
+impl SpawnGuarded for Command {
+    fn spawn_guarded(&mut self) -> Guard {
+        Guard::new(self.spawn().expect("failed to run cmm2-emulator"))
+    }
+}
+
+// Paths that are removed when this is dropped, a failed test too: a directory with what is in it
+// (made writable again first, as a test may have left it read-only), a file as it is.
+pub struct Cleanup(pub Vec<PathBuf>);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            if path.is_dir() {
+                let _ = std::fs::set_permissions(
+                    path,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                );
+                let _ = std::fs::remove_dir_all(path);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+// The path of the emulator binary, for a command that has to be built round it (one that runs it
+// in a mount namespace, say). The command that is built has to set the board variables itself: the
+// environment of `emulator()` does not come with a path. This is the only place that takes the
+// program out of a command.
+pub fn emulator_path() -> String {
+    emulator().get_program().to_str().unwrap().to_string()
+}
+
 pub fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    emulator()
         .args(args)
         // The window tests have no display to open on.
         .env("SDL_VIDEODRIVER", "dummy")
@@ -20,11 +118,13 @@ pub fn run(args: &[&str]) -> Output {
         .expect("failed to run cmm2-emulator")
 }
 
+pub mod board;
+
+#[path = "../../src/run_id.rs"]
+mod run_id;
+
 pub fn temp_path(name: &str, extension: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "cmm2-cli-{}-{name}.{extension}",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("cmm2-cli-{}-{name}.{extension}", run_id::run_id()))
 }
 
 pub const CODE: u32 = 0x0800_0100;
@@ -175,17 +275,16 @@ pub fn written_back(path: &PathBuf, image: &[u8], inode_before: u64) -> bool {
 
 // Starts a live run of WRITE_CARD with the flash file and the card, and returns it once it has
 // printed "done\n", so that the guest is running and has written the card.
-pub fn start_writing_run(name: &str, flash: &PathBuf, card: &PathBuf) -> std::process::Child {
+pub fn start_writing_run(name: &str, flash: &PathBuf, card: &PathBuf) -> Guard {
     let path = temp_program(name, &write_card(SPIN));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cmm2-emulator"))
+    let mut child = emulator()
         .args(["--firmware", path.to_str().unwrap(), "--console", "--flash"])
         .arg(flash)
         .arg("--sd")
         .arg(card)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
-        .expect("failed to run cmm2-emulator");
+        .spawn_guarded();
     let mut out = child.stdout.take().unwrap();
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
@@ -202,7 +301,6 @@ pub fn start_writing_run(name: &str, flash: &PathBuf, card: &PathBuf) -> std::pr
         let _ = std::io::copy(&mut out, &mut std::io::sink());
     });
     if receiver.recv_timeout(Duration::from_secs(30)).is_err() {
-        child.kill().unwrap();
         panic!("the guest never said it was done");
     }
     std::fs::remove_file(&path).unwrap();
@@ -242,9 +340,13 @@ pub fn run_with_read_only_mount(dir: &Path, firmware: &Path, args: &[&str]) -> O
     let output = Command::new("unshare")
         .args(["-rm", "sh", "-c", script, "sh"])
         .arg(dir)
-        .arg(env!("CARGO_BIN_EXE_cmm2-emulator"))
+        .arg(EMULATOR)
         .args(["--firmware", firmware.to_str().unwrap()])
         .args(args)
+        .env(HOME_VARIABLE, NO_BOARD)
+        .env("XDG_DATA_HOME", NO_BOARD)
+        .env("HOME", NO_BOARD)
+        .env("USERPROFILE", NO_BOARD)
         .env("SDL_VIDEODRIVER", "dummy")
         .output();
     match output {

@@ -1,4 +1,5 @@
-//! The commands that only look at something and run nothing: `--vectors` and `--lookup`.
+//! The commands that only look at something and run nothing: `--firmware` alone (it prints the
+//! vector table) and `--lookup`.
 
 use crate::error::RunError;
 use cmm2_core::{Firmware, Svd};
