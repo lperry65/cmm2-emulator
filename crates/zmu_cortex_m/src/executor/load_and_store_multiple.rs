@@ -21,6 +21,58 @@ pub trait IsaLoadAndStoreMultiple {
     fn exec_pop(&mut self, registers: EnumSet<Reg>, unaligned_allowed: bool) -> ExecuteResult;
 }
 
+/// The cycles a load of PC adds to the 1 + N of a load multiple: the refill of the pipeline (P).
+/// ARM publishes no timings for the Cortex-M7; the M4 TRM gives 1 + N and adds P, 1 to 3, for a PC
+/// load. LDM, LDMDB and POP all count P = 3.
+const PC_LOAD_REFILL_CYCLES: u32 = 3;
+
+impl Processor {
+    /// LDM and LDMDB: loads the words from `start` up, one per register, and writes `new_base`
+    /// back if the instruction writes back. Every word is read before anything is written, so a
+    /// fault, which is precise, leaves the base and every other register as they were. The write
+    /// back comes before the load of PC: that can be an exception return, which unstacks the
+    /// frame from the SP the instruction leaves and puts back registers (the base among them) that
+    /// the write back must not touch afterwards, as POP's pseudocode has it (A7.7.99) and real
+    /// cores do. A7.7.41 and A7.7.42 literally write back after `LoadWritePC`.
+    fn load_multiple(
+        &mut self,
+        params: &LoadAndStoreMultipleParams,
+        start: u32,
+        new_base: u32,
+    ) -> ExecuteResult {
+        let mut address = start;
+        require_aligned(address, 3)?;
+
+        // at most 15 registers: no SP in a 32-bit list
+        let mut loaded = [(Reg::R0, 0u32); 16];
+        let mut count = 0;
+        for reg in &params.registers {
+            loaded[count] = (reg, self.read32_data(address)?);
+            count += 1;
+            address = address.wrapping_add(4);
+        }
+
+        for &(reg, value) in &loaded[..count] {
+            if reg != Reg::PC {
+                self.set_r(reg, value);
+            }
+        }
+        // The decoders refuse write back with the base in the list (UNPREDICTABLE), so the base
+        // is not in `loaded` when this runs.
+        if params.wback {
+            self.set_r(params.rn, new_base);
+        }
+        let cycles = 1 + count as u32;
+        if params.registers.contains(&Reg::PC) {
+            self.load_write_pc(loaded[count - 1].1)?;
+            return Ok(ExecuteSuccess::Branched {
+                cycles: cycles + PC_LOAD_REFILL_CYCLES,
+            });
+        }
+        Ok(ExecuteSuccess::Taken { cycles })
+    }
+}
+
 impl IsaLoadAndStoreMultiple for Processor {
     fn exec_stm(&mut self, params: &LoadAndStoreMultipleParams) -> ExecuteResult {
         if self.condition_passed() {
@@ -71,74 +123,22 @@ impl IsaLoadAndStoreMultiple for Processor {
     }
 
     fn exec_ldm(&mut self, params: &LoadAndStoreMultipleParams) -> ExecuteResult {
-        if self.condition_passed() {
-            let regs_size = 4 * (params.registers.len() as u32);
-
-            let mut address = self.get_r(params.rn);
-
-            require_aligned(address, 3)?;
-
-            let mut branched = false;
-            for reg in &params.registers {
-                let value = self.read32_data(address)?;
-                if reg == Reg::PC {
-                    self.load_write_pc(value)?;
-                    branched = true;
-                } else {
-                    self.set_r(reg, value);
-                }
-                address = address.wrapping_add(4);
-            }
-
-            if params.wback && !params.registers.contains(&params.rn) {
-                self.add_r(params.rn, regs_size);
-            }
-            let cc = 1 + params.registers.len() as u32;
-            if branched {
-                return Ok(ExecuteSuccess::Branched { cycles: cc });
-            }
-            return Ok(ExecuteSuccess::Taken { cycles: cc });
+        if !self.condition_passed() {
+            return Ok(ExecuteSuccess::NotTaken);
         }
-        Ok(ExecuteSuccess::NotTaken)
+        let base = self.get_r(params.rn);
+        let new_base = base.wrapping_add(4 * params.registers.len() as u32);
+        self.load_multiple(params, base, new_base)
     }
 
     /// LDMDB (A7.7.42): the words just below the base, lowest register from the lowest address.
-    /// Every word is read before anything is written, so a fault, which is precise, leaves the
-    /// base and every other register as they were. Write back comes before the load of PC, so an
-    /// exception return with SP as the base sees the new SP, as a POP does.
     fn exec_ldmdb(&mut self, params: &LoadAndStoreMultipleParams) -> ExecuteResult {
         if !self.condition_passed() {
             return Ok(ExecuteSuccess::NotTaken);
         }
-        let regs_size = 4 * (params.registers.len() as u32);
         let base = self.get_r(params.rn);
-        let mut address = base.wrapping_sub(regs_size);
-        require_aligned(address, 3)?;
-
-        // at most 14 registers: no SP, and PC and LR are not both there
-        let mut loaded = [(Reg::R0, 0u32); 15];
-        let mut count = 0;
-        for reg in &params.registers {
-            loaded[count] = (reg, self.read32_data(address)?);
-            count += 1;
-            address = address.wrapping_add(4);
-        }
-
-        for &(reg, value) in &loaded[..count] {
-            if reg != Reg::PC {
-                self.set_r(reg, value);
-            }
-        }
-        if params.wback {
-            self.set_r(params.rn, base.wrapping_sub(regs_size));
-        }
-        let cycles = 1 + params.registers.len() as u32;
-        if params.registers.contains(&Reg::PC) {
-            self.load_write_pc(loaded[count - 1].1)?;
-            // the refill of a PC load, as for POP
-            return Ok(ExecuteSuccess::Branched { cycles: cycles + 3 });
-        }
-        Ok(ExecuteSuccess::Taken { cycles })
+        let new_base = base.wrapping_sub(4 * params.registers.len() as u32);
+        self.load_multiple(params, new_base, new_base)
     }
 
     fn exec_push(&mut self, registers: EnumSet<Reg>, unaligned_allowed: bool) -> ExecuteResult {
@@ -197,7 +197,7 @@ impl IsaLoadAndStoreMultiple for Processor {
 
             if registers.contains(&Reg::PC) {
                 return Ok(ExecuteSuccess::Branched {
-                    cycles: 4 + registers.len() as u32,
+                    cycles: 1 + registers.len() as u32 + PC_LOAD_REFILL_CYCLES,
                 });
             } else {
                 return Ok(ExecuteSuccess::Taken {

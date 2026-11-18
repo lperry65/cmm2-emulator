@@ -91,14 +91,58 @@ The firmware needs a few things zmu does not do, so I changed the following.
   LoadWritePC (BXWritePC, and so ExceptionReturn) first and writes back afterwards; but the write
   back has to reach the SP bank in use before the return, and the frame has to be read from the SP
   the instruction leaves, as POP's pseudocode (A7.7.99) has it and as real cores and QEMU do.
-  `exec_ldm` currently writes back after the return, so it differs (`ldm.w r2!, {r4, pc}` with an
-  EXC_RETURN loses r2); that is not fixed here. LDMDB counts 1 + N cycles, and 4 + N with a PC
-  load, as POP does for the same list: ARM publishes no Cortex-M7 per-instruction timings, and the
-  M4 TRM gives 1 + N for LDM and adds P, a pipeline refill of 1 to 3 cycles, for a PC load.
-  `exec_ldm` counts 1 + N for a PC load too, which disagrees with POP; also left as it is.
+  `exec_ldm` used to write back after the return; see the entry below (issue 80), which fixed it.
+  LDMDB counts 1 + N cycles, and 4 + N with a PC load, as POP does; the rule is the one below.
 - `executor/saturate.rs` is empty and nothing refers to it. It is empty in the upstream import
   too, so I left it. `executor/saturating_add_sub.rs` was empty upstream and is now the executor
   of QADD, QSUB, QDADD and QDSUB.
+- An exception return from the last instruction of an IT block lost the ITSTATE it restored
+  (issue 79): `execute()` advanced the ITSTATE after any branch, and after an exception return
+  that was the ITSTATE just unstacked for the interrupted code, so the thread's next instruction
+  ran unconditionally instead of under the condition the frame said. It does not advance after an
+  exception return now (the flag `exception_returned`, which the tail-chaining already had). It
+  holds for BX, POP, LDM, LDMDB and LDR with PC. `MOV PC, LR` is not an exception return (it is
+  BranchWritePC), so it advances the block as any branch does. The manual makes BX, POP and LDM
+  with PC UNPREDICTABLE inside an IT block unless last; zmu runs the return, and the ITSTATE is
+  the frame's whatever the handler's own block said.
+- `exec_ldm` wrote back after the exception return (issue 80): `ldm.w r2!, {r4, pc}` in Handler
+  mode, loading EXC_RETURN, left r2 as the stacked value plus 8. LDM and LDMDB are one routine
+  now: every word is read first (so a fault leaves every register as it was, where LDM used to
+  leave the registers it had loaded), the write back comes next, and the PC load is last, as POP
+  and LDR with write back already did. The same ordering was checked in LDR (immediate; the
+  register form has no write back in Thumb) and in POP: both were right.
+- Cycles of a load of PC: LDM counted 1 + N and POP 4 + N. One rule now, for LDM, LDMDB and POP:
+  1 + N, and a pipeline refill of P = 3 on top for a load of PC (4 + N). ARM publishes no
+  Cortex-M7 per-instruction timings; the M4 TRM gives 1 + N for LDM and POP and adds P, 1 to 3, for
+  a PC load, and POP's 3 was the value already in use. What moves is only an LDM that loads PC (a
+  `pop`-shaped `ldm sp!, {..., pc}` is decoded as POP and did not change), by 3 cycles. LDR with PC
+  keeps its 2 cycles.
+- SP bits 1:0 are RAZ/WI (issue 78). B1.4.1 (page B1-516) says "Armv7-M implementations treat SP
+  bits[1:0] as RAZ/WI"; A5.1.3 (page A5-127) makes them SBZP (a non-zero write is UNPREDICTABLE, a
+  read returns zero); and the pseudocode of `R[]` in B1.4.7 reads `SP<31:2>:'00'` (page B1-521) and
+  writes `SP<31:2>:'00'` (page B1-522). The pseudocode of MSR itself writes `SP_main = R[n]` with no
+  mask, so the mask on the MSR path comes from the B1.4.1 RAZ/WI rule. `mov sp, r1` with non-zero
+  low bits is UNPREDICTABLE under A5.1.3 but write-ignored under B1.4.1, so dropping the bits is a
+  permitted choice. zmu kept bits 1:0 of a value written to SP. Every write to `SP_main` and
+  `SP_process` now drops them: `set_r(SP)`, `set_msp`, `set_psp`, the SP arithmetic, MSR MSP and
+  PSP (which went round `set_msp`), the stack pointer loaded at reset (already masked) and the
+  exception return (the pop adds a multiple of 4 to an aligned SP, and bit 2 comes back as
+  STKALIGN says). The effect is that SP is never misaligned, so a PUSH or POP cannot raise the
+  alignment UsageFault from SP any more; four tests in `executor/mod.rs` that built that fault with
+  an odd SP were changed to use another base register or to say that it cannot happen, and the
+  tests of MRS MSP and PSP now expect the dropped bits. The STKALIGN logic reads bit 2 only and is
+  unchanged. Unicorn (QEMU) does not model this in either of its Thumb modes, so it cannot check
+  it.
+- `instruction_count` (also from issue 78: should a fetch fault add to it?) stays as it is. The
+  manual has no counter of instructions executed: the DWT counts cycles (CYCCNT), the extra cycles
+  of instructions (CPICNT), exceptions, sleep, load/store cycles and folded instructions, none of
+  them instructions. So it is zmu's own bookkeeping: one per instruction that was fetched and
+  decoded and begun in `execute()` (one that then faults counts), and a fetch that faults never
+  became an instruction. For cmm2-core it is the budget of a run (`while count < limit`) and the
+  figure in the report; a fetch fault takes an exception without advancing it, but that cannot
+  spin: the handler runs counted instructions, or fetch-faults again, which escalates and then
+  locks the core up, and the run loop stops on a lockup. A lockstep comparison or the JIT's oracle
+  that compares by `step()` calls must not use `instruction_count` as the number of steps.
 - Checked against Unicorn 2.1.5 (QEMU), a Cortex-M7 in Thumb mode: 75,800 random and boundary
   inputs, the 36 parallel adds and subtracts, the four saturating ones, the six multiplies and
   LDMDB, with registers, flags, Q, GE and memory compared: no differences. Unicorn is a local

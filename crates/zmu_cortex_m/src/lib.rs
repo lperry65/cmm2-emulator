@@ -170,8 +170,8 @@ pub struct Processor {
     /// sleeps (WFI). Off by default, as on the chip, where the CPU clock that drives the DWT stops
     /// in `CSleep` (RM0433 6.7.5, 8.5.12).
     pub dwt_runs_in_sleep: bool,
-    /// An exception return was made in the current step: an exception taken at its end is
-    /// tail-chained.
+    /// An exception return was made in the current instruction: an exception taken at its end is
+    /// tail-chained, and the IT state it restored is not advanced.
     pub(crate) exception_returned: bool,
     pub exit_code: u32,
 

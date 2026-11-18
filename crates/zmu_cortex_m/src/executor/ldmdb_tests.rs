@@ -223,9 +223,9 @@ fn cycles(outcome: ExecuteSuccess) -> u32 {
     }
 }
 
-// ARM publishes no Cortex-M7 timings. LDMDB counts as POP does for the same list: 1 + N, and
-// 4 + N when it loads PC (the M4 TRM gives 1 + N for LDM and P, a refill of 1 to 3 cycles, for a
-// PC load). LDM.W counts 1 + N for the PC load too, which differs; that is not changed here.
+// ARM publishes no Cortex-M7 timings. LDMDB counts as POP and LDM do for the same list: 1 + N, and
+// 1 + N + 3 when it loads PC (the M4 TRM gives 1 + N for LDM and adds P, a refill of 1 to 3
+// cycles, for a PC load).
 #[test]
 fn test_the_cycles_are_one_plus_n_and_four_plus_n_with_pc_like_pop() {
     let mut core = core_with_memory();

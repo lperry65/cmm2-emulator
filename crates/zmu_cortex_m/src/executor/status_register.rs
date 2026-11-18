@@ -132,8 +132,8 @@ impl IsaStatusRegister for Processor {
                     if self.current_mode_is_privileged() {
                         match params.sysm.get_bits(0..3) {
                             //PSP, MSP
-                            0 => self.msp = r_n,
-                            1 => self.psp = r_n,
+                            0 => self.set_msp(r_n),
+                            1 => self.set_psp(r_n),
                             _ => (),
                         }
                     }
@@ -425,7 +425,7 @@ mod tests {
             .unwrap();
 
         // Assert (value got)
-        assert_eq!(processor.get_r(Reg::R2), 0xcafe_babe);
+        assert_eq!(processor.get_r(Reg::R2), 0xcafe_babc);
     }
 
     #[test]
@@ -470,7 +470,7 @@ mod tests {
             .unwrap();
 
         // Assert (value got)
-        assert_eq!(processor.get_r(Reg::R2), 0xcafe_babe);
+        assert_eq!(processor.get_r(Reg::R2), 0xcafe_babc);
     }
 
     #[test]
@@ -493,7 +493,7 @@ mod tests {
             .unwrap();
 
         // Assert (handler mode remains privileged)
-        assert_eq!(processor.get_r(Reg::R2), 0xcafe_babe);
+        assert_eq!(processor.get_r(Reg::R2), 0xcafe_babc);
     }
 
     #[test]
@@ -516,7 +516,7 @@ mod tests {
             .unwrap();
 
         // Assert (value got)
-        assert_eq!(processor.get_r(Reg::R2), 0xdead_beef);
+        assert_eq!(processor.get_r(Reg::R2), 0xdead_beec);
     }
 
     #[test]
@@ -561,7 +561,7 @@ mod tests {
             .unwrap();
 
         // Assert (value got)
-        assert_eq!(processor.get_r(Reg::R2), 0xdead_beef);
+        assert_eq!(processor.get_r(Reg::R2), 0xdead_beec);
     }
 
     #[test]
@@ -584,7 +584,7 @@ mod tests {
             .unwrap();
 
         // Assert (handler mode remains privileged)
-        assert_eq!(processor.get_r(Reg::R2), 0xdead_beef);
+        assert_eq!(processor.get_r(Reg::R2), 0xdead_beec);
     }
 
     #[test]
@@ -1055,7 +1055,7 @@ mod tests {
             .unwrap();
 
         // Assert
-        assert_eq!(processor.msp, 0xcafe_babe);
+        assert_eq!(processor.msp, 0xcafe_babc);
     }
 
     #[test]

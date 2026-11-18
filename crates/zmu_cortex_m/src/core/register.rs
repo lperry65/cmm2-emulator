@@ -11,6 +11,10 @@ use enum_set::CLike;
 use std::fmt;
 use std::mem;
 
+/// SP bits 1:0 are RAZ/WI on ARMv7-M (B1.4.1, A5.1.3, and `R[]` in B1.4.7 which reads and writes
+/// `SP<31:2>:'00'`): every write to `SP_main` or `SP_process` drops them.
+const SP_MASK: u32 = 0xffff_fffc;
+
 ///
 /// Base register manipulation
 ///
@@ -195,9 +199,9 @@ impl BaseReg for Processor {
             match reg {
                 13 => {
                     if self.control.sp_sel {
-                        self.psp = value;
+                        self.psp = value & SP_MASK;
                     } else {
-                        self.msp = value;
+                        self.msp = value & SP_MASK;
                     }
                 }
                 14 => self.lr = value,
@@ -208,12 +212,12 @@ impl BaseReg for Processor {
 
     #[inline(always)]
     fn set_msp(&mut self, value: u32) {
-        self.msp = value;
+        self.msp = value & SP_MASK;
     }
 
     #[inline(always)]
     fn set_psp(&mut self, value: u32) {
-        self.psp = value;
+        self.psp = value & SP_MASK;
     }
     #[inline(always)]
     fn get_msp(&self) -> u32 {
@@ -254,9 +258,9 @@ impl BaseReg for Processor {
             match reg {
                 13 => {
                     if self.control.sp_sel {
-                        self.psp = self.psp.wrapping_add(value);
+                        self.psp = self.psp.wrapping_add(value) & SP_MASK;
                     } else {
-                        self.msp = self.msp.wrapping_add(value);
+                        self.msp = self.msp.wrapping_add(value) & SP_MASK;
                     }
                 }
                 14 => self.lr = self.lr.wrapping_add(value),
@@ -278,9 +282,9 @@ impl BaseReg for Processor {
             match reg {
                 13 => {
                     if self.control.sp_sel {
-                        self.psp = self.psp.wrapping_sub(value);
+                        self.psp = self.psp.wrapping_sub(value) & SP_MASK;
                     } else {
-                        self.msp = self.msp.wrapping_sub(value);
+                        self.msp = self.msp.wrapping_sub(value) & SP_MASK;
                     }
                 }
                 14 => self.lr = self.lr.wrapping_sub(value),
@@ -1023,13 +1027,20 @@ mod tests {
     #[test]
     fn test_registers_wrap_around_on_add_and_sub() {
         let mut processor = Processor::new();
-        for register in [Reg::R0, Reg::R12, Reg::SP, Reg::LR] {
+        for register in [Reg::R0, Reg::R12, Reg::LR] {
             processor.set_r(register, u32::MAX);
             processor.add_r(register, 2);
             assert_eq!(processor.get_r(register), 1);
             processor.sub_r(register, 2);
             assert_eq!(processor.get_r(register), u32::MAX);
         }
+        // SP wraps too, with bits 1:0 always zero
+        processor.set_r(Reg::SP, u32::MAX);
+        assert_eq!(processor.get_r(Reg::SP), 0xffff_fffc);
+        processor.add_r(Reg::SP, 4);
+        assert_eq!(processor.get_r(Reg::SP), 0);
+        processor.sub_r(Reg::SP, 4);
+        assert_eq!(processor.get_r(Reg::SP), 0xffff_fffc);
 
         processor.set_pc(u32::MAX);
         processor.add_r(Reg::PC, 2);

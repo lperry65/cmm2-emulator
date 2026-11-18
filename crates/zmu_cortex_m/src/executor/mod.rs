@@ -25,6 +25,8 @@ mod divide;
 #[cfg(test)]
 mod dsp_test_support;
 mod exception;
+#[cfg(all(test, not(feature = "armv6m")))]
+mod exception_return_tests;
 #[cfg(test)]
 mod guest_never_panics_tests;
 #[cfg(test)]
@@ -48,6 +50,8 @@ mod saturating_add_sub;
 mod saturating_add_sub_tests;
 mod shift;
 mod signed_multiply;
+#[cfg(test)]
+mod sp_low_bits_tests;
 mod status_register;
 mod std_data_processing;
 
@@ -997,6 +1001,7 @@ impl Executor for Processor {
         self.instruction_count += 1;
 
         let in_it_block = self.in_it_block();
+        self.exception_returned = false;
 
         match self.execute_internal(instruction) {
             Err(fault) => {
@@ -1011,8 +1016,10 @@ impl Executor for Processor {
                 1
             }
             Ok(ExecuteSuccess::Branched { cycles }) => {
-                // a BKPT that halts into a debugger leaves the PC, and so the IT state, alone
-                if in_it_block && !self.debug_halt {
+                // A BKPT that halts into a debugger leaves the PC, and so the IT state, alone. An
+                // exception return has put back the IT state of the code it returns to, which
+                // already says what is left of its block: advancing it would skip one.
+                if in_it_block && !self.debug_halt && !self.exception_returned {
                     self.it_advance();
                 }
                 cycles
@@ -1875,9 +1882,11 @@ mod tests {
                 if raises_unaligned(opcode, base, trp, *stack) {
                     wrong.push(format!("{name}: aligned faulted (trp {trp})"));
                 }
-                if !raises_unaligned(opcode, base + offset, trp, *stack) {
+                // a stack instruction cannot be given a misaligned SP: bits 1:0 are RAZ/WI
+                if raises_unaligned(opcode, base + offset, trp, *stack) == *stack {
                     wrong.push(format!(
-                        "{name}: unaligned at +{offset} did not fault (trp {trp})"
+                        "{name}: unaligned at +{offset}, expected a fault {} (trp {trp})",
+                        !*stack
                     ));
                 }
             }
@@ -1904,8 +1913,9 @@ mod tests {
             ("ldrb", Half(0x7801), false, 1, false),
             ("strb", Half(0x7001), false, 1, false),
             ("ldrex b", Wide(0xe8d0_1f4f), false, 1, false),
-            ("push {r1} (T3)", Wide(0xf84d_1d04), true, 2, true),
-            ("pop {r1} (T3)", Wide(0xf85d_1b04), true, 2, true),
+            // SP is never misaligned (bits 1:0 are RAZ/WI), so these cannot fault for alignment
+            ("push {r1} (T3)", Wide(0xf84d_1d04), true, 2, false),
+            ("pop {r1} (T3)", Wide(0xf85d_1b04), true, 2, false),
         ];
         let mut wrong = Vec::new();
         for (name, opcode, stack, offset, trapped) in &rows {
@@ -1948,8 +1958,9 @@ mod tests {
         assert_eq!(core.get_r(Reg::R1), 0);
     }
 
-    // The fault comes before any access or write back: an LDM that is refused loads nothing, and
-    // a POP leaves SP where it was.
+    // The fault comes before any access or write back: an LDM that is refused loads nothing and
+    // leaves its base alone. (A POP cannot be refused for alignment any more: SP bits 1:0 are
+    // RAZ/WI, so SP is never misaligned.)
     #[test]
     #[cfg(not(feature = "armv6m"))]
     fn test_a_refused_access_changes_nothing() {
@@ -1957,13 +1968,16 @@ mod tests {
         let mut core = Processor::new();
         core.write32(0xE000_ED24, 1 << 18).unwrap();
         core.ccr = 0;
-        core.set_msp(0x2000_0302);
+        core.set_msp(0x2000_0400);
+        core.set_r(Reg::R0, 0x2000_0302);
         core.set_pc(0x100);
-        let instruction = crate::decoder::decode_16(0xbc06); // pop {r1, r2}
+        let instruction = crate::decoder::decode_16(0xc806); // ldm r0!, {r1, r2}
         core.execute(&instruction, instruction_size(&instruction));
         assert_eq!(core.cfsr & (1 << 24), 1 << 24);
+        assert_eq!(core.get_r(Reg::R0), 0x2000_0302);
+        assert_eq!(core.get_r(Reg::R1), 0);
         // UsageFault entry stacked the frame on the same stack: SP is 0x20 below what it was
-        assert_eq!(core.get_msp(), 0x2000_0302 - 0x20);
+        assert_eq!(core.get_msp(), 0x2000_0400 - 0x20);
     }
 
     // The fault is precise: the base register keeps its value for every form that writes it back,
@@ -1996,21 +2010,8 @@ mod tests {
                 wrong.push(format!("{name}: r0 is {:#x}", core.get_r(Reg::R0)));
             }
         }
-        // POP T3 with UNALIGN_TRP
-        let mut core = Processor::new();
-        core.write32(0xE000_ED24, 1 << 18).unwrap();
-        core.ccr = 1 << 3;
-        core.set_msp(0x2000_0302);
-        core.set_pc(0x100);
-        let instruction = crate::decoder::decode_32(0xf85d_1b04); // pop {r1}
-        core.execute(&instruction, instruction_size(&instruction));
-        if core.cfsr & (1 << 24) == 0 {
-            wrong.push("pop {r1}: no fault".to_string());
-        }
-        // the entry lowered SP by the frame only
-        if core.get_msp() != 0x2000_0302 - 0x20 {
-            wrong.push(format!("pop {{r1}}: SP is {:#x}", core.get_msp()));
-        }
+        // (POP T3 with UNALIGN_TRP used to be tried with SP misaligned; SP bits 1:0 are RAZ/WI,
+        // so it cannot be.)
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
