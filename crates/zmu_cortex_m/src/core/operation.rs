@@ -221,6 +221,21 @@ pub fn ror(value: u32, shift: usize) -> u32 {
     }
 }
 
+///
+/// `SignedSatQ` and `UnsignedSatQ`: the value clamped to the range of a `bits`-bit signed or
+/// unsigned number, and whether it had to be (which is what sets Q). `bits` is 1 to 32 when
+/// signed and 0 to 31 when unsigned, the range of SSAT and USAT, so the bounds fit in 64 bits.
+///
+pub fn saturate(value: i64, bits: u32, signed: bool) -> (i64, bool) {
+    let (low, high) = if signed {
+        (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1)
+    } else {
+        (0, (1i64 << bits) - 1)
+    };
+    let result = value.clamp(low, high);
+    (result, result != value)
+}
+
 fn rrx_c(value: u32, carry_in: bool) -> (u32, bool) {
     let carry_out = value.get_bit(0);
     let result = (value >> 1) + (u32::from(carry_in) << 31);

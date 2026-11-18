@@ -495,3 +495,72 @@ fn test_decode_qadd_family_and_smmul_family_without_dsp_ext_are_udf() {
         );
     }
 }
+
+// Without the DSP extension, the encodings of issue 77, batch 3 are undefined: SSAT16 and USAT16
+// are in the space of SSAT and USAT with `sh = 1` and no shift amount, which is UNDEFINED there
+// (A7.7.152, A7.7.213), and not SSAT or USAT with ASR #32.
+#[test]
+#[cfg(not(feature = "has-dsp-ext"))]
+fn test_decode_batch3_without_dsp_ext_are_udf() {
+    for opcode in [
+        0xfb72_f103u32, // usad8 r1, r2, r3
+        0xfb72_4103,    // usada8 r1, r2, r3, r4
+        0xfa2f_f183,    // sxtb16 r1, r3
+        0xfa22_f183,    // sxtab16 r1, r2, r3
+        0xfa3f_f193,    // uxtb16 r1, r3, ror #8
+        0xfa32_f193,    // uxtab16 r1, r2, r3, ror #8
+        0xf322_010f,    // ssat16 r1, #16, r2
+        0xf3a2_010f,    // usat16 r1, #15, r2
+        0xfb32_f103,    // smulwb r1, r2, r3
+        0xfb32_4113,    // smlawt r1, r2, r3, r4
+        0xfbc3_1284,    // smlalbb r1, r2, r3, r4
+        0xfbc3_12b4,    // smlaltt
+        0xfb22_f103,    // smuad r1, r2, r3
+        0xfb22_4113,    // smladx
+        0xfb42_f113,    // smusdx
+        0xfb42_4103,    // smlsd
+        0xfbc3_12d4,    // smlaldx
+        0xfbd3_12c4,    // smlsld
+        0xfbe3_1264,    // umaal r1, r2, r3, r4
+    ] {
+        assert_udf_32(opcode);
+    }
+}
+
+#[test]
+#[cfg(feature = "has-dsp-ext")]
+fn test_decode_ssat16_and_usat16_are_not_ssat_and_usat_with_asr_32() {
+    use crate::core::instruction::Sat16Params;
+    assert_eq!(
+        decode_32(0xf322_010f),
+        Instruction::SAT16 {
+            params: Sat16Params {
+                rd: Reg::R1,
+                rn: Reg::R2,
+                saturate_to: 16,
+            },
+            signed: true,
+        }
+    );
+    assert_eq!(
+        decode_32(0xf3a2_0100),
+        Instruction::SAT16 {
+            params: Sat16Params {
+                rd: Reg::R1,
+                rn: Reg::R2,
+                saturate_to: 0,
+            },
+            signed: false,
+        }
+    );
+}
+
+// With or without the extension, SSAT and USAT with `sh = 1` and no shift amount, that are not
+// SSAT16 and USAT16 (sat_imm bit 4 set, which the SSAT and USAT table patterns let through to
+// the decoder's refusal), are undefined, not an ASR #32.
+#[test]
+fn test_decode_ssat_usat_with_sh_and_no_amount_are_not_asr_32() {
+    for opcode in [0xf322_011fu32, 0xf322_0117, 0xf3a2_0110, 0xf3a2_011f] {
+        assert_udf_32(opcode);
+    }
+}

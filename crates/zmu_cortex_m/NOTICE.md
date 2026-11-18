@@ -79,6 +79,68 @@ The firmware needs a few things zmu does not do, so I changed the following.
   of `(Ra << 32) +- Rn * Rm` in 64 bits, with 0x8000_0000 added first for the R forms. The sum can
   pass 2^63 and only bits 63:32 are kept, so it wraps. SMMLA with Ra = PC is SMMUL; SMMLS with Ra =
   PC or SP, and SMMLA with Ra = SP, are UNPREDICTABLE and decode as UDF. None of them sets Q.
+- DSP extension, USAD8 and USADA8 (A7.7.211, .212) were decoded as undefined. One decoder and one
+  executor (`Instruction::USAD8`, `decoder/usad8.rs`, `executor/sum_abs_diff.rs`): the sum of the
+  four absolute differences of the unsigned bytes, with Ra added for USADA8 (Ra = PC is USAD8),
+  wrapped to 32 bits. Neither GE nor Q is touched. Table A5-28 has the two Ra columns of this row
+  the wrong way round; I followed the instruction pages, and llvm and Unicorn agree with them.
+- DSP extension, SXTB16, SXTAB16, UXTB16 and UXTAB16 (A7.7.183, .180, .222, .219) were decoded as
+  undefined. One decoder and one executor (`Instruction::EXTEND16`, `executor/extend16.rs`): the
+  bytes 0 and 2 of Rm rotated by 0, 8, 16 or 24, extended to two halfwords, and for the add forms
+  added to the halfwords of Rn, each wrapping on its own with no carry into the other. Rn = PC is
+  the plain extend. The existing SXTAB, SXTAH, UXTAB and UXTAH were checked in the same run (all
+  four rotations, a sum that wraps, Rd = Rn and Rd = Rm), and were right; what they lacked was the
+  register rule of their pages (Rd or Rm SP or PC, and Rn = SP, are UNPREDICTABLE), which now
+  decodes as UDF for them too (`decoder/unpredictable_dsp.rs`). The bit hw2<6> that the diagrams
+  mark (0) must be 0 here, as it is for the other extends; llvm-mc also decodes it set (see below).
+- SSAT16 and USAT16 (A7.7.153, .214) were decoded as SSAT and USAT with `ASR #32`, so they ran with
+  a silently wrong result. They are `Instruction::SAT16` now (`decoder/sat16.rs`,
+  `executor/saturate16.rs`): the two halfwords are saturated on their own to 1 to 16 bits
+  (SSAT16) or 0 to 15 (USAT16), and Q is set if either saturated. The table entry comes before
+  SSAT and USAT, and the SSAT and USAT decoders refuse `sh = 1` with a shift amount of 0 (what is
+  left of that space, sat_imm bit 4 or 5 set, the (0) bits of SSAT16; and all of it without the DSP
+  extension, where A7.7.152 says UNDEFINED), so none of it is an ASR #32 any more. The shift forms
+  of SSAT and USAT themselves (LSL 0 to 31, ASR 1 to 31, 1 to 32 and 0 to 31 bits, Q) were
+  checked and were right. Their disassembly now shows the shift, and Rd or Rn as SP or PC is
+  UNPREDICTABLE and decodes as UDF (it was only PC for Rd). The clamp is one `saturate()` in
+  `core/operation.rs` for SSAT, USAT, SSAT16 and USAT16.
+- DSP extension, SMULWB, SMULWT, SMLAWB and SMLAWT (A7.7.150, .141) were decoded as undefined
+  (`Instruction::SMULW`, `executor/word_multiply.rs`): bits 47:16 of Rn times the chosen signed
+  halfword of Rm, with Ra << 16 added first for SMLAW, which sets Q (never clears it) when that
+  sum does not fit 32 bits. SMULW cannot overflow and never sets Q.
+- DSP extension, SMUAD, SMUSD, SMLAD and SMLSD with their X forms (A7.7.147, .151, .137, .142) and
+  SMLALD, SMLALDX, SMLSLD and SMLSLDX (A7.7.140, .143) were decoded as undefined
+  (`Instruction::SMDUAL` and `SMDUAL_LONG`, `executor/dual_multiply.rs`). The two signed halfword
+  products (Rm's halfwords exchanged for X) are added or subtracted, and Ra, or the 64-bit
+  RdHi:RdLo, added, in a wide integer. For the 32-bit ones Q is set when the whole sum does not fit
+  (SMUSD cannot overflow); for the long ones the sum wraps at 2^64 and Q is not set.
+- DSP extension, SMLALBB, SMLALBT, SMLALTB and SMLALTT (A7.7.139) and UMAAL (A7.7.202, which is
+  Armv7E-M, so it needs the DSP extension too) were decoded as undefined
+  (`Instruction::SMLAL_half` and `UMAAL`, `executor/long_multiply.rs`). The signed halfword
+  product wraps into the 64-bit accumulate without Q; UMAAL is Rn * Rm + RdHi + RdLo unsigned,
+  which is at most 2^64 - 1. RdHi = RdLo, and SP or PC in any register, are UNPREDICTABLE for all
+  the long ones here and decode as UDF; without the DSP extension all of these are undefined.
+  (SMLAL, UMLAL, SMULL and UMULL still lack those two rules; they are not part of this batch.)
+- Checked against Unicorn 2.1.5 (QEMU), a Cortex-M7 in Thumb mode, with random vectors mixed with
+  boundary values and random NZCVQ and GE, registers chosen to overlap: two runs of 600,000
+  vectors (1,200,000 in all) over USAD8, USADA8, SXTB16, SXTAB16, UXTB16, UXTAB16, SXTAB, UXTAB,
+  SXTAH, UXTAH, SXTB, UXTH (10,000 to 20,000 each), SSAT16, USAT16 (20,000), SSAT, USAT (60,000),
+  SMULW, SMLAW, SMUAD, SMLAD, SMUSD, SMLSD, SMLALD, SMLSLD, UMAAL (20,000 each) and SMLAL<x><y>
+  (40,000), per run. One difference, 26 vectors of the second run, all SMLAD: Unicorn sets Q when
+  the partial sum of the two products is 2^31 (both halfwords of both operands -32768) even when
+  the accumulate then brings the total back in range. The pseudocode of A7.7.137 sets Q only if
+  the whole sum differs from its low 32 bits, and I follow it; real silicon was not available to
+  decide. Every other register, flag, Q and GE matched. A harness with four planted bugs showed
+  mismatches in each of the instructions it touched, so it does see these differences. What the
+  check could not cover: encodings with an UNPREDICTABLE register (the runner never makes one) and
+  the bits that must be zero.
+- The decode was swept against llvm-mc over 7.6 million opcodes (hw1 in the SSAT, USAT, extend,
+  multiply and long multiply ranges with Rn 0, 2, 13 or 15, hw2 all 65,536): the 226,192 opcodes
+  this tree decodes as one of these families (and SMLAL) all assemble with llvm-mc to the same
+  opcode from their disassembly text, but for 9,304 existing SMLAL ones llvm calls UNPREDICTABLE;
+  and every opcode llvm decodes as one of them that this tree does not (351,408) is SP or PC as a
+  register, RdLo = RdHi, SMLAL, or the extends with the bit hw2<6> set, which the manual marks
+  (0) and this tree, as for the existing extends, treats as undefined.
 - LDMDB (LDMEA is the same encoding) was hardwired to UDF in the decoder. It runs now
   (`exec_ldmdb`). All the words are read before anything is written, so a fault, which is precise,
   leaves the base and every other register as they were. Write back comes before the load of PC,

@@ -501,6 +501,27 @@ fn main() -> Result<(), Box<dyn Error>> {
             // must be 000
             ("111110110101............000.....", "SMMLA_t1"),
             ("111110110110............000.....", "SMMLS_t1"),
+            // USAD8 and USADA8 (op1 = 111, op2 = 00; USAD8 has Ra = 1111)
+            ("111110110111............0000....", "USAD8_t1"),
+            // SMUAD, SMLAD (op1 = 010) and SMUSD, SMLSD (op1 = 100), with their X forms in hw2<4>
+            ("111110110010............000.....", "SMLAD_t1"),
+            ("111110110100............000.....", "SMLSD_t1"),
+            // SMULWB, SMULWT, SMLAWB and SMLAWT (op1 = 011)
+            ("111110110011............000.....", "SMLAW_t1"),
+            // SXTB16, SXTAB16, UXTB16 and UXTAB16: the ones with Rn = 1111 have no add
+            ("11111010001011111111....10......", "SXTB16_t1"),
+            ("111110100010....1111....10......", "SXTAB16_t1"),
+            ("11111010001111111111....10......", "UXTB16_t1"),
+            ("111110100011....1111....10......", "UXTAB16_t1"),
+            // SSAT16 and USAT16 take the encodings of SSAT and USAT with sh = 1 and no shift amount
+            ("111100110010....0000....0000....", "SSAT16_t1"),
+            ("111100111010....0000....0000....", "USAT16_t1"),
+            // The long multiplies: SMLALBB and the other three (op2 = 10xx), SMLALD (op2 = 110x),
+            // SMLSLD (op1 = 101, op2 = 110x), UMAAL (op1 = 110, op2 = 0110)
+            ("111110111100............10......", "SMLAL_half_t1"),
+            ("111110111100............110.....", "SMLALD_t1"),
+            ("111110111101............110.....", "SMLSLD_t1"),
+            ("111110111110............0110....", "UMAAL_t1"),
         ]);
     }
 

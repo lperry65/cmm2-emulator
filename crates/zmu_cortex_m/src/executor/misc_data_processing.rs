@@ -9,7 +9,7 @@ use crate::core::instruction::Reg3NoSetFlagsParams;
 use crate::core::{
     bits::Bits,
     instruction::{BfcParams, BfiParams, BfxParams, MovtParams, Reg2RdRmParams},
-    operation::sign_extend,
+    operation::{saturate, sign_extend},
     register::{Apsr, BaseReg},
 };
 
@@ -112,15 +112,9 @@ impl IsaMiscDataProcessing for Processor {
                 params.shift_n as usize,
                 c,
             ) as i32);
-            let n = u32::from(params.saturate_to);
-            let (lo, hi) = if signed {
-                (-(1i64 << (n - 1)), (1i64 << (n - 1)) - 1)
-            } else {
-                (0, (1i64 << n) - 1)
-            };
-            let result = operand.clamp(lo, hi);
+            let (result, saturated) = saturate(operand, u32::from(params.saturate_to), signed);
             self.set_r(params.rd, result as u32);
-            if result != operand {
+            if saturated {
                 self.psr.set_q(true);
             }
             return Ok(ExecuteSuccess::Taken { cycles: 1 });

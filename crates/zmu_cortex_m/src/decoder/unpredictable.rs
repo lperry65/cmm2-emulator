@@ -51,7 +51,7 @@ pub(super) fn is_memory_hint(instruction: &Instruction) -> bool {
     }
 }
 
-fn is_bad(register: Reg) -> bool {
+pub(super) fn is_bad(register: Reg) -> bool {
     register == Reg::SP || register == Reg::PC
 }
 

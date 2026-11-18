@@ -24,15 +24,27 @@ mod coproc;
 mod divide;
 #[cfg(test)]
 mod dsp_test_support;
+#[cfg(feature = "has-dsp-ext")]
+mod dual_multiply;
+#[cfg(all(test, feature = "has-dsp-ext"))]
+mod dual_multiply_tests;
 mod exception;
 #[cfg(all(test, not(feature = "armv6m")))]
 mod exception_return_tests;
+#[cfg(feature = "has-dsp-ext")]
+mod extend16;
+#[cfg(all(test, feature = "has-dsp-ext"))]
+mod extend16_tests;
 #[cfg(test)]
 mod guest_never_panics_tests;
 #[cfg(test)]
 mod ldmdb_tests;
 mod load_and_store;
 mod load_and_store_multiple;
+#[cfg(feature = "has-dsp-ext")]
+mod long_multiply;
+#[cfg(all(test, feature = "has-dsp-ext"))]
+mod long_multiply_tests;
 mod misc;
 mod misc_data_processing;
 #[cfg(feature = "has-dsp-ext")]
@@ -45,6 +57,12 @@ mod parallel_add;
 #[cfg(all(test, feature = "has-dsp-ext"))]
 mod parallel_add_tests;
 #[cfg(feature = "has-dsp-ext")]
+mod saturate16;
+#[cfg(all(test, feature = "has-dsp-ext"))]
+mod saturate16_tests;
+#[cfg(test)]
+mod saturate_tests;
+#[cfg(feature = "has-dsp-ext")]
 mod saturating_add_sub;
 #[cfg(all(test, feature = "has-dsp-ext"))]
 mod saturating_add_sub_tests;
@@ -54,6 +72,14 @@ mod signed_multiply;
 mod sp_low_bits_tests;
 mod status_register;
 mod std_data_processing;
+#[cfg(feature = "has-dsp-ext")]
+mod sum_abs_diff;
+#[cfg(all(test, feature = "has-dsp-ext"))]
+mod sum_abs_diff_tests;
+#[cfg(feature = "has-dsp-ext")]
+mod word_multiply;
+#[cfg(all(test, feature = "has-dsp-ext"))]
+mod word_multiply_tests;
 
 #[cfg(all(test, feature = "has-fp"))]
 mod fp_arith_tests;
@@ -73,9 +99,15 @@ mod fp_test_support;
 use branch::IsaBranch;
 use coproc::IsaCoprocessor;
 use divide::IsaDivide;
+#[cfg(feature = "has-dsp-ext")]
+use dual_multiply::IsaDualMultiply;
 use exception::IsaException;
+#[cfg(feature = "has-dsp-ext")]
+use extend16::IsaExtend16;
 use load_and_store::IsaLoadAndStore;
 use load_and_store_multiple::IsaLoadAndStoreMultiple;
+#[cfg(feature = "has-dsp-ext")]
+use long_multiply::IsaLongMultiply;
 use misc::IsaMisc;
 use misc_data_processing::IsaMiscDataProcessing;
 #[cfg(feature = "has-dsp-ext")]
@@ -85,11 +117,17 @@ use packing::IsaPacking;
 #[cfg(feature = "has-dsp-ext")]
 use parallel_add::IsaParallelAddSub;
 #[cfg(feature = "has-dsp-ext")]
+use saturate16::IsaSaturate16;
+#[cfg(feature = "has-dsp-ext")]
 use saturating_add_sub::IsaSaturatingAddSub;
 use shift::IsaShift;
 use signed_multiply::IsaSignedMultiply;
 use status_register::IsaStatusRegister;
 use std_data_processing::IsaStandardDataProcessing;
+#[cfg(feature = "has-dsp-ext")]
+use sum_abs_diff::IsaSumAbsDiff;
+#[cfg(feature = "has-dsp-ext")]
+use word_multiply::IsaWordMultiply;
 
 #[cfg(feature = "has-fp")]
 use fp_data_processing::IsaFloatingPointDataProcessing;
@@ -590,6 +628,39 @@ impl ExecutorHelper for Processor {
             Instruction::SMLA { params } => self.exec_smla(params),
             #[cfg(not(feature = "has-dsp-ext"))]
             Instruction::SMLA { .. } => Err(Fault::UndefInstr),
+            #[cfg(feature = "has-dsp-ext")]
+            Instruction::SMULW {
+                params,
+                m_high,
+                accumulate,
+            } => self.exec_smulw(params, *m_high, *accumulate),
+            #[cfg(feature = "has-dsp-ext")]
+            Instruction::SMDUAL {
+                params,
+                subtract,
+                swap,
+                accumulate,
+            } => self.exec_smdual(params, *subtract, *swap, *accumulate),
+            #[cfg(feature = "has-dsp-ext")]
+            Instruction::SMDUAL_LONG {
+                params,
+                subtract,
+                swap,
+            } => self.exec_smdual_long(params, *subtract, *swap),
+            #[cfg(feature = "has-dsp-ext")]
+            Instruction::SMLAL_half {
+                params,
+                n_high,
+                m_high,
+            } => self.exec_smlal_half(params, *n_high, *m_high),
+            #[cfg(feature = "has-dsp-ext")]
+            Instruction::UMAAL { params } => self.exec_umaal(params),
+            #[cfg(not(feature = "has-dsp-ext"))]
+            Instruction::SMULW { .. }
+            | Instruction::SMDUAL { .. }
+            | Instruction::SMDUAL_LONG { .. }
+            | Instruction::SMLAL_half { .. }
+            | Instruction::UMAAL { .. } => Err(Fault::UndefInstr),
 
             // --------------------------------------------
             //
@@ -629,6 +700,14 @@ impl ExecutorHelper for Processor {
             Instruction::UXTAH { params } => self.exec_uxtah(params),
             Instruction::SXTAB { params } => self.exec_sxtab(params),
             Instruction::SXTAH { params } => self.exec_sxtah(params),
+            #[cfg(feature = "has-dsp-ext")]
+            Instruction::EXTEND16 {
+                params,
+                signed,
+                add,
+            } => self.exec_extend16(params, *signed, *add),
+            #[cfg(not(feature = "has-dsp-ext"))]
+            Instruction::EXTEND16 { .. } => Err(Fault::UndefInstr),
             Instruction::PKH { params, tb_form } => self.exec_pkh(params, *tb_form),
 
             // --------------------------------------------
@@ -677,6 +756,10 @@ impl ExecutorHelper for Processor {
             Instruction::RBIT { params } => self.exec_rbit(*params),
             Instruction::SSAT { params } => self.exec_sat(params, true),
             Instruction::USAT { params } => self.exec_sat(params, false),
+            #[cfg(feature = "has-dsp-ext")]
+            Instruction::SAT16 { params, signed } => self.exec_sat16(params, *signed),
+            #[cfg(not(feature = "has-dsp-ext"))]
+            Instruction::SAT16 { .. } => Err(Fault::UndefInstr),
             Instruction::REV { params, .. } => self.exec_rev(*params),
             Instruction::REV16 { params, .. } => self.exec_rev16(*params),
             Instruction::REVSH { params, .. } => self.exec_revsh(*params),
@@ -693,6 +776,10 @@ impl ExecutorHelper for Processor {
             Instruction::SEL { params } => self.exec_sel(params),
             #[cfg(not(feature = "has-dsp-ext"))]
             Instruction::SEL { .. } => Err(Fault::UndefInstr),
+            #[cfg(feature = "has-dsp-ext")]
+            Instruction::USAD8 { params, accumulate } => self.exec_usad8(params, *accumulate),
+            #[cfg(not(feature = "has-dsp-ext"))]
+            Instruction::USAD8 { .. } => Err(Fault::UndefInstr),
             // --------------------------------------------
             //
             // Group: Status register access instructions

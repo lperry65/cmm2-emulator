@@ -5,6 +5,11 @@ use crate::core::operation::decode_imm_shift;
 #[allow(non_snake_case)]
 pub fn decode_USAT_t1(opcode: u32) -> Instruction {
     let imm5 = ((opcode.get_bits(12..15) << 2) + opcode.get_bits(6..8)) as u8;
+    // sh = 1 with an amount of 0 is USAT16 where there is the DSP extension, and the table has
+    // it first; whatever of that space is left is not USAT with ASR #32, it is undefined
+    if opcode.get_bit(21) && imm5 == 0 {
+        return super::decode_UDF_t2(opcode);
+    }
     let (shift_t, shift_n) = decode_imm_shift(u8::from(opcode.get_bit(21)) << 1, imm5);
     Instruction::USAT {
         params: SatParams {

@@ -22,6 +22,7 @@ mod sbfx;
 mod ssat;
 mod ubfx;
 mod unpredictable;
+mod unpredictable_dsp;
 mod usat;
 mod wfe;
 mod wfi;
@@ -50,6 +51,8 @@ mod dmb;
 mod dsb;
 
 mod eor;
+#[cfg(feature = "has-dsp-ext")]
+mod extend16;
 
 mod isb;
 mod it;
@@ -61,6 +64,8 @@ mod ldrb;
 mod ldrh;
 mod ldrsb;
 mod ldrsh;
+#[cfg(feature = "has-dsp-ext")]
+mod long_multiply;
 mod lsl;
 mod lsr;
 
@@ -94,11 +99,15 @@ mod ror;
 mod rrx;
 mod rsb;
 
+#[cfg(feature = "has-dsp-ext")]
+mod sat16;
 mod sbc;
 mod sdiv;
 #[cfg(feature = "has-dsp-ext")]
 mod sel;
 mod sev;
+#[cfg(feature = "has-dsp-ext")]
+mod smdual;
 #[cfg(feature = "has-dsp-ext")]
 mod smla;
 mod smlal;
@@ -107,6 +116,8 @@ mod smm;
 #[cfg(feature = "has-dsp-ext")]
 mod smul;
 mod smull;
+#[cfg(feature = "has-dsp-ext")]
+mod smulw;
 mod stc;
 mod stm;
 mod str;
@@ -123,6 +134,8 @@ mod movt;
 mod udiv;
 mod umlal;
 mod umull;
+#[cfg(feature = "has-dsp-ext")]
+mod usad8;
 mod uxt;
 #[cfg(feature = "has-dsp-ext")]
 mod uxtab;
@@ -300,13 +313,19 @@ use {
 
 #[cfg(feature = "has-dsp-ext")]
 use self::{
+    extend16::{decode_SXTAB16_t1, decode_SXTB16_t1, decode_UXTAB16_t1, decode_UXTB16_t1},
+    long_multiply::{decode_SMLAL_half_t1, decode_SMLALD_t1, decode_SMLSLD_t1, decode_UMAAL_t1},
     parallel::decode_PARALLEL_t1,
     pkh::decode_PKH_t1,
     qsat::decode_QSAT_t1,
+    sat16::{decode_SSAT16_t1, decode_USAT16_t1},
     sel::decode_SEL_t1,
+    smdual::{decode_SMLAD_t1, decode_SMLSD_t1},
     smla::decode_SMLA_t1,
     smm::{decode_SMMLA_t1, decode_SMMLS_t1},
     smul::decode_SMUL_t1,
+    smulw::decode_SMLAW_t1,
+    usad8::decode_USAD8_t1,
     uxtab::{decode_SXTAB_t1, decode_SXTAH_t1, decode_UXTAB_t1, decode_UXTAH_t1},
 };
 
@@ -425,6 +444,7 @@ pub fn decode_32(opcode: u32) -> Instruction {
     } else if unpredictable::is_unallocated_addressing(&instruction)
         || unpredictable::writes_pc_as_plain_register(&instruction)
         || unpredictable::uses_a_register_the_manual_forbids(&instruction)
+        || unpredictable_dsp::uses_a_register_the_manual_forbids(&instruction)
     {
         decode_UDF_t2(opcode)
     } else {

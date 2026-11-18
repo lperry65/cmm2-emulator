@@ -328,6 +328,16 @@ pub struct SatParams {
     pub shift_n: u8,
 }
 
+/// The operands of SSAT16 and USAT16: two halfwords saturated to `saturate_to` bits, which is 1 to
+/// 16 for SSAT16 and 0 to 15 for USAT16
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub struct Sat16Params {
+    pub rd: Reg,
+    pub rn: Reg,
+    pub saturate_to: u8,
+}
+
 #[allow(missing_docs)]
 #[derive(PartialEq, Debug, Copy, Clone)]
 pub struct Reg2RdRmParams {
@@ -1056,49 +1066,37 @@ pub enum Instruction {
         params: Reg4HighParams,
     },
 
-    //SMLAL second variant?
-
-    // Signed Multiply Accumulate Long, halfwords
-    // SMLABB, SMLABT, SMLATT, SMLATB
-
-    // Signed Multiply Accumulate Dual
-    // SMLAD, SMLADX
-
-    // Signed Multiply Accumulate Long, halfwords
-    // SMLALBB, SMLALBT, SMLALTT, SMLALTB
-
-    // Signed Multiply Accumulate Long Dual
-    // SMLALD, SMLALDX
-
-    // Signed Multiply Accumulate, word by halfword
-    // SMLAWB, SMLAWT
-
-    // Signed Multiply Subtract Dual
-    // SMLSD, SMLSDX
-
-    // Signed Multiply Subtract Long Dual
-    // SMLSLD, SMLSLDX
-
-    // Signed most significant word Multiply Accumulate
-    // SMMLA, SMMLAR
-
-    // Signed most significant word Multiply Subtract
-    // SMMLS, SMMLSR
-
-    // Signed most significant Word Multiply
-    // SMMUL, SMMULR
-
-    // Signed Dual Multiply Add
-    // SMUAD, SMUADX
-
-    // Signed Multiply, halfwords
-    // SMULBB, SMULBT, SMULTB, SMULTT
-
-    // Signed Multiply, word by halfword
-    // SMULWB, SMULWT
-
-    // Signed Dual Multiply Subtract
-    // SMUSD, SMUSDX
+    /// SMUAD, SMUADX, SMUSD, SMUSDX, SMLAD, SMLADX, SMLSD and SMLSDX (A7.7.147, .151, .137, .142):
+    /// two signed halfword products, added or subtracted, with Ra added if `accumulate`, and Rm
+    /// rotated by 16 first if `swap`. Q is set if the sum overflows 32 bits.
+    SMDUAL {
+        params: Reg4NoSetFlagsParams,
+        subtract: bool,
+        swap: bool,
+        accumulate: bool,
+    },
+    /// SMLALD, SMLALDX, SMLSLD and SMLSLDX (A7.7.140, .143): the same two products, added or
+    /// subtracted, to the 64-bit value in RdHi:RdLo. Q is not set.
+    SMDUAL_LONG {
+        params: Reg643232Params,
+        subtract: bool,
+        swap: bool,
+    },
+    /// SMLALBB, SMLALBT, SMLALTB and SMLALTT (A7.7.139): a signed halfword product added to the
+    /// 64-bit value in RdHi:RdLo
+    SMLAL_half {
+        params: Reg643232Params,
+        n_high: bool,
+        m_high: bool,
+    },
+    /// SMULWB, SMULWT, SMLAWB and SMLAWT (A7.7.150, .141): the top 32 bits of Rn times a signed
+    /// halfword of Rm, with Ra added if `accumulate` (and Q set if that overflows). `ra` is not
+    /// used without it.
+    SMULW {
+        params: Reg4NoSetFlagsParams,
+        m_high: bool,
+        accumulate: bool,
+    },
 
     //
     // Subgroup: Unsigned Multiply instructions (ARMv7-M base architecture)
@@ -1113,7 +1111,10 @@ pub enum Instruction {
     //
     // Subgroup: Unsigned multiply instructions (Armv7-M DSP extension)
     //
-    // UMAAL
+    /// Unsigned Multiply Accumulate Accumulate Long (A7.7.202): Rn * Rm + `RdHi` + `RdLo`
+    UMAAL {
+        params: Reg643232Params,
+    },
 
     // --------------------------------------------
     //
@@ -1130,8 +1131,12 @@ pub enum Instruction {
     //
     // Subgroup: Halfword saturating instructions, (ARMv7-M DSP extensions)
     //
-    //USAT16
-    //SSAT16
+    /// SSAT16 and USAT16 (A7.7.153, .214): each halfword saturated on its own, with Q set if
+    /// either was
+    SAT16 {
+        params: Sat16Params,
+        signed: bool,
+    },
 
     //
     // Subgroup: Saturating addition and subtraction instructions, Armv7-M DSP extension
@@ -1182,7 +1187,14 @@ pub enum Instruction {
         params: Reg3ShiftParams,
         tb_form: bool,
     },
-    //SXTAB16
+    /// SXTB16, SXTAB16, UXTB16 and UXTAB16 (A7.7.183, .180, .222, .219): the bytes 0 and 2 of Rm,
+    /// rotated, extended to two halfwords, with Rn's halfwords added if `add`. `rn` is not used
+    /// without it.
+    EXTEND16 {
+        params: Reg3UsizeParams,
+        signed: bool,
+        add: bool,
+    },
     /// Signed Extend Byte and Add
     SXTAB {
         params: Reg3UsizeParams,
@@ -1191,17 +1203,14 @@ pub enum Instruction {
     SXTAH {
         params: Reg3UsizeParams,
     },
-    //SXTB16
     /// Unsigned Extend Byte and Add
     UXTAB {
         params: Reg3UsizeParams,
     },
-    //UXTAB16
     /// Unsigned Extend Halfword and Add
     UXTAH {
         params: Reg3UsizeParams,
     },
-    //UXTB16
 
     // --------------------------------------------
     //
@@ -1301,8 +1310,12 @@ pub enum Instruction {
     SEL {
         params: Reg3NoSetFlagsParams,
     },
-    //USAD8
-    //USADA8
+    /// USAD8 and USADA8 (A7.7.211, .212): the sum of the absolute differences of the four
+    /// unsigned bytes, with Ra added if `accumulate`. `ra` is not used without it.
+    USAD8 {
+        params: Reg4NoSetFlagsParams,
+        accumulate: bool,
+    },
 
     // --------------------------------------------
     //
@@ -2025,6 +2038,19 @@ fn fmt_vcvt_fixed(params: VCVTFixedParams) -> String {
     format!("vcvt.{to}.{from} {reg}, {reg}, #{}", params.fraction_bits)
 }
 
+/// SSAT and USAT, with the shift unless it is LSL #0
+fn fmt_saturate(mnemonic: &str, params: SatParams) -> String {
+    let shift = match (params.shift_t, params.shift_n) {
+        (_, 0) => String::new(),
+        (SRType::ASR, amount) => format!(", asr #{amount}"),
+        (_, amount) => format!(", lsl #{amount}"),
+    };
+    format!(
+        "{mnemonic} {}, #{}, {}{shift}",
+        params.rd, params.saturate_to, params.rn
+    )
+}
+
 fn fmt_extend_add(mnemonic: &str, params: Reg3UsizeParams) -> String {
     let rotation = if params.rotation > 0 {
         format!(", ror #{}", params.rotation)
@@ -2581,15 +2607,16 @@ impl fmt::Display for Instruction {
             ),
 
             Self::RBIT { params } => write!(f, "rbit {}, {}", params.rd, params.rm),
-            Self::SSAT { params } => write!(
+            Self::SSAT { params } => write!(f, "{}", fmt_saturate("ssat", params)),
+            Self::USAT { params } => write!(f, "{}", fmt_saturate("usat", params)),
+            Self::SAT16 { params, signed } => write!(
                 f,
-                "ssat {}, #{}, {}",
-                params.rd, params.saturate_to, params.rn
-            ),
-            Self::USAT { params } => write!(
-                f,
-                "usat {}, #{}, {}",
-                params.rd, params.saturate_to, params.rn
+                "{}16 {}, #{}, {}",
+                if signed { "ssat" } else { "usat" },
+                params.rd,
+                // SSAT16 is written with the bit position, and the field has it less 1
+                params.saturate_to,
+                params.rn
             ),
             Self::REV { params, .. } => write!(f, "rev {}, {}", params.rd, params.rm),
             Self::REV16 { params, .. } => write!(f, "rev16 {}, {}", params.rd, params.rm),
@@ -2849,6 +2876,105 @@ impl fmt::Display for Instruction {
                 )
             }
             Self::SEL { params } => write!(f, "sel {}, {}, {}", params.rd, params.rn, params.rm),
+            Self::USAD8 { params, accumulate } => {
+                let name = if accumulate { "usada8" } else { "usad8" };
+                write!(f, "{name} {}, {}, {}", params.rd, params.rn, params.rm)?;
+                if accumulate {
+                    write!(f, ", {}", params.ra)?;
+                }
+                Ok(())
+            }
+            Self::EXTEND16 {
+                params,
+                signed,
+                add,
+            } => {
+                let name = match (signed, add) {
+                    (true, true) => "sxtab16",
+                    (true, false) => "sxtb16",
+                    (false, true) => "uxtab16",
+                    (false, false) => "uxtb16",
+                };
+                if add {
+                    write!(f, "{}", fmt_extend_add(name, params))
+                } else {
+                    let rotation = if params.rotation > 0 {
+                        format!(", ror #{}", params.rotation)
+                    } else {
+                        String::new()
+                    };
+                    write!(f, "{name} {}, {}{rotation}", params.rd, params.rm)
+                }
+            }
+            Self::SMULW {
+                params,
+                m_high,
+                accumulate,
+            } => {
+                let name = match (accumulate, m_high) {
+                    (false, false) => "smulwb",
+                    (false, true) => "smulwt",
+                    (true, false) => "smlawb",
+                    (true, true) => "smlawt",
+                };
+                write!(f, "{name} {}, {}, {}", params.rd, params.rn, params.rm)?;
+                if accumulate {
+                    write!(f, ", {}", params.ra)?;
+                }
+                Ok(())
+            }
+            Self::SMDUAL {
+                params,
+                subtract,
+                swap,
+                accumulate,
+            } => {
+                let name = match (subtract, accumulate) {
+                    (false, false) => "smuad",
+                    (true, false) => "smusd",
+                    (false, true) => "smlad",
+                    (true, true) => "smlsd",
+                };
+                let x = if swap { "x" } else { "" };
+                write!(f, "{name}{x} {}, {}, {}", params.rd, params.rn, params.rm)?;
+                if accumulate {
+                    write!(f, ", {}", params.ra)?;
+                }
+                Ok(())
+            }
+            Self::SMDUAL_LONG {
+                params,
+                subtract,
+                swap,
+            } => write!(
+                f,
+                "{}{} {}, {}, {}, {}",
+                if subtract { "smlsld" } else { "smlald" },
+                if swap { "x" } else { "" },
+                params.rdlo,
+                params.rdhi,
+                params.rn,
+                params.rm
+            ),
+            Self::SMLAL_half {
+                params,
+                n_high,
+                m_high,
+            } => write!(
+                f,
+                "smlal{}{} {}, {}, {}, {}",
+                if n_high { "t" } else { "b" },
+                if m_high { "t" } else { "b" },
+                params.rdlo,
+                params.rdhi,
+                params.rn,
+                params.rm
+            ),
+            Self::UMAAL { params } => write!(
+                f,
+                "umaal {}, {}, {}, {}",
+                params.rdlo, params.rdhi, params.rn, params.rm
+            ),
             // ARMv7-M
             Self::UDIV { params } => write!(f, "udiv {}, {}, {}", params.rd, params.rn, params.rm),
             Self::SDIV { params } => write!(f, "sdiv {}, {}, {}", params.rd, params.rn, params.rm),
@@ -3483,10 +3609,8 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         //SMUAD
         Instruction::SMUL { .. } => 4,
         Instruction::SMULL { .. } => 4,
-        //SMULW
         //SMUSD
         //SSAT
-        //SSAT16
         //SSAX
         //SSUB16
         //SSUB8
@@ -3510,10 +3634,8 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         Instruction::SUB_reg { thumb32, .. } => isize_t(*thumb32),
         Instruction::SVC { .. } => 2,
         //SXTAB
-        //SXTAB16
         //SXTAH
         Instruction::SXTB { thumb32, .. } => isize_t(*thumb32),
-        //SXTB16
         Instruction::SXTH { thumb32, .. } => isize_t(*thumb32),
 
         Instruction::TBB { .. } => 4,
@@ -3533,7 +3655,6 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         //UHSAX
         //UHSUB16
         //UHSUB8
-        //UMAAL
         Instruction::UMLAL { .. } => 4,
         Instruction::UMULL { .. } => 4,
         //UQADD16
@@ -3542,19 +3663,23 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         //UQSAX
         //UQSUB16
         //UQSUB8
-        //USAD8
-        //USADA8
         //USAT
-        //USAT16
         //USAX
         //USUB16
         //USUB8
         Instruction::SXTAB { .. } => 4,
         Instruction::SXTAH { .. } => 4,
         Instruction::UXTAB { .. } => 4,
-        //UXTAB16
         Instruction::UXTAH { .. } => 4,
         Instruction::PKH { .. } => 4,
+        Instruction::SMDUAL { .. }
+        | Instruction::SMDUAL_LONG { .. }
+        | Instruction::SMLAL_half { .. }
+        | Instruction::SMULW { .. }
+        | Instruction::UMAAL { .. }
+        | Instruction::SAT16 { .. }
+        | Instruction::EXTEND16 { .. }
+        | Instruction::USAD8 { .. } => 4,
         Instruction::UXTB { thumb32, .. } => isize_t(*thumb32),
         Instruction::UXTH { thumb32, .. } => isize_t(*thumb32),
 
