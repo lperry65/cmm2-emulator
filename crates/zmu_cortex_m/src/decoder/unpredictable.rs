@@ -8,7 +8,7 @@
 //! so they are left out here.
 //!
 
-use crate::core::instruction::{Instruction, Reg2FullParams};
+use crate::core::instruction::{Instruction, MswAccumulate, Reg2FullParams};
 use crate::core::register::Reg;
 
 fn is_pc(register: Reg) -> bool {
@@ -119,6 +119,32 @@ pub(super) fn uses_a_register_the_manual_forbids(instruction: &Instruction) -> b
                 || is_bad(params.rt2)
                 || is_pc(params.rn)
                 || (params.wback && (params.rn == params.rt || params.rn == params.rt2))
+        }
+        // A7.7.102, .106, .107 and .109: d, n or m in {13, 15}
+        Instruction::QSAT { params, .. } => {
+            is_bad(params.rd) || is_bad(params.rn) || is_bad(params.rm)
+        }
+        // A7.7.144 to .146: d, n or m in {13, 15}, and Ra in {13, 15} for SMMLS, Ra = 13 for SMMLA
+        // (Ra = 15 is SMMUL, which has no Ra)
+        Instruction::SMM {
+            params, accumulate, ..
+        } => {
+            is_bad(params.rd)
+                || is_bad(params.rn)
+                || is_bad(params.rm)
+                || match accumulate {
+                    MswAccumulate::None => false,
+                    MswAccumulate::Add => params.ra == Reg::SP,
+                    MswAccumulate::Sub => is_bad(params.ra),
+                }
+        }
+        // A7.7.42: n == 15, fewer than two registers, PC and LR together, or the base register in
+        // the list with write back
+        Instruction::LDMDB { params } => {
+            is_pc(params.rn)
+                || params.registers.len() < 2
+                || (params.registers.contains(&Reg::PC) && params.registers.contains(&Reg::LR))
+                || (params.wback && params.registers.contains(&params.rn))
         }
         // A7.7.121 and the other parallel adds and subtracts: d, n or m in {13, 15}
         Instruction::PARALLEL { params, .. } => {

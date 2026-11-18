@@ -1,19 +1,8 @@
 //! Edge and random inputs against the model, in every register layout.
 
+use super::super::dsp_test_support::Rng;
 use super::model::{encode, model};
 use super::*;
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u32 {
-        // xorshift64, seeded, so the cases are the same on every run
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 >> 16) as u32
-    }
-}
 
 const EDGES: [u32; 20] = [
     0x0000_0000,

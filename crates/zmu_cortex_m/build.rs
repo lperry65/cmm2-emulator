@@ -495,6 +495,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             ("111110100000....1111....10......", "SXTAH_t1"),
             // Pack halfword (PKHBT, PKHTB)
             ("111010101100....0..........0....", "PKH_t1"),
+            // QADD, QDADD, QSUB, QDSUB: op1 = 00 of the miscellaneous operations, op2 in hw2<5:4>
+            ("111110101000....1111....10......", "QSAT_t1"),
+            // SMMUL, SMMLA (op1 = 101) and SMMLS (op1 = 110), and their R forms in hw2<4>; hw2<7:5>
+            // must be 000
+            ("111110110101............000.....", "SMMLA_t1"),
+            ("111110110110............000.....", "SMMLS_t1"),
         ]);
     }
 

@@ -69,6 +69,40 @@ The firmware needs a few things zmu does not do, so I changed the following.
 - MSR with the mask 01 (`apsr_g`) or 11 (`apsr_nzcvqg`) was decoded as a branch: the table only
   matched mask 10. They decode now, so a program can set GE for SEL. A mask of 00, or any mask but
   10 for a SYSm above 3, is UNPREDICTABLE and decodes as UDF.
+- DSP extension, QADD, QSUB, QDADD and QDSUB were decoded as undefined. They are one decoder and one
+  executor (`Instruction::QSAT`). The manual's operands are Rd, Rm, Rn and the result is Rm plus or
+  minus Rn, with Rn doubled first (and saturated) in the two D forms. Q is set when either step
+  saturates, and never cleared. A reviewer expected Galactic Raiders to need them (its text code
+  has two QADD).
+- DSP extension, SMMUL, SMMLA and SMMLS with their R forms were decoded as undefined (the game's
+  drawing code has twelve SMMUL). One decoder and one executor (`Instruction::SMM`): the high word
+  of `(Ra << 32) +- Rn * Rm` in 64 bits, with 0x8000_0000 added first for the R forms. The sum can
+  pass 2^63 and only bits 63:32 are kept, so it wraps. SMMLA with Ra = PC is SMMUL; SMMLS with Ra =
+  PC or SP, and SMMLA with Ra = SP, are UNPREDICTABLE and decode as UDF. None of them sets Q.
+- LDMDB (LDMEA is the same encoding) was hardwired to UDF in the decoder. It runs now
+  (`exec_ldmdb`). All the words are read before anything is written, so a fault, which is precise,
+  leaves the base and every other register as they were. Write back comes before the load of PC,
+  so an exception return through `ldmdb sp!, {..., pc}` unstacks from the new SP, as POP does.
+  The base in the list with write back, fewer than two registers, PC and LR together, and PC as
+  the base are UNPREDICTABLE and decode as UDF. An unaligned base is a UsageFault, as for LDM.
+  A PC load inside an IT block that is not its last instruction is also UNPREDICTABLE in the
+  manual; it is not checked here, as for LDM and POP.
+  Its write back deliberately comes before the PC load. The literal pseudocode of A7.7.42 runs
+  LoadWritePC (BXWritePC, and so ExceptionReturn) first and writes back afterwards; but the write
+  back has to reach the SP bank in use before the return, and the frame has to be read from the SP
+  the instruction leaves, as POP's pseudocode (A7.7.99) has it and as real cores and QEMU do.
+  `exec_ldm` currently writes back after the return, so it differs (`ldm.w r2!, {r4, pc}` with an
+  EXC_RETURN loses r2); that is not fixed here. LDMDB counts 1 + N cycles, and 4 + N with a PC
+  load, as POP does for the same list: ARM publishes no Cortex-M7 per-instruction timings, and the
+  M4 TRM gives 1 + N for LDM and adds P, a pipeline refill of 1 to 3 cycles, for a PC load.
+  `exec_ldm` counts 1 + N for a PC load too, which disagrees with POP; also left as it is.
+- `executor/saturate.rs` is empty and nothing refers to it. It is empty in the upstream import
+  too, so I left it. `executor/saturating_add_sub.rs` was empty upstream and is now the executor
+  of QADD, QSUB, QDADD and QDSUB.
+- Checked against Unicorn 2.1.5 (QEMU), a Cortex-M7 in Thumb mode: 75,800 random and boundary
+  inputs, the 36 parallel adds and subtracts, the four saturating ones, the six multiplies and
+  LDMDB, with registers, flags, Q, GE and memory compared: no differences. Unicorn is a local
+  check only; nothing of it is in this tree.
 - Rounding to an integer (FPRoundInt, FPToFixed): they now round on the bits of the value, not on
   the `BigFloat` approximation, which keeps 40 digits and so does not hold a double with a long
   mantissa exactly (a floor of such a whole number could come back one low). The rounding modes,

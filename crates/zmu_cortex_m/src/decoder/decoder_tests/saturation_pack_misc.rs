@@ -471,3 +471,27 @@ fn test_decode_parallel_add_and_subtract_without_dsp_ext_are_udf() {
         }
     }
 }
+
+// Neither the saturating adds and subtracts nor the most significant word multiplies are there
+// without the DSP extension.
+#[test]
+#[cfg(not(feature = "has-dsp-ext"))]
+fn test_decode_qadd_family_and_smmul_family_without_dsp_ext_are_udf() {
+    for opcode in [
+        0xfa83_f182, // qadd r1, r2, r3
+        0xfa83_f192, // qdadd
+        0xfa83_f1a2, // qsub
+        0xfa83_f1b2, // qdsub
+        0xfb52_f103, // smmul
+        0xfb52_f113, // smmulr
+        0xfb52_4103, // smmla
+        0xfb52_4113, // smmlar
+        0xfb62_4103, // smmls
+        0xfb62_4113, // smmlsr
+    ] {
+        assert!(
+            matches!(decode_32(opcode), Instruction::UDF { .. }),
+            "{opcode:#010x}"
+        );
+    }
+}

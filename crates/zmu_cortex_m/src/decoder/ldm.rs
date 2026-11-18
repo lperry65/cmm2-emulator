@@ -22,10 +22,15 @@ pub fn decode_LDM_t1(opcode: u16) -> Instruction {
 
 #[allow(non_snake_case)]
 pub fn decode_LDMDB_t1(opcode: u32) -> Instruction {
-    Instruction::UDF {
-        imm32: 0,
-        opcode: opcode.into(),
-        thumb32: true,
+    // the register list is P:M:'0':list, so bit 13 is never in it
+    let regs = get_reglist((opcode & 0b1101_1111_1111_1111) as u16);
+
+    Instruction::LDMDB {
+        params: LoadAndStoreMultipleParams {
+            registers: regs,
+            rn: Reg::from(opcode.get_bits(16..20) as u8),
+            wback: opcode.get_bit(21),
+        },
     }
 }
 

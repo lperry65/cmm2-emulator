@@ -22,18 +22,30 @@ mod address_wrap_tests;
 mod branch;
 mod coproc;
 mod divide;
+#[cfg(test)]
+mod dsp_test_support;
 mod exception;
 #[cfg(test)]
 mod guest_never_panics_tests;
+#[cfg(test)]
+mod ldmdb_tests;
 mod load_and_store;
 mod load_and_store_multiple;
 mod misc;
 mod misc_data_processing;
+#[cfg(feature = "has-dsp-ext")]
+mod msw_multiply;
+#[cfg(all(test, feature = "has-dsp-ext"))]
+mod msw_multiply_tests;
 mod multiply;
 mod packing;
 mod parallel_add;
 #[cfg(all(test, feature = "has-dsp-ext"))]
 mod parallel_add_tests;
+#[cfg(feature = "has-dsp-ext")]
+mod saturating_add_sub;
+#[cfg(all(test, feature = "has-dsp-ext"))]
+mod saturating_add_sub_tests;
 mod shift;
 mod signed_multiply;
 mod status_register;
@@ -62,10 +74,14 @@ use load_and_store::IsaLoadAndStore;
 use load_and_store_multiple::IsaLoadAndStoreMultiple;
 use misc::IsaMisc;
 use misc_data_processing::IsaMiscDataProcessing;
+#[cfg(feature = "has-dsp-ext")]
+use msw_multiply::IsaMswMultiply;
 use multiply::IsaMultiply;
 use packing::IsaPacking;
 #[cfg(feature = "has-dsp-ext")]
 use parallel_add::IsaParallelAddSub;
+#[cfg(feature = "has-dsp-ext")]
+use saturating_add_sub::IsaSaturatingAddSub;
 use shift::IsaShift;
 use signed_multiply::IsaSignedMultiply;
 use status_register::IsaStatusRegister;
@@ -626,6 +642,18 @@ impl ExecutorHelper for Processor {
             //
             // --------------------------------------------
             #[cfg(feature = "has-dsp-ext")]
+            Instruction::QSAT { params, op } => self.exec_qsat(params, *op),
+            #[cfg(not(feature = "has-dsp-ext"))]
+            Instruction::QSAT { .. } => Err(Fault::UndefInstr),
+            #[cfg(feature = "has-dsp-ext")]
+            Instruction::SMM {
+                params,
+                accumulate,
+                round,
+            } => self.exec_smm(params, *accumulate, *round),
+            #[cfg(not(feature = "has-dsp-ext"))]
+            Instruction::SMM { .. } => Err(Fault::UndefInstr),
+            #[cfg(feature = "has-dsp-ext")]
             Instruction::PARALLEL { params, op } => self.exec_parallel(params, *op),
             #[cfg(not(feature = "has-dsp-ext"))]
             Instruction::PARALLEL { .. } => Err(Fault::UndefInstr),
@@ -724,6 +752,7 @@ impl ExecutorHelper for Processor {
             // --------------------------------------------
             Instruction::STM { params, .. } => self.exec_stm(params),
             Instruction::STMDB { params } => self.exec_stmdb(params),
+            Instruction::LDMDB { params } => self.exec_ldmdb(params),
             Instruction::LDM { params, .. } => self.exec_ldm(params),
 
             Instruction::PUSH { registers, thumb32 } => {

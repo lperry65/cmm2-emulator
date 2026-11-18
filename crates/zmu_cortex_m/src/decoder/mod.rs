@@ -85,6 +85,8 @@ mod pld;
 mod pli;
 mod pop;
 mod push;
+#[cfg(feature = "has-dsp-ext")]
+mod qsat;
 
 mod rbit;
 mod rev;
@@ -100,6 +102,8 @@ mod sev;
 #[cfg(feature = "has-dsp-ext")]
 mod smla;
 mod smlal;
+#[cfg(feature = "has-dsp-ext")]
+mod smm;
 #[cfg(feature = "has-dsp-ext")]
 mod smul;
 mod smull;
@@ -298,8 +302,10 @@ use {
 use self::{
     parallel::decode_PARALLEL_t1,
     pkh::decode_PKH_t1,
+    qsat::decode_QSAT_t1,
     sel::decode_SEL_t1,
     smla::decode_SMLA_t1,
+    smm::{decode_SMMLA_t1, decode_SMMLS_t1},
     smul::decode_SMUL_t1,
     uxtab::{decode_SXTAB_t1, decode_SXTAH_t1, decode_UXTAB_t1, decode_UXTAH_t1},
 };

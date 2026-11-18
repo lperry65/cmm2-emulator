@@ -94,6 +94,26 @@ pub struct Reg3Params {
     pub rm: Reg,
     pub setflags: SetFlags,
 }
+/// The four saturating adds and subtracts: Rm + Rn, Rm - Rn, and the two with Rn doubled first.
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub enum SaturatingOp {
+    Add,
+    Sub,
+    DoubleAdd,
+    DoubleSub,
+}
+
+/// What the most significant word multiplies do with Ra: SMMUL has none, SMMLA adds `Ra << 32` and
+/// SMMLS subtracts the product from it.
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub enum MswAccumulate {
+    None,
+    Add,
+    Sub,
+}
+
 /// What a parallel add or subtract does with the sum or difference of each lane.
 #[allow(missing_docs)]
 #[derive(PartialEq, Debug, Copy, Clone)]
@@ -1006,6 +1026,13 @@ pub enum Instruction {
     //
     // Subgroup: Signed multiply instructions (ArmV7-m)
     //
+    /// SMMUL, SMMULR, SMMLA, SMMLAR, SMMLS and SMMLSR (A7.7.146, .144, .145). `ra` is not used
+    /// without an accumulate.
+    SMM {
+        params: Reg4NoSetFlagsParams,
+        accumulate: MswAccumulate,
+        round: bool,
+    },
     /// Signed Multiply and Accumulate (Long)
     SMLAL {
         params: Reg643232Params,
@@ -1109,10 +1136,12 @@ pub enum Instruction {
     //
     // Subgroup: Saturating addition and subtraction instructions, Armv7-M DSP extension
     //
-    //QADD
-    //QSUB
-    //QDADD
-    //QDSUB
+    /// QADD, QSUB, QDADD and QDSUB (A7.7.102, .109, .106, .107). The manual's operands are Rm and
+    /// Rn in that order: `rm` is the register in hw2<3:0>, `rn` the one in hw1<3:0>.
+    QSAT {
+        params: Reg3NoSetFlagsParams,
+        op: SaturatingOp,
+    },
 
     // --------------------------------------------
     //
@@ -1434,6 +1463,10 @@ pub enum Instruction {
         thumb32: bool,
     },
     STMDB {
+        params: LoadAndStoreMultipleParams,
+    },
+    /// LDMDB and LDMEA, which are one encoding (A7.7.42)
+    LDMDB {
         params: LoadAndStoreMultipleParams,
     },
 
@@ -2627,6 +2660,43 @@ impl fmt::Display for Instruction {
                 if params.wback { "!" } else { "" },
                 params.registers
             ),
+            Self::LDMDB { params } => write!(
+                f,
+                "ldmdb {}{}, {{{:?}}}",
+                params.rn,
+                if params.wback { "!" } else { "" },
+                params.registers
+            ),
+            Self::QSAT { params, op } => write!(
+                f,
+                "{} {}, {}, {}",
+                match op {
+                    SaturatingOp::Add => "qadd",
+                    SaturatingOp::Sub => "qsub",
+                    SaturatingOp::DoubleAdd => "qdadd",
+                    SaturatingOp::DoubleSub => "qdsub",
+                },
+                params.rd,
+                params.rm,
+                params.rn
+            ),
+            Self::SMM {
+                params,
+                accumulate,
+                round,
+            } => {
+                let name = match accumulate {
+                    MswAccumulate::None => "smmul",
+                    MswAccumulate::Add => "smmla",
+                    MswAccumulate::Sub => "smmls",
+                };
+                let r = if round { "r" } else { "" };
+                write!(f, "{name}{r} {}, {}, {}", params.rd, params.rn, params.rm)?;
+                match accumulate {
+                    MswAccumulate::None => Ok(()),
+                    _ => write!(f, ", {}", params.ra),
+                }
+            }
             Self::STMDB { params } => write!(
                 f,
                 "stmdb {}{}, {{{:?}}}",
@@ -3399,6 +3469,9 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         Instruction::SMLA { .. } => 4,
         //SMLAD
         Instruction::SMLAL { .. } => 4,
+        Instruction::SMM { .. } => 4,
+        Instruction::QSAT { .. } => 4,
+        Instruction::LDMDB { .. } => 4,
         //SMLAL second variant?
         //SMLALD
         //SMLAW

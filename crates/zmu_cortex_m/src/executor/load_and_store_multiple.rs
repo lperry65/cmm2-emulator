@@ -14,6 +14,7 @@ pub trait IsaLoadAndStoreMultiple {
     fn exec_stm(&mut self, params: &LoadAndStoreMultipleParams) -> ExecuteResult;
     fn exec_stmdb(&mut self, params: &LoadAndStoreMultipleParams) -> ExecuteResult;
     fn exec_ldm(&mut self, params: &LoadAndStoreMultipleParams) -> ExecuteResult;
+    fn exec_ldmdb(&mut self, params: &LoadAndStoreMultipleParams) -> ExecuteResult;
     /// `unaligned_allowed` is the single-register 32-bit form (STR/LDR with write back,
     /// A7.7.99 T3, A7.7.101 T3); the others need a word-aligned stack (A3.2.1).
     fn exec_push(&mut self, registers: EnumSet<Reg>, unaligned_allowed: bool) -> ExecuteResult;
@@ -99,6 +100,45 @@ impl IsaLoadAndStoreMultiple for Processor {
             return Ok(ExecuteSuccess::Taken { cycles: cc });
         }
         Ok(ExecuteSuccess::NotTaken)
+    }
+
+    /// LDMDB (A7.7.42): the words just below the base, lowest register from the lowest address.
+    /// Every word is read before anything is written, so a fault, which is precise, leaves the
+    /// base and every other register as they were. Write back comes before the load of PC, so an
+    /// exception return with SP as the base sees the new SP, as a POP does.
+    fn exec_ldmdb(&mut self, params: &LoadAndStoreMultipleParams) -> ExecuteResult {
+        if !self.condition_passed() {
+            return Ok(ExecuteSuccess::NotTaken);
+        }
+        let regs_size = 4 * (params.registers.len() as u32);
+        let base = self.get_r(params.rn);
+        let mut address = base.wrapping_sub(regs_size);
+        require_aligned(address, 3)?;
+
+        // at most 14 registers: no SP, and PC and LR are not both there
+        let mut loaded = [(Reg::R0, 0u32); 15];
+        let mut count = 0;
+        for reg in &params.registers {
+            loaded[count] = (reg, self.read32_data(address)?);
+            count += 1;
+            address = address.wrapping_add(4);
+        }
+
+        for &(reg, value) in &loaded[..count] {
+            if reg != Reg::PC {
+                self.set_r(reg, value);
+            }
+        }
+        if params.wback {
+            self.set_r(params.rn, base.wrapping_sub(regs_size));
+        }
+        let cycles = 1 + params.registers.len() as u32;
+        if params.registers.contains(&Reg::PC) {
+            self.load_write_pc(loaded[count - 1].1)?;
+            // the refill of a PC load, as for POP
+            return Ok(ExecuteSuccess::Branched { cycles: cycles + 3 });
+        }
+        Ok(ExecuteSuccess::Taken { cycles })
     }
 
     fn exec_push(&mut self, registers: EnumSet<Reg>, unaligned_allowed: bool) -> ExecuteResult {
