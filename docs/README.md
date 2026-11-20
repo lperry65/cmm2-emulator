@@ -2,6 +2,8 @@
 
 Project documentation lives here as markdown.
 
+- [usage.md](usage.md): every option, the board, the settings file, the SD card, how a run ends.
+- [status.md](status.md): the detailed status: what works, the CPU core, speed and known gaps.
 - [goals.md](goals.md): what the emulator is for and what follows from that.
 - [hardware-map.md](hardware-map.md): the CMM2 Gen 2 hardware as measured and documented.
 - [background.md](background.md): what existed before, the three levels of emulator, and the
@@ -26,3 +28,28 @@ Project documentation lives here as markdown.
   iteration 3, with the speed measurements of that day. It is a historical snapshot.
 
 Local copies of manuals, schematics and firmware are kept in `reference/`, which is not tracked.
+
+## Code layout
+
+The repository is a Cargo workspace with three members, two of them mine:
+
+- `cmm2-core`: the emulation (CPU, memory, peripherals). It has no SDL or UI dependency, so it
+  can be tested on its own and reused.
+- `cmm2-emulator`: the front end binary. It owns the window and input and drives `cmm2-core`.
+- `zmu_cortex_m`: the Cortex-M core, a vendored copy of the one in
+  [zmu](https://github.com/jjkt/zmu) with my changes to it (listed in
+  `crates/zmu_cortex_m/NOTICE.md`). It is Apache-2.0, as upstream; `cmm2-core` depends on it.
+
+`cmm2-core` and `cmm2-emulator` are separate so the SDL front end stays out of the emulation
+code.
+
+In `cmm2-emulator`, `main.rs` is a short entry point over modules: `args` (the command line),
+`batch` (a run with no console or window), `live` (a run with the console or a window), `machine`
+(building the machine), `board` (the board's directory, its lock and what it remembers) and
+`launch` (which run is on the board), `storage`, `saveable`, `atomic_write` and `run_and_save`
+(the `--flash` and `--sd` files, read at the start and saved safely at the end), `panic_hook`,
+`signals`, `output` and `error`, `trace`, `slice`, `report` and `inspect`, `script` (the `--on`
+keys), `pacing`, `terminal`, `keys`, `usb_keys`, `window` and `local_clock`. Two more, `run_id`
+and `test_support`, are built for the tests only. The unit tests of a module are in
+`<module>/tests.rs` beside it, or in the file itself for some of the smaller ones, and the
+command-line and real-firmware tests are in `crates/*/tests/`, split by topic.

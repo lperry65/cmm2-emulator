@@ -175,8 +175,8 @@ pub(crate) fn remove_stale_temps_in(dir: &Path) {
 /// Opens a file that is to be locked and not read: not following a link, not waiting for a
 /// FIFO's other end, and only if it turns out to be a regular file. It is opened for reading,
 /// or if that is not allowed (a left-over file whose mode was copied from a write-only one) for
-/// writing; a file with neither right cannot be locked, and is left (README says how to clear
-/// it by hand).
+/// writing; a file with neither right cannot be locked, and is left (docs/usage.md says how to
+/// clear it by hand).
 fn open_to_lock(path: &Path) -> Option<File> {
     use std::os::unix::fs::OpenOptionsExt;
     let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY;

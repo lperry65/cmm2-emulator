@@ -367,7 +367,7 @@ As of e3e8936 (2026-11-18) what works after the prompt, each described in its ow
 - `TIMER` and `PAUSE` count properly, with the timers' update interrupts (issues 28 and 70,
   [timers.md](timers.md)), and `RND` follows the modelled RNG (issue 22, [rng.md](rng.md)).
 
-What is still missing is listed in the status and known gaps sections of the README. I have not
+What is still missing is listed in [status.md](status.md) (the status and known gaps sections). I have not
 hunted for the next wait after the prompt as I meant to in iteration 2. The open problems I know of
 at the prompt are issue 47 (a hard fault on `ESC O D`, the SS3 left arrow) and issue 48 (pasted
 lines are joined). Issue 71 (the emulator exits silently on `RUN` with the console on a terminal)

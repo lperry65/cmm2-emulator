@@ -110,7 +110,7 @@ fn a_hand_written_card_record_with_a_line_end_works() {
 
 #[test]
 fn a_burn_is_done_even_if_the_start_then_fails_on_a_card_that_has_gone() {
-    // The firmware is burned before the machine is built, and the README says so.
+    // The firmware is burned before the machine is built, and docs/usage.md says so.
     let home = Home::new("board-burn-then-fail");
     burn_counter(&home, "board-burn-then-fail");
     let (card, _) = Tmp::card("board-burn-then-fail");

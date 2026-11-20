@@ -8,7 +8,7 @@ This is a snapshot, and I have left it as it was written. Since then video, the 
 card, the DS3231, the RNG and the timer interrupts have been built, the decision about speed is made
 (an x86-64 JIT first, [decisions/0002-jit-first.md](decisions/0002-jit-first.md)), and the figures
 below are older than my later speed measurements (in [0002](decisions/0002-jit-first.md) and
-`usb-host.md`). The README has the current status.
+`usb-host.md`). [status.md](status.md) has the current status.
 
 ## What works
 

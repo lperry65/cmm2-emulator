@@ -239,7 +239,7 @@ fn a_left_over_file_that_cannot_be_read_is_removed_through_a_write_open() {
     remove_stale_temps(dir.join("a.img").to_str().unwrap());
 
     // Write only can be locked and so is removed; with no right at all it cannot be, and
-    // is left (README has the command to remove it).
+    // is left (docs/usage.md has the command to remove it).
     assert!(!write_only.exists());
     assert!(nothing.exists());
 }
