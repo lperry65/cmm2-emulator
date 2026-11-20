@@ -305,7 +305,7 @@ fn real_firmware_keeps_its_saved_options_in_the_persistent_state() {
     let console = memory.console();
     let mut cpu = Cpu::new(&firmware, memory, irqs).unwrap();
     let first = boot_to_second_prompt(&mut cpu, &console);
-    let saved = cpu.persistent();
+    let saved = cpu.persistent().unwrap();
     assert_ne!(cpu.read32(0x081E_0000), 0xFFFF_FFFF);
 
     // A new machine, started from what the first one saved, is a board that was set up before:
@@ -327,4 +327,19 @@ fn real_firmware_keeps_its_saved_options_in_the_persistent_state() {
     console.push_input(b"PRINT 1+2\r");
     let answer = run_to_text(&mut cpu, &console, "\r\n> ", 50_000_000);
     assert_eq!(answer, "PRINT 1+2\r\n 3\r\n> ");
+}
+
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
+fn real_firmware_b5_is_a_known_profile() {
+    assert_eq!(firmware().profile(), Some(&cmm2_core::B5));
+}
+
+#[test]
+#[ignore = "needs the RC6 firmware: CMM2_FIRMWARE_RC6=<path> cargo test -- --ignored"]
+fn real_firmware_rc6_is_a_known_profile() {
+    let path = std::env::var("CMM2_FIRMWARE_RC6")
+        .expect("CMM2_FIRMWARE_RC6 must be set to the path of CMM2_MMBasic_7.00.00RC6.bin");
+    let firmware = cmm2_core::Firmware::load(path).unwrap();
+    assert_eq!(firmware.profile(), Some(&cmm2_core::RC6));
 }

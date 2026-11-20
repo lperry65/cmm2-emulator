@@ -16,6 +16,12 @@ use std::time::{Duration, Instant};
 // owner's own board. A test of the board sets its own with `.env(HOME_VARIABLE, ...)`. This is the
 // only place that names the binary (tests/guard.rs sees to that), so every test goes through it.
 pub const HOME_VARIABLE: &str = "CMM2_EMULATOR_HOME";
+// The programs these tests run are not a firmware I know, so they have no settings layout of
+// their own. This names one for an image that has none, as a user could. A test of the refusal
+// removes it.
+pub const LAYOUT_VARIABLE: &str = "CMM2_SETTINGS_LAYOUT";
+// The same for the board, which the other variable never reaches: for the tests that burn one.
+pub const BOARD_LAYOUT_VARIABLE: &str = "CMM2_BOARD_LAYOUT_FOR_TESTS";
 pub const NO_BOARD: &str = "/dev/null/no-board";
 const EMULATOR: &str = env!("CARGO_BIN_EXE_cmm2-emulator");
 
@@ -28,7 +34,9 @@ pub fn emulator() -> Command {
         .env(HOME_VARIABLE, NO_BOARD)
         .env("XDG_DATA_HOME", NO_BOARD)
         .env("HOME", NO_BOARD)
-        .env("USERPROFILE", NO_BOARD);
+        .env("USERPROFILE", NO_BOARD)
+        .env(LAYOUT_VARIABLE, "b5")
+        .env(BOARD_LAYOUT_VARIABLE, "b5");
     command
 }
 
@@ -187,12 +195,12 @@ pub const SCREEN: [u16; 46] = [
     0x0002, 0x0000, 0x00FF, 0x0000, 0x0000, 0x2400, 0x0009, 0x0002, 0xF800, 0x0000,
 ];
 
-// The flash file is the last 0xE0000 bytes of the flash, the saved options in its last sector,
-// then the clock's time and date, a word each. The DS3231's state comes after them once the
-// guest has set its time, which these programs do not.
-pub const FLASH_FILE_SIZE: usize = 0xE_0008;
+// The flash file is b5's 32-byte block, then the last 0xE0000 bytes of the flash, the saved options
+// in its last sector, then the clock's time and date, a word each. The DS3231's state comes after
+// them once the guest has set its time, which these programs do not.
+pub const FLASH_FILE_SIZE: usize = 0x20 + 0xE_0000 + 8;
 
-pub const OPTIONS_AT: usize = 0xC_0000;
+pub const OPTIONS_AT: usize = 0x20 + 0xC_0000;
 
 // Adds one to the word at 0x081E_0000, the start of the saved options (the literal is at +14),
 // then ends as `end`. An erased word is -1, so the first run leaves 0.
@@ -347,6 +355,8 @@ pub fn run_with_read_only_mount(dir: &Path, firmware: &Path, args: &[&str]) -> O
         .env("XDG_DATA_HOME", NO_BOARD)
         .env("HOME", NO_BOARD)
         .env("USERPROFILE", NO_BOARD)
+        .env(LAYOUT_VARIABLE, "b5")
+        .env(BOARD_LAYOUT_VARIABLE, "b5")
         .env("SDL_VIDEODRIVER", "dummy")
         .output();
     match output {

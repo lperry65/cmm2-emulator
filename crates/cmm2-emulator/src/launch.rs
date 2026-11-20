@@ -7,8 +7,10 @@ use crate::batch::run_firmware;
 use crate::board::{Board, about_the_remembered_card, board_dir};
 use crate::error::{RunError, say};
 use crate::live::run_live;
-use crate::machine::{Machine, build_machine};
-use cmm2_core::Firmware;
+use crate::machine::{
+    BOARD_LAYOUT_VARIABLE, LAYOUT_VARIABLE, Machine, build_machine, layout_named_in, with_layout,
+};
+use cmm2_core::{Firmware, NoLayout};
 
 /// How the card of a board run was settled.
 enum Card {
@@ -23,7 +25,7 @@ enum Card {
 pub(crate) fn run(start: Start, options: RunOptions) -> Result<bool, RunError> {
     match start {
         Start::File(path) => {
-            let machine = build_machine(&path, &options)?;
+            let machine = build_machine(&path, &options, LAYOUT_VARIABLE)?;
             go(machine, options)
         }
         Start::Board => on_the_board(options),
@@ -39,6 +41,23 @@ fn go(machine: Machine, options: RunOptions) -> Result<bool, RunError> {
     }
 }
 
+/// The image to burn. The board always keeps settings, so a firmware with no settings layout is
+/// refused here, before the board is touched, and not on every start after.
+fn load_for_the_board(file: &str) -> Result<Firmware, RunError> {
+    let firmware = with_layout(
+        Firmware::load(file)?,
+        BOARD_LAYOUT_VARIABLE,
+        layout_named_in(BOARD_LAYOUT_VARIABLE),
+    )?;
+    match firmware.profile() {
+        Some(_) => Ok(firmware),
+        None => Err(RunError::NoLayout {
+            path: file.to_string(),
+            source: NoLayout,
+        }),
+    }
+}
+
 /// Switches the board on, burning the `--burn` image onto it first if there is one, and runs it
 /// with its own settings and card unless the options name others.
 fn on_the_board(mut options: RunOptions) -> Result<bool, RunError> {
@@ -49,9 +68,8 @@ fn on_the_board(mut options: RunOptions) -> Result<bool, RunError> {
     let image = options
         .burn
         .take()
-        .map(|file| Firmware::load(&file))
-        .transpose()
-        .map_err(RunError::from)?;
+        .map(|file| load_for_the_board(&file))
+        .transpose()?;
     let board = Board::switch_on(dir, image.is_some())?;
     if let Some(firmware) = &image {
         board.burn(firmware)?;
@@ -77,9 +95,14 @@ fn on_the_board(mut options: RunOptions) -> Result<bool, RunError> {
     } else {
         Card::Empty
     };
-    let machine = build_machine(&board.firmware_path(), &options).map_err(|err| match card {
-        Card::Remembered => about_the_remembered_card(err),
-        _ => err,
+    let firmware = board.firmware_path();
+    let machine = build_machine(&firmware, &options, BOARD_LAYOUT_VARIABLE).map_err(|err| {
+        match (err, &card) {
+            // The settings file is not at fault, the firmware is.
+            (RunError::NoLayout { .. }, _) => RunError::BoardNoLayout { path: firmware },
+            (err, Card::Remembered) => about_the_remembered_card(err),
+            (err, _) => err,
+        }
     })?;
     if let Card::Given(path) = &card {
         board.remember_card(path)?;

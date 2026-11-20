@@ -8,7 +8,7 @@ use crate::storage::{load_flash, load_sd};
 use crate::trace::{TraceOut, trace_out};
 use crate::usb_keys::UsbKeys;
 use cmm2_core::{
-    Console, Cpu, Firmware, HidKeyboard, Irqs, KeyReport, SdSlot, cmm2_memory,
+    Console, Cpu, Firmware, HidKeyboard, Irqs, KeyReport, Profile, SdSlot, cmm2_memory,
     cmm2_memory_with_rng_seed,
 };
 use std::cell::RefCell;
@@ -21,8 +21,53 @@ pub(crate) struct Machine {
     pub(crate) trace: Option<Rc<RefCell<TraceOut>>>,
 }
 
-pub(crate) fn build_machine(path: &str, options: &RunOptions) -> Result<Machine, RunError> {
-    let firmware = Firmware::load(path)?;
+/// Names the layout of the settings for a firmware I do not know, in a scratch run with a
+/// `--flash` file. This is for the tests, whose programs are not a firmware, and for trying a
+/// new release by hand: what it names may be wrong for the image, and then the settings are too.
+/// A firmware I know keeps its own. The board never looks at it.
+pub(crate) const LAYOUT_VARIABLE: &str = "CMM2_SETTINGS_LAYOUT";
+
+/// The same for the board (`--burn` and the start of the board), for the tests that burn a
+/// program. For tests only, and not in the README. Set by accident to `b5` it would burn an
+/// unknown firmware with b5's layout, and the board's settings file would then hold that
+/// firmware's code and not its settings.
+pub(crate) const BOARD_LAYOUT_VARIABLE: &str = "CMM2_BOARD_LAYOUT_FOR_TESTS";
+
+/// What the variable says, if it is set.
+pub(crate) fn layout_named_in(variable: &str) -> Option<String> {
+    std::env::var_os(variable).map(|name| name.to_string_lossy().into_owned())
+}
+
+/// The firmware with the layout that `name` (the value of `variable`) gives it, if it has none.
+pub(crate) fn with_layout(
+    firmware: Firmware,
+    variable: &str,
+    name: Option<String>,
+) -> Result<Firmware, RunError> {
+    let Some(name) = name.filter(|_| firmware.profile().is_none()) else {
+        return Ok(firmware);
+    };
+    match Profile::named(&name) {
+        Some(profile) => Ok(firmware.with_profile(profile)),
+        None => Err(RunError::BadLayoutName {
+            variable: variable.to_string(),
+            name,
+        }),
+    }
+}
+
+/// Builds the machine for the firmware at `path`. `variable` is the one that may name a layout for
+/// it, which only matters when there are settings to keep: with no `--flash` a bad value is
+/// nothing.
+pub(crate) fn build_machine(
+    path: &str,
+    options: &RunOptions,
+    variable: &str,
+) -> Result<Machine, RunError> {
+    let mut firmware = Firmware::load(path)?;
+    if options.flash.is_some() {
+        firmware = with_layout(firmware, variable, layout_named_in(variable))?;
+    }
     let irqs = Irqs::new();
     // The RNG takes its values from the host's entropy unless the run fixes the seed.
     let memory = match options.rng_seed {

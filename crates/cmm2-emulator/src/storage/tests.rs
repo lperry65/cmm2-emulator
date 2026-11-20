@@ -4,8 +4,7 @@ use crate::atomic_write::write_atomically;
 use crate::error::RunError;
 use crate::saveable::{check_regular, why_not_saveable};
 use crate::test_support::{age, files_in, idle_cpu, mode, root, scratch};
-use cmm2_core::PERSISTENT_SIZE;
-use cmm2_core::{Irqs, MIN_IMAGE_SIZE, SdSlot, cmm2_memory};
+use cmm2_core::{B5, Firmware, Irqs, MIN_IMAGE_SIZE, SdSlot, cmm2_memory};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -188,8 +187,8 @@ fn a_ds3231_never_set_keeps_the_flash_file_the_size_it_was_before_it_was_modelle
     };
     let mut cpu = idle_cpu();
     save_flash(&mut cpu, &options).unwrap();
-    assert_eq!(std::fs::read(&file).unwrap().len(), PERSISTENT_SIZE);
-    assert_eq!(PERSISTENT_SIZE, 917_512);
+    assert_eq!(std::fs::read(&file).unwrap().len(), B5.persistent_size());
+    assert_eq!(B5.persistent_size(), 917_544);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -198,7 +197,7 @@ fn a_flash_file_with_a_ds3231_offset_that_is_too_far_away_is_refused() {
     let dir = scratch("flash-offset-far");
     let file = dir.join("board.flash");
     let mut cpu = idle_cpu();
-    let mut bytes = cpu.persistent();
+    let mut bytes = cpu.persistent().unwrap();
     bytes.extend(i64::MAX.to_le_bytes());
     bytes.extend([1, 0x88]);
     std::fs::write(&file, bytes).unwrap();
@@ -214,7 +213,7 @@ fn a_read_only_flash_file_is_saved_all_the_same_as_the_save_replaces_the_file() 
     let dir = scratch("flash-readonly");
     let file = dir.join("board.flash");
     let mut cpu = idle_cpu();
-    std::fs::write(&file, cpu.persistent()).unwrap();
+    std::fs::write(&file, cpu.persistent().unwrap()).unwrap();
     mode(&file, 0o444);
     let path = file.to_str().unwrap();
 
@@ -238,7 +237,7 @@ fn a_flash_file_in_a_directory_that_cannot_be_written_is_refused_at_the_start() 
     let dir = scratch("flash-dir-readonly");
     let file = dir.join("board.flash");
     let mut cpu = idle_cpu();
-    std::fs::write(&file, cpu.persistent()).unwrap();
+    std::fs::write(&file, cpu.persistent().unwrap()).unwrap();
     mode(&dir, 0o555);
     let path = file.to_str().unwrap();
 
@@ -523,5 +522,43 @@ fn a_card_file_with_the_longest_name_is_written_back() {
 
     assert_eq!(std::fs::read(&file).unwrap(), vec![0x22; MIN_IMAGE_SIZE]);
     assert_eq!(files_in(&dir), ["c".repeat(255)]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// A machine whose image is not one I know.
+fn unknown_cpu() -> Cpu {
+    let mut image = vec![0; 64];
+    image[..4].copy_from_slice(&0x2000_8000u32.to_le_bytes());
+    image[4..8].copy_from_slice(&0x0800_0021u32.to_le_bytes());
+    let irqs = Irqs::new();
+    Cpu::new(
+        &Firmware::from_bytes(image).unwrap(),
+        cmm2_memory(&irqs),
+        irqs,
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_flash_file_with_a_firmware_that_has_no_layout_is_refused_at_the_start() {
+    let dir = scratch("flash-no-layout");
+    let new = dir.join("new.flash");
+    let old = dir.join("old.flash");
+    std::fs::write(&old, vec![0xFF; 917_522]).unwrap();
+
+    // The first run, with no file yet, is refused as well: nothing could be saved at the end.
+    for file in [&new, &old] {
+        let path = file.to_str().unwrap();
+        let err = load_flash(&mut unknown_cpu(), path).unwrap_err();
+        assert!(matches!(err, RunError::NoLayout { .. }));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{path}: this firmware has no settings layout yet, so it cannot save or load \
+                 settings (see issue 82)"
+            )
+        );
+    }
+    assert!(!new.exists());
     std::fs::remove_dir_all(&dir).unwrap();
 }

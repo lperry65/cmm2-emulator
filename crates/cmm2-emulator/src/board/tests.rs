@@ -136,17 +136,20 @@ fn burning_leaves_no_temporary_file() {
 }
 
 #[test]
-fn an_image_that_reaches_the_user_flash_is_refused_and_the_old_firmware_stays() {
+fn an_image_larger_than_the_flash_is_refused_and_the_old_firmware_stays() {
     let scratch = scratch_dir("board-large");
     let board = burned(&scratch);
     let large = scratch.join("large.bin");
     let mut bytes = image(3);
-    bytes.resize(0x12_0000 + 1, 0);
+    bytes.resize(0x20_0000 + 1, 0);
     std::fs::write(&large, bytes).unwrap();
 
     let err = burn(&board, large.to_str().unwrap()).unwrap_err();
 
-    assert!(text(&err).contains("0x08120000"), "{err}");
+    assert!(
+        text(&err).contains("larger than the 2097152 bytes of flash"),
+        "{err}"
+    );
     assert_eq!(std::fs::read(board.firmware_path()).unwrap(), image(1));
 }
 

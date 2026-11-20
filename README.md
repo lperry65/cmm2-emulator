@@ -157,7 +157,9 @@ The open issues at e3e8936, from `gh issue list --state open --limit 100`:
   mouse), 54 (gamepad), 81 (the live-run end line: the cursor tracker cannot know where an escape
   moves the cursor, and the window-closed end has no end-to-end test).
 - Storage and the board's state: 63 (SPI3 for the SD card, `OPTION SD TIMING FAST`), 44 (a host
-  folder as the SD card), 41 (the guest writes 32 zero bytes into the firmware region of flash).
+  folder as the SD card), 41 (the guest's 32-byte write into the firmware region of flash: the
+  firmware's own first-start write, which the settings file now keeps, so only whether the hardware
+  would accept that write remains).
 - Window and platform: 39 (scaling, full screen and aspect controls), 75 (Windows).
 - Firmware and end-to-end: 57 (firmware 5.07, the version the Gen 2 shipped with), 49 (run
   Galactic Raiders as an end-to-end test: a run goes on for minutes with no fault, but the hash
@@ -249,28 +251,29 @@ cmm2-emulator                                      # from then on: as it was lef
 ```
 
 `--burn <file>` burns the firmware. The image is loaded before anything is made, and the loader
-checks it as it always did: an image that reaches 0x08120000 is refused, and so is one whose vector
-table is not sensible (the stack pointer in RAM, a Thumb reset handler inside the image). What a
-burn cannot know is whether the image is whole: a firmware image has no checksum to ask, so a copy
-that was cut short, or damaged, and still has a sensible vector table is burned. I considered
+checks it as it always did: an image larger than the 2 MB of flash is refused, and so is one whose
+vector table is not sensible (the stack pointer in RAM, a Thumb reset handler inside the image).
+What a burn cannot know is whether the image is whole: a firmware image has no checksum to ask, so a
+copy that was cut short, or damaged, and still has a sensible vector table is burned. I considered
 checking that the handlers in the vector table point inside the image, and took it out: the real
 image has only four distinct handlers, so it would decide for hardly any cut. A burn says what it
-burned on one line of standard error (the size, the initial stack pointer and the reset handler),
-so the size can be compared with the file I meant. The image is then written into the board with a
+burned on one line of standard error (the size, the initial stack pointer and the reset handler), so
+the size can be compared with the file I meant. The image is then written into the board with a
 temporary file in the same directory, synced and renamed into place, so a burn that fails (a full
 disk, say) leaves the old firmware where it was, and moving or changing the `.bin` afterwards does
 nothing until I burn it again. If `firmware.bin` is a symbolic link, the rename replaces the link
 itself and what it pointed to is not written; the cleanup of old temporary files looks only in the
-board directory. Burning keeps the settings: the file holds only what the user changes and never
-the firmware (as the `--flash` section below has it), so I expect it to survive a new firmware, but
-I have only tested that a burn leaves it alone, not that another firmware version accepts it. The
-board then starts: the first run, with nothing in the directory yet, makes the directory (mode
-0700, as the XDG specification has it), burns and starts, and the first-boot questions come up in
-the window (or the console) as before. `--burn` goes with `--console`, `--run`, `--sd` and the
-other board options. The burn is done before the machine is built, so a start that then fails (a
-card that has gone, see below) has burned all the same. A plain start with nothing burned prints
-how to burn and which directory it looked in, exits with status 1 and makes nothing, not even the
-lock file.
+board directory. Burning keeps the settings: the file holds only what the firmware keeps in flash
+and never its code (as the `--flash` section below has it). A burn of another release leaves a file
+that is the wrong size for it, and the run says so; then I delete `settings.flash` by hand, as the
+emulator never deletes it. A firmware that the emulator has no settings layout for is refused by the
+burn, before anything is made. The board then starts: the first run, with nothing in the directory
+yet, makes the directory (mode 0700, as the XDG specification has it), burns and starts, and the
+first-boot questions come up in the window (or the console) as before. `--burn` goes with
+`--console`, `--run`, `--sd` and the other board options. The burn is done before the machine is
+built, so a start that then fails (a card that has gone, see below) has burned all the same. A plain
+start with nothing burned prints how to burn and which directory it looked in, exits with status 1
+and makes nothing, not even the lock file.
 
 `--firmware <file>` is not the board. It runs that image as a scratch machine, as before the board
 existed: the file is read, nothing is read from or written to the board directory, and `--flash`
@@ -556,14 +559,48 @@ with the same file reaches the prompt with no setup questions and no reset:
 cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --flash board.flash
 ```
 
-The file holds only what the user changes, never the firmware, so it stays valid when you move
-to a newer firmware `.bin`: the stored program and saved options (flash from 0x08120000 to the
-end, 896 KB) and then the clock's time and date (8 bytes), which a real board's battery keeps. The
-firmware asks its setup questions again if the clock has not been set, so the clock has to be saved
-too. The STM32's RTC runs on emulated time, not the host's: it counts with the machine's clock, so
-it is slower than the wall clock when the host is slow, and it stands still while the emulator is
-off. That makes the file 917,512 bytes, and the run stops with an error, leaving the file alone, if
-it is any other size than the three below.
+The file holds only what the firmware keeps in flash, never the firmware's code. What that is
+depends on the firmware, so the emulator knows it for the images it recognises (by their length and
+a hash of every byte, as no SHA-256 crate is in the build) and for no other. I know two: 7.00.00b5
+and 7.00.00RC6. The file holds the regions of flash that the firmware keeps, in this order, and then
+the clock's time and date (8 bytes), which a real board's battery keeps:
+
+- 7.00.00b5: a 32-byte block at 0x080F8540, which is inside the image (see below), then the stored
+  program and saved options, flash from 0x08120000 to the end (896 KB).
+- 7.00.00RC6: a 32-byte block at 0x080F6F00, also inside the image, then the saved options, the
+  first 4 KB of the sector at 0x08140000 (the rest of that sector is firmware code, so it is not
+  kept, and loading the file never changes it), then the stored program, flash from 0x08160000 to
+  the end (640 KB).
+
+The firmware asks its setup questions again if the clock has not been set, so the clock has to be
+saved too. The STM32's RTC runs on emulated time, not the host's: it counts with the machine's
+clock, so it is slower than the wall clock when the host is slow, and it stands still while the
+emulator is off. That makes the file 917,544 bytes for b5 and 659,496 for RC6, and the run stops
+with an error, leaving the file alone, if it is any other size than the ones below.
+
+The 32-byte block matters. At boot the firmware reads 8 bytes of it. If they are FF, which is what
+they are in the image, it takes its first-start path: it wipes the function key strings and erases
+the stored program. The first run writes zeros there, so a file without the block lost both on the
+next run. Until this was fixed (issue 82), the file did not hold it, and every run after the first
+set-up forgot the function keys and the program. A b5 file from before the block was kept (917,512
+bytes, or 917,520 or 917,522 with the DS3231 below) still loads, with a block of zeros, as the
+firmware writes them itself, and is written back with the block. A file from a run that stopped
+before the firmware wrote the block would then skip the first-start setup: I accept that. A file of
+the new form that was cut to exactly one of those old sizes cannot be told from an old file by its
+size, and would load with its bytes shifted, so do not cut files.
+
+A firmware I do not know, version 8 for one, runs as a scratch machine with `--firmware`, but
+`--flash` with it, and `--burn` of it (the board always keeps its settings), stop at the start with
+an error that says this firmware has no settings layout yet (see issue 82). I would rather refuse
+than keep the wrong flash. For a scratch run with `--flash`, and for tests, the environment variable
+`CMM2_SETTINGS_LAYOUT` (`b5` or `rc6`) names a layout for an image that has none; what it names may
+be wrong for that image, and then the file is too. It is not used for the board: `--burn` of an
+unknown firmware is refused with or without it, and a bad value does nothing to a run with no
+`--flash`. A firmware I know keeps its own layout whatever it says. A settings file is for the
+firmware that made it: one made for another release is the wrong size, or, when it is the size of
+the other release's file, the error says it probably belongs to another release. After `--burn` of
+another release, delete `settings.flash` or give another `--flash` file. A plain start of a board
+whose firmware has no layout says so and names `firmware.bin`; burn a firmware I know again.
 
 The Gen 2's real time comes from the external DS3231, and the emulator has one fitted, always. It is
 on PD4 and PD5, bit-banged by the firmware, and `OPTION DS3231 ON` at the prompt switches the
@@ -585,20 +622,15 @@ in UTC; the real chip would not see it, but it only matters while the emulator r
 
 The chip's state is added to the file only once the chip is no longer as it was made: you have set
 its time, cleared its status flags, or written the weekday or the 12-hour form of the hours
-register. A file whose chip was never touched is 917,512 bytes, which builds from before the chip
-was modelled read too. Once it was, the file is 917,522 bytes: the ten more bytes are the offset
-(milliseconds, an i64), a flag byte and the chip's status register. In the flag byte bit 0 says the
-time was set, bits 1 to 3 are the weekday count the chip keeps and bit 4 is the 12-hour form. A
-build from before the chip was modelled refuses a file of that size ("the saved flash and clock are
-917512 bytes ..."), so if you go back to such a build, delete the file or truncate it to its first
-917,512 bytes (you then lose the time you set). Files of 917,520 bytes, which an earlier version of
-this build wrote (the offset in seconds from the host's local time), still load, with the same time,
-and are written back in the new form.
-
-The address 0x08120000, where the user flash starts and the firmware ends, is only known to me
-for MMBasic 7.00.00b5 (its image ends 216 bytes below it); I have not checked it against another
-release. A firmware image that reaches it is refused at the start with an error, so that a
-release that does not fit is noticed and its tail is not merged into the `--flash` file.
+register. A file whose chip was never touched is the size above (917,544 bytes for b5). Once it was,
+the file is 10 bytes more (917,554 for b5, 659,506 for RC6): the offset (milliseconds, an i64), a
+flag byte and the chip's status register. In the flag byte bit 0 says the time was set, bits 1 to 3
+are the weekday count the chip keeps and bit 4 is the 12-hour form. A build from before the chip was
+modelled refuses a file of that size, and so does a build from before issue 82 refuse any file of
+the new form: there is no way back that I support, so keep a copy of the file before you go to an
+older build. Files that an earlier version of this build wrote with the offset in seconds from the
+host's local time (8 bytes more than the size without the chip) still load, with the same time, and
+are written back in the new form.
 
 `--sd <file>` puts an SD card in the socket, with the file as its contents. The firmware drives the
 card in SPI mode over GPIO pins, and the card is a model of that: it answers the commands the

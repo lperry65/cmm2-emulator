@@ -1,3 +1,4 @@
+use crate::profile::Profile;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -5,18 +6,6 @@ use std::path::{Path, PathBuf};
 pub const FLASH_BASE: u32 = 0x0800_0000;
 /// The STM32H743 has 2 MB of flash.
 pub const FLASH_SIZE: usize = 2 * 1024 * 1024;
-/// Where the flash the user changes starts: the stored BASIC program from here, then the saved
-/// options in the last sector, at 0x081E_0000. Below it is the firmware.
-///
-/// I only know this address for MMBasic 7.00.00b5, which leaves 216 bytes between the end of
-/// its image and here. I have not checked it against any other release. A firmware image that
-/// reaches it is refused, so a release that does not fit here fails loudly and does not have
-/// its tail merged into the `--flash` file.
-pub const USER_FLASH_BASE: u32 = 0x0812_0000;
-/// The most a firmware image can be: what lies below the user flash.
-pub const FIRMWARE_MAX_SIZE: usize = (USER_FLASH_BASE - FLASH_BASE) as usize;
-/// The user flash runs to the end of the flash.
-pub const USER_FLASH_SIZE: usize = FLASH_SIZE - (USER_FLASH_BASE - FLASH_BASE) as usize;
 
 // On-chip RAM sits between the flash and peripheral windows.
 const RAM_START: u32 = 0x2000_0000;
@@ -33,6 +22,7 @@ pub struct VectorTable {
 pub struct Firmware {
     image: Vec<u8>,
     vectors: VectorTable,
+    profile: Option<&'static Profile>,
 }
 
 #[derive(Debug)]
@@ -54,7 +44,7 @@ impl Firmware {
         if image.len() < 8 {
             return Err(FirmwareError::TooShort(image.len()));
         }
-        if image.len() > FIRMWARE_MAX_SIZE {
+        if image.len() > FLASH_SIZE {
             return Err(FirmwareError::TooLarge);
         }
         let word = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
@@ -79,7 +69,12 @@ impl Firmware {
         if !(FLASH_BASE as u64..end).contains(&u64::from(reset & !1)) {
             return Err(FirmwareError::ResetOutsideImage(reset));
         }
-        Ok(Firmware { image, vectors })
+        let profile = Profile::identify(&image);
+        Ok(Firmware {
+            image,
+            vectors,
+            profile,
+        })
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Firmware, FirmwareError> {
@@ -89,10 +84,10 @@ impl Firmware {
             source,
         };
         let file = std::fs::File::open(path).map_err(io_error)?;
-        // One byte past the limit is enough to tell the image is too large,
+        // One byte past the flash is enough to tell the image is too large,
         // and keeps a huge or endless file from being read into memory.
         let mut bytes = Vec::new();
-        file.take(FIRMWARE_MAX_SIZE as u64 + 1)
+        file.take(FLASH_SIZE as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(io_error)?;
         Firmware::from_bytes(bytes)
@@ -105,6 +100,18 @@ impl Firmware {
     pub fn image(&self) -> &[u8] {
         &self.image
     }
+
+    /// What this firmware keeps in flash, if it is one I know.
+    pub fn profile(&self) -> Option<&'static Profile> {
+        self.profile
+    }
+
+    /// This firmware with the given profile, for an image I do not know (a test image, or one
+    /// whose layout the caller has been told).
+    pub fn with_profile(mut self, profile: &'static Profile) -> Firmware {
+        self.profile = Some(profile);
+        self
+    }
 }
 
 impl fmt::Display for FirmwareError {
@@ -115,11 +122,7 @@ impl fmt::Display for FirmwareError {
                 write!(f, "image is {len} bytes, too short for a vector table")
             }
             FirmwareError::TooLarge => {
-                write!(
-                    f,
-                    "image is larger than the {FIRMWARE_MAX_SIZE} bytes below the user flash \
-                     at {USER_FLASH_BASE:#010X}"
-                )
+                write!(f, "image is larger than the {FLASH_SIZE} bytes of flash")
             }
             FirmwareError::StackPointerNotInRam(sp) => {
                 write!(f, "initial stack pointer {sp:#010X} is not in RAM")
@@ -192,27 +195,31 @@ mod tests {
     #[test]
     fn too_large_is_rejected() {
         let mut bytes = valid();
-        bytes.resize(FIRMWARE_MAX_SIZE + 1, 0);
+        bytes.resize(FLASH_SIZE + 1, 0);
         let err = Firmware::from_bytes(bytes).unwrap_err();
         assert!(matches!(err, FirmwareError::TooLarge));
     }
 
     #[test]
-    fn an_image_that_reaches_the_user_flash_is_rejected() {
-        // One byte into the user flash is enough; the flash file would take it over.
+    fn an_image_that_reaches_past_0x08120000_is_accepted() {
+        // The size of the RC6 image, which runs well past where the b5 user flash starts.
         let mut bytes = valid();
-        bytes.resize((USER_FLASH_BASE - FLASH_BASE) as usize + 1, 0);
-        assert!(matches!(
-            Firmware::from_bytes(bytes),
-            Err(FirmwareError::TooLarge)
-        ));
+        bytes.resize(1_409_568, 0);
+        assert!(Firmware::from_bytes(bytes).is_ok());
     }
 
     #[test]
-    fn image_that_ends_where_the_user_flash_starts_is_accepted() {
+    fn an_image_that_fills_the_flash_is_accepted() {
         let mut bytes = valid();
-        bytes.resize(FIRMWARE_MAX_SIZE, 0);
+        bytes.resize(FLASH_SIZE, 0);
         assert!(Firmware::from_bytes(bytes).is_ok());
+    }
+
+    #[test]
+    fn a_synthetic_image_has_no_profile_until_it_is_given_one() {
+        let fw = Firmware::from_bytes(valid()).unwrap();
+        assert_eq!(fw.profile(), None);
+        assert_eq!(fw.with_profile(&crate::B5).profile(), Some(&crate::B5));
     }
 
     #[test]
@@ -307,17 +314,17 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_a_file_that_reaches_the_user_flash() {
-        let err = load_from_temp_file("oversized", &vec![0; FIRMWARE_MAX_SIZE + 1000]).unwrap_err();
+    fn load_rejects_a_file_larger_than_the_flash() {
+        let err = load_from_temp_file("oversized", &vec![0; FLASH_SIZE + 1000]).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "image is larger than the 1179648 bytes below the user flash at 0x08120000"
+            "image is larger than the 2097152 bytes of flash"
         );
     }
 
     #[test]
-    fn load_accepts_a_file_that_ends_at_the_user_flash() {
-        let bytes = image(0x2000_0100, 0x0800_0101, FIRMWARE_MAX_SIZE);
-        assert!(load_from_temp_file("exact", &bytes).is_ok());
+    fn load_accepts_a_file_the_size_of_the_rc6_image() {
+        let bytes = image(0x2000_0100, 0x0800_0101, 1_409_568);
+        assert!(load_from_temp_file("rc6-size", &bytes).is_ok());
     }
 }

@@ -291,6 +291,8 @@ pub fn in_tmpfs(size: &str, script: &str, args: &[&str]) -> Option<Output> {
         .env("XDG_DATA_HOME", NO_BOARD)
         .env("HOME", NO_BOARD)
         .env("USERPROFILE", NO_BOARD)
+        .env(LAYOUT_VARIABLE, "b5")
+        .env(BOARD_LAYOUT_VARIABLE, "b5")
         .args([
             "-rm",
             "--pid",

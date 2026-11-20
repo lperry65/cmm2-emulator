@@ -141,7 +141,10 @@ fn a_flash_file_of_the_wrong_size_is_an_error_and_is_left_alone() {
     assert_eq!(
         stderr(&output),
         format!(
-            "cmm2-emulator: {}: the saved flash and clock are {FLASH_FILE_SIZE} bytes, or {} with the DS3231's state ({} from the first version that had it), not 3\n",
+            "cmm2-emulator: {}: the saved flash and clock for firmware 7.00.00b5 are \
+             {FLASH_FILE_SIZE} bytes, or {} with the DS3231's state ({} from the first version \
+             that had it), or those sizes less 32 bytes from before the firmware's own block was \
+             kept, not 3\n",
             flash.display(),
             FLASH_FILE_SIZE + 10,
             FLASH_FILE_SIZE + 8
@@ -307,4 +310,90 @@ fn a_first_run_through_a_dangling_link_makes_the_file_it_points_to() {
         FLASH_FILE_SIZE
     );
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// The emulator as a user has it, with no layout named for an image I do not know.
+fn without_a_layout(name: &str, args: &[&str]) -> std::process::Output {
+    let program = temp_program(name, &THREE);
+    let output = emulator()
+        .env_remove(LAYOUT_VARIABLE)
+        .args(["--firmware", program.to_str().unwrap()])
+        .args(args)
+        .output()
+        .expect("failed to run cmm2-emulator");
+    std::fs::remove_file(&program).unwrap();
+    output
+}
+
+#[test]
+fn a_firmware_with_no_settings_layout_is_refused_with_flash_and_the_file_is_left_alone() {
+    let flash = flash_path("flash-no-layout");
+    let _ = std::fs::remove_file(&flash);
+    let path = flash.to_str().unwrap();
+
+    // No file yet, and one that is there.
+    for existing in [None, Some(&[1u8, 2, 3][..])] {
+        if let Some(bytes) = existing {
+            std::fs::write(&flash, bytes).unwrap();
+        }
+        let output = without_a_layout("flash-no-layout", &["--run", "10", "--flash", path]);
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            stderr(&output),
+            format!(
+                "cmm2-emulator: {path}: this firmware has no settings layout yet, so it cannot \
+                 save or load settings (see issue 82)\n"
+            )
+        );
+    }
+    assert_eq!(std::fs::read(&flash).unwrap(), [1, 2, 3]);
+    std::fs::remove_file(&flash).unwrap();
+}
+
+#[test]
+fn a_firmware_with_no_settings_layout_still_runs_without_a_flash_file() {
+    let output = without_a_layout("scratch-no-layout", &["--run", "10"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn the_layout_variable_names_a_layout_for_an_unknown_firmware_and_a_bad_name_is_an_error() {
+    let flash = flash_path("flash-layout-rc6");
+    let _ = std::fs::remove_file(&flash);
+    let program = temp_program("flash-layout-rc6", &THREE);
+    let run = |layout: &str| {
+        emulator()
+            .env(LAYOUT_VARIABLE, layout)
+            .args(["--firmware", program.to_str().unwrap(), "--run", "10"])
+            .args(["--flash", flash.to_str().unwrap()])
+            .output()
+            .expect("failed to run cmm2-emulator")
+    };
+
+    let rc6 = run("rc6");
+    assert!(rc6.status.success(), "{}", stderr(&rc6));
+    // 32 + 4096 + 655,360, then the clock.
+    assert_eq!(std::fs::read(&flash).unwrap().len(), 659_496);
+    let bad = run("8");
+    assert_eq!(bad.status.code(), Some(1));
+    assert_eq!(
+        stderr(&bad),
+        "cmm2-emulator: CMM2_SETTINGS_LAYOUT is \"8\", not b5 or rc6\n"
+    );
+    std::fs::remove_file(&program).unwrap();
+    std::fs::remove_file(&flash).unwrap();
+}
+
+#[test]
+fn a_bad_layout_variable_does_not_stop_a_scratch_run_that_has_no_flash_file() {
+    let program = temp_program("scratch-bad-layout", &THREE);
+    let output = emulator()
+        .env(LAYOUT_VARIABLE, "8")
+        .args(["--firmware", program.to_str().unwrap(), "--run", "10"])
+        .output()
+        .expect("failed to run cmm2-emulator");
+    std::fs::remove_file(&program).unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
 }

@@ -2,6 +2,7 @@ use super::*;
 
 use crate::args::RunOptions;
 use crate::test_support::scratch;
+use cmm2_core::Firmware;
 
 #[test]
 fn the_ds3231_is_fitted_and_shows_the_hosts_time() {
@@ -12,7 +13,12 @@ fn the_ds3231_is_fitted_and_shows_the_hosts_time() {
     image[4..8].copy_from_slice(&0x0800_0021u32.to_le_bytes());
     std::fs::write(&firmware, image).unwrap();
 
-    let machine = build_machine(firmware.to_str().unwrap(), &RunOptions::default()).unwrap();
+    let machine = build_machine(
+        firmware.to_str().unwrap(),
+        &RunOptions::default(),
+        LAYOUT_VARIABLE,
+    )
+    .unwrap();
 
     // The chip's own default clock stands at the year 2000, until the host's is attached.
     let shown = machine.cpu.memory().ds3231().time();
@@ -57,7 +63,7 @@ fn first_rng_word(name: &str, seed: Option<u64>) -> u32 {
         rng_seed: seed,
         ..RunOptions::default()
     };
-    let mut machine = build_machine(firmware.to_str().unwrap(), &options).unwrap();
+    let mut machine = build_machine(firmware.to_str().unwrap(), &options, LAYOUT_VARIABLE).unwrap();
     machine.cpu.run(20_000);
     let word = machine.cpu.reg(4);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -80,4 +86,47 @@ fn without_a_seed_the_rng_values_differ_from_run_to_run() {
     );
     assert_ne!(a, 0);
     assert_ne!(a, b);
+}
+
+// A synthetic image with no profile of its own, and one given b5's.
+fn firmware_with(profile: Option<&'static cmm2_core::Profile>) -> Firmware {
+    let mut image = vec![0; 64];
+    image[..4].copy_from_slice(&0x2000_8000u32.to_le_bytes());
+    image[4..8].copy_from_slice(&0x0800_0021u32.to_le_bytes());
+    let firmware = Firmware::from_bytes(image).unwrap();
+    match profile {
+        Some(profile) => firmware.with_profile(profile),
+        None => firmware,
+    }
+}
+
+#[test]
+fn a_known_firmware_keeps_its_own_layout_whatever_the_variable_names() {
+    let known = firmware_with(Some(&cmm2_core::B5));
+    let kept = with_layout(known, LAYOUT_VARIABLE, Some("rc6".to_string())).unwrap();
+    assert_eq!(kept.profile(), Some(&cmm2_core::B5));
+    // Not even a bad name is looked at.
+    let known = firmware_with(Some(&cmm2_core::B5));
+    assert!(with_layout(known, LAYOUT_VARIABLE, Some("8".to_string())).is_ok());
+}
+
+#[test]
+fn an_unknown_firmware_takes_the_layout_the_variable_names_and_a_bad_name_is_an_error() {
+    let named = with_layout(
+        firmware_with(None),
+        LAYOUT_VARIABLE,
+        Some("RC6".to_string()),
+    );
+    assert_eq!(named.unwrap().profile(), Some(&cmm2_core::RC6));
+    assert_eq!(
+        with_layout(firmware_with(None), LAYOUT_VARIABLE, None)
+            .unwrap()
+            .profile(),
+        None
+    );
+    let bad = with_layout(firmware_with(None), LAYOUT_VARIABLE, Some("8".to_string()));
+    assert_eq!(
+        bad.unwrap_err().to_string(),
+        "CMM2_SETTINGS_LAYOUT is \"8\", not b5 or rc6"
+    );
 }

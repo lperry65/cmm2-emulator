@@ -1,5 +1,6 @@
 use super::*;
-use crate::{AccessKind, FLASH_BASE, Firmware, PeripheralAccess, Svd, UnmappedAccess};
+use crate::ds3231::STATE_SIZE;
+use crate::{AccessKind, B5, FLASH_BASE, Firmware, PeripheralAccess, RC6, Svd, UnmappedAccess};
 use crate::{Console, FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController, cmm2_memory};
 use crate::{Ds3231Slot, SdSlot, TIM16_BASE, TIMER_SIZE, Timer};
 use crate::{GPIO_PORT_SIZE, Gpio, RCC_BASE, RCC_SIZE, RTC_BASE, RTC_SIZE, Rcc, Rtc};
@@ -8,6 +9,16 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 const CODE: u32 = FLASH_BASE + 0x100;
+// These numbers repeat the profile table's on purpose: the ignored real-firmware tests check the
+// table's against the real images, and these check that the code does what the table says.
+// The start of the user flash on b5, after the 32-byte block that it keeps in its own image.
+const USER_FLASH_BASE: u32 = 0x0812_0000;
+const BLOCK: usize = 32;
+// The flash part of the saved state of b5, and its sizes with the clock and the DS3231 after.
+const FLASH_PART: usize = 917_536;
+const PERSISTENT_SIZE: usize = FLASH_PART + 8;
+const WITH_DS3231_SIZE: usize = PERSISTENT_SIZE + STATE_SIZE;
+const VERSION_1_SIZE: usize = PERSISTENT_SIZE + 8;
 const SP: u32 = 0x2000_8000;
 
 // Thumb code assembled with binutils, as halfwords.
@@ -47,7 +58,7 @@ fn image(code: &[u16], handlers: &[(usize, u32)]) -> Firmware {
     }
     let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     bytes.extend(code.iter().flat_map(|h| h.to_le_bytes()));
-    Firmware::from_bytes(bytes).unwrap()
+    Firmware::from_bytes(bytes).unwrap().with_profile(&B5)
 }
 
 fn cpu(code: &[u16]) -> Cpu {
@@ -368,33 +379,33 @@ fn set_clock(cpu: &mut Cpu, tr: u32, dr: u32) {
 #[test]
 fn the_persistent_state_is_the_end_of_the_flash_and_the_clock() {
     let mut cpu = board(&THREE);
-    let state = cpu.persistent();
+    let state = cpu.persistent().unwrap();
     assert_eq!(state.len(), PERSISTENT_SIZE);
-    assert_eq!(USER_FLASH_BASE, 0x0812_0000);
-    assert_eq!(PERSISTENT_SIZE, 0xE_0008);
-    assert_eq!(WITH_DS3231_SIZE, 0xE_0012);
-    assert_eq!(VERSION_1_SIZE, 0xE_0010);
-    assert!(state[..USER_FLASH_SIZE].iter().all(|&byte| byte == 0xFF));
+    assert_eq!(PERSISTENT_SIZE, 0xE_0028);
+    assert_eq!(WITH_DS3231_SIZE, 0xE_0032);
+    assert_eq!(VERSION_1_SIZE, 0xE_0030);
+    // The image's own bytes (the synthetic image has none there) and the user flash, erased.
+    assert!(state[..FLASH_PART].iter().all(|&byte| byte == 0xFF));
     // The clock's reset values: 00:00:00 on Monday 01/01/00. Nothing of the DS3231's, which
     // is as it was made.
-    assert_eq!(state[USER_FLASH_SIZE..], [0, 0, 0, 0, 0x01, 0x21, 0, 0]);
+    assert_eq!(state[FLASH_PART..], [0, 0, 0, 0, 0x01, 0x21, 0, 0]);
 }
 
 #[test]
 fn loaded_state_reads_back_and_leaves_the_firmware_alone() {
     let mut cpu = board(&THREE);
     let mut state = vec![0xFF; PERSISTENT_SIZE];
-    state[..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
-    let last = USER_FLASH_SIZE - 4;
-    state[last..USER_FLASH_SIZE].copy_from_slice(&0xCAFE_F00Du32.to_le_bytes());
-    state[USER_FLASH_SIZE..USER_FLASH_SIZE + 4].copy_from_slice(&0x12_00_00u32.to_le_bytes());
-    state[USER_FLASH_SIZE + 4..].copy_from_slice(&0x26_91_12u32.to_le_bytes());
+    state[BLOCK..BLOCK + 4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    let last = FLASH_PART - 4;
+    state[last..FLASH_PART].copy_from_slice(&0xCAFE_F00Du32.to_le_bytes());
+    state[FLASH_PART..FLASH_PART + 4].copy_from_slice(&0x12_00_00u32.to_le_bytes());
+    state[FLASH_PART + 4..].copy_from_slice(&0x26_91_12u32.to_le_bytes());
 
     cpu.load_persistent(&state).unwrap();
 
     assert_eq!(cpu.read32(USER_FLASH_BASE), 0x1234_5678);
-    assert_eq!(cpu.read32(0x081E_0000 + 0x1_FFFC), 0xCAFE_F00D);
-    assert_eq!(cpu.persistent(), state);
+    assert_eq!(cpu.read32(0x0820_0000 - 4), 0xCAFE_F00D);
+    assert_eq!(cpu.persistent().unwrap(), state);
     assert_eq!(cpu.read32(FLASH_BASE), SP);
     assert_eq!(cpu.read32(USER_FLASH_BASE - 4), 0xFFFF_FFFF);
 }
@@ -404,8 +415,8 @@ fn flash_the_guest_wrote_is_saved() {
     let code = [boot_program(1), COUNT_IN_AXI.to_vec()].concat();
     let mut cpu = Cpu::new(&image(&code, &[]), cmm2_memory(&Irqs::new()), Irqs::new()).unwrap();
     cpu.run(100);
-    let state = cpu.persistent();
-    let at = (FLASH_WORD - USER_FLASH_BASE) as usize;
+    let state = cpu.persistent().unwrap();
+    let at = (FLASH_WORD - USER_FLASH_BASE) as usize + BLOCK;
     assert_eq!(state[at..at + 4], 1u32.to_le_bytes());
 }
 
@@ -413,19 +424,19 @@ fn flash_the_guest_wrote_is_saved() {
 fn the_clock_is_saved_and_carries_on_in_a_new_machine() {
     let mut first = board(&THREE);
     set_clock(&mut first, 0x12_30_45, 0x26_91_12);
-    let state = first.persistent();
+    let state = first.persistent().unwrap();
     assert_eq!(
-        state[USER_FLASH_SIZE..USER_FLASH_SIZE + 4],
+        state[FLASH_PART..FLASH_PART + 4],
         0x12_30_45u32.to_le_bytes()
     );
     assert_eq!(
-        state[USER_FLASH_SIZE + 4..USER_FLASH_SIZE + 8],
+        state[FLASH_PART + 4..FLASH_PART + 8],
         0x26_91_12u32.to_le_bytes()
     );
 
     let mut second = board(&THREE);
     second.load_persistent(&state).unwrap();
-    assert_eq!(second.persistent(), state);
+    assert_eq!(second.persistent().unwrap(), state);
 }
 
 #[test]
@@ -436,7 +447,7 @@ fn the_ds3231_is_saved_after_the_clock_once_it_is_set_and_carries_on_in_a_new_ma
         .ds3231()
         .set_offset_millis(Some(-86_400_000 * 3 - 7))
         .unwrap();
-    let state = first.persistent();
+    let state = first.persistent().unwrap();
     assert_eq!(state.len(), WITH_DS3231_SIZE);
     let ds3231 = &state[PERSISTENT_SIZE..];
     assert_eq!(ds3231[..8], (-86_400_000i64 * 3 - 7).to_le_bytes());
@@ -449,7 +460,7 @@ fn the_ds3231_is_saved_after_the_clock_once_it_is_set_and_carries_on_in_a_new_ma
         second.memory().ds3231().offset_millis(),
         Some(-86_400_000 * 3 - 7)
     );
-    assert_eq!(second.persistent(), state);
+    assert_eq!(second.persistent().unwrap(), state);
 }
 
 #[test]
@@ -458,14 +469,14 @@ fn a_ds3231_with_its_time_never_set_but_its_status_cleared_is_saved_and_loaded()
     let mut saved = [0; STATE_SIZE];
     saved[9] = 0x08;
     first.memory().ds3231().load(saved).unwrap();
-    let state = first.persistent();
+    let state = first.persistent().unwrap();
     assert_eq!(state[PERSISTENT_SIZE + 8..], [0, 0x08]);
 
     let mut second = board(&THREE);
     second.memory().ds3231().set_offset_millis(Some(5)).unwrap();
     second.load_persistent(&state).unwrap();
     assert_eq!(second.memory().ds3231().offset_millis(), None);
-    assert_eq!(second.persistent(), state);
+    assert_eq!(second.persistent().unwrap(), state);
 }
 
 #[test]
@@ -476,23 +487,23 @@ fn state_saved_before_the_ds3231_was_modelled_loads_and_leaves_it_as_it_was_made
         .set_offset_millis(Some(99_000))
         .unwrap();
     let mut old = vec![0xFF; PERSISTENT_SIZE];
-    old[..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
-    old[USER_FLASH_SIZE..USER_FLASH_SIZE + 4].copy_from_slice(&0x12_00_00u32.to_le_bytes());
-    old[USER_FLASH_SIZE + 4..].copy_from_slice(&0x26_91_12u32.to_le_bytes());
+    old[BLOCK..BLOCK + 4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    old[FLASH_PART..FLASH_PART + 4].copy_from_slice(&0x12_00_00u32.to_le_bytes());
+    old[FLASH_PART + 4..].copy_from_slice(&0x26_91_12u32.to_le_bytes());
 
     cpu.load_persistent(&old).unwrap();
 
     assert_eq!(cpu.memory().ds3231().offset_millis(), None);
     assert_eq!(cpu.read32(USER_FLASH_BASE), 0x1234_5678);
-    // Saved again it is the same bytes, so a build without a DS3231 can still read it.
-    assert_eq!(cpu.persistent(), old);
+    // Saved again it is the same bytes: the DS3231's state is added only once it is not as made.
+    assert_eq!(cpu.persistent().unwrap(), old);
 }
 
 #[test]
 fn state_saved_by_the_first_version_with_a_ds3231_is_converted() {
     let mut cpu = board(&THREE);
     let mut v1 = vec![0xFF; VERSION_1_SIZE];
-    v1[USER_FLASH_SIZE..USER_FLASH_SIZE + 8].fill(0);
+    v1[FLASH_PART..FLASH_PART + 8].fill(0);
     v1[PERSISTENT_SIZE..].copy_from_slice(&(-3600i64).to_le_bytes());
 
     cpu.load_persistent(&v1).unwrap();
@@ -502,17 +513,17 @@ fn state_saved_by_the_first_version_with_a_ds3231_is_converted() {
     v1[PERSISTENT_SIZE..].fill(0);
     cpu.load_persistent(&v1).unwrap();
     assert_eq!(cpu.memory().ds3231().offset_millis(), None);
-    assert_eq!(cpu.persistent().len(), PERSISTENT_SIZE);
+    assert_eq!(cpu.persistent().unwrap().len(), PERSISTENT_SIZE);
 }
 
 #[test]
 fn a_saved_offset_that_is_too_far_away_is_refused_and_nothing_is_loaded() {
     let mut cpu = board(&THREE);
     let mut state = vec![0xFF; WITH_DS3231_SIZE];
-    state[USER_FLASH_SIZE..PERSISTENT_SIZE].fill(0);
+    state[FLASH_PART..PERSISTENT_SIZE].fill(0);
     state[PERSISTENT_SIZE..PERSISTENT_SIZE + 8].copy_from_slice(&i64::MAX.to_le_bytes());
     state[PERSISTENT_SIZE + 8] = 1;
-    state[0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    state[BLOCK..BLOCK + 4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
     let error = cpu.load_persistent(&state).unwrap_err();
     assert_eq!(
         error,
@@ -538,7 +549,7 @@ fn saving_and_loading_the_state_leave_no_trace_on_the_bus() {
         .set_peripheral_trace(Some(Box::new(move |access| {
             sink.borrow_mut().push(*access)
         })));
-    let state = cpu.persistent();
+    let state = cpu.persistent().unwrap();
     cpu.load_persistent(&state).unwrap();
     assert_eq!(seen.borrow().len(), 0, "{:?}", seen.borrow());
 }
@@ -548,7 +559,7 @@ fn state_of_the_wrong_length_is_refused() {
     let mut cpu = board(&THREE);
     for len in [
         0,
-        USER_FLASH_SIZE,
+        FLASH_PART,
         PERSISTENT_SIZE - 4,
         PERSISTENT_SIZE + 4,
         VERSION_1_SIZE - 4,
@@ -558,11 +569,14 @@ fn state_of_the_wrong_length_is_refused() {
     ] {
         assert_eq!(
             cpu.load_persistent(&vec![0; len]),
-            Err(PersistentError::Size(PersistentSizeError { got: len }))
+            Err(PersistentError::Size(PersistentSizeError {
+                got: len,
+                profile: &B5
+            }))
         );
     }
     assert!(
-        cpu.persistent()[..USER_FLASH_SIZE]
+        cpu.persistent().unwrap()[..FLASH_PART]
             .iter()
             .all(|&byte| byte == 0xFF)
     );
@@ -570,7 +584,11 @@ fn state_of_the_wrong_length_is_refused() {
 
 #[test]
 fn the_size_error_names_every_size_that_loads() {
-    let message = PersistentSizeError { got: 3 }.to_string();
+    let message = PersistentSizeError {
+        got: 3,
+        profile: &B5,
+    }
+    .to_string();
     for size in [PERSISTENT_SIZE, VERSION_1_SIZE, WITH_DS3231_SIZE] {
         assert!(message.contains(&size.to_string()), "{message}");
     }
@@ -1388,4 +1406,213 @@ fn a_reset_puts_vtor_back_at_the_flash_base() {
     cpu.processor.vtor = 0x2000_0000;
     cpu.reset();
     assert_eq!(cpu.processor.vtor, FLASH_BASE);
+}
+
+// A machine with the clock mapped and the profile's flash the guest wrote to.
+fn machine_for(profile: &'static Profile) -> Cpu {
+    let firmware = image(&THREE, &[]).with_profile(profile);
+    Cpu::new(&firmware, cmm2_memory(&Irqs::new()), Irqs::new()).unwrap()
+}
+
+// A distinctive word for an address, so that a byte that lands in the wrong place shows.
+fn tag(addr: u32) -> u32 {
+    addr.rotate_left(7) ^ 0x5A5A_C3C3
+}
+
+fn write_tags(cpu: &mut Cpu, addrs: &[u32]) {
+    for &addr in addrs {
+        cpu.processor.write32(addr, tag(addr)).unwrap();
+    }
+}
+
+// The first and last word of each region of the profile.
+fn region_edges(profile: &Profile) -> Vec<u32> {
+    let edges = |r: &Region| [r.addr, r.addr + r.len - 4];
+    profile.regions.iter().flat_map(edges).collect()
+}
+
+#[test]
+fn every_region_of_each_profile_is_saved_and_loaded_in_a_new_machine() {
+    for profile in [&B5, &RC6] {
+        let mut first = machine_for(profile);
+        let edges = region_edges(profile);
+        write_tags(&mut first, &edges);
+        let state = first.persistent().unwrap();
+        assert_eq!(state.len(), profile.persistent_size(), "{}", profile.name);
+
+        let mut second = machine_for(profile);
+        second.load_persistent(&state).unwrap();
+        for &addr in &edges {
+            assert_eq!(second.read32(addr), tag(addr), "{} {addr:#X}", profile.name);
+        }
+        assert_eq!(second.persistent().unwrap(), state);
+    }
+}
+
+#[test]
+fn the_32_byte_block_inside_the_image_is_saved_first_and_survives_a_load() {
+    for (profile, block) in [(&B5, 0x080F_8540u32), (&RC6, 0x080F_6F00)] {
+        let mut first = machine_for(profile);
+        first.processor.write32(block, 0x1111_2222).unwrap();
+        first.processor.write32(block + 28, 0x3333_4444).unwrap();
+        let state = first.persistent().unwrap();
+        assert_eq!(state[..4], 0x1111_2222u32.to_le_bytes());
+        assert_eq!(state[28..32], 0x3333_4444u32.to_le_bytes());
+
+        let mut second = machine_for(profile);
+        second.load_persistent(&state).unwrap();
+        assert_eq!(second.read32(block), 0x1111_2222);
+        assert_eq!(second.read32(block + 28), 0x3333_4444);
+        // And not a word past it.
+        assert_eq!(second.read32(block + 32), 0xFFFF_FFFF);
+    }
+}
+
+#[test]
+fn rc6_leaves_the_firmware_code_beside_its_options_out_of_the_file_and_alone_on_a_load() {
+    // Code in the same sector as the options, and in the sector before the program flash.
+    let code = [0x0814_1000, 0x0815_8000, 0x0815_FFFC];
+    let mut first = machine_for(&RC6);
+    write_tags(&mut first, &code);
+    write_tags(&mut first, &region_edges(&RC6));
+    let state = first.persistent().unwrap();
+    for &addr in &code {
+        let word = tag(addr).to_le_bytes();
+        assert!(
+            !state.windows(4).any(|w| w == word),
+            "{addr:#X} is in the file"
+        );
+    }
+
+    // A machine with newer code in those places keeps it.
+    let mut second = machine_for(&RC6);
+    for &addr in &code {
+        second.processor.write32(addr, !tag(addr)).unwrap();
+    }
+    second.load_persistent(&state).unwrap();
+    for &addr in &code {
+        assert_eq!(second.read32(addr), !tag(addr), "{addr:#X}");
+    }
+    assert_eq!(second.read32(0x0814_0000), tag(0x0814_0000));
+}
+
+// A b5 file from before the 32-byte block was kept: the user flash, then the clock.
+fn old_b5_file(tail: usize) -> Vec<u8> {
+    let mut bytes = vec![0xFF; FLASH_PART - BLOCK + tail];
+    bytes[..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    bytes[FLASH_PART - BLOCK..FLASH_PART - BLOCK + 8].fill(0);
+    bytes
+}
+
+#[test]
+fn old_b5_files_without_the_block_still_load_and_get_a_block_of_zeros() {
+    // 917,512 (no DS3231), 917,520 (the first DS3231 version) and 917,522 bytes.
+    for (len, tail) in [(917_512, 8), (917_520, 16), (917_522, 18)] {
+        let mut file = old_b5_file(tail);
+        assert_eq!(file.len(), len);
+        if tail == 18 {
+            file[len - 2..].copy_from_slice(&[1, 0x88]);
+        }
+        let mut cpu = machine_for(&B5);
+        // Whatever was there, the firmware must not find FF, or it takes its first-start path.
+        cpu.processor.write32(0x080F_8540, 0xABCD_EF01).unwrap();
+        cpu.processor
+            .write32(0x080F_8540 + 28, 0xABCD_EF01)
+            .unwrap();
+
+        cpu.load_persistent(&file).unwrap();
+
+        assert_eq!(cpu.read32(USER_FLASH_BASE), 0x1234_5678, "{len}");
+        for word in 0..8 {
+            assert_eq!(cpu.read32(0x080F_8540 + word * 4), 0, "{len} word {word}");
+        }
+        // Saved again, it is the new form, with the block first.
+        let saved = cpu.persistent().unwrap();
+        assert_eq!(saved[..BLOCK], [0; BLOCK], "{len}");
+        assert_eq!(
+            saved[BLOCK..BLOCK + 4],
+            0x1234_5678u32.to_le_bytes(),
+            "{len}"
+        );
+    }
+}
+
+#[test]
+fn rc6_has_no_files_from_before_its_block() {
+    let mut cpu = machine_for(&RC6);
+    let old = vec![0xFF; RC6.persistent_size() - BLOCK];
+    assert!(matches!(
+        cpu.load_persistent(&old),
+        Err(PersistentError::Size(_))
+    ));
+}
+
+#[test]
+fn a_file_of_any_other_size_for_the_profile_is_refused_and_nothing_is_loaded() {
+    // Each profile's own sizes load; the other's does not, nor does one a word off.
+    let cases = [
+        (&B5, RC6.persistent_size()),
+        (&B5, B5.persistent_size() + 4),
+        (&B5, 0),
+        (&RC6, B5.persistent_size()),
+        (&RC6, RC6.persistent_size() + 4),
+        (&RC6, RC6.persistent_size() - 4),
+    ];
+    for (profile, len) in cases {
+        let mut cpu = machine_for(profile);
+        let mut file = vec![0; len];
+        if len >= 4 {
+            file[..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        }
+        let error = cpu.load_persistent(&file).unwrap_err();
+        assert_eq!(
+            error,
+            PersistentError::Size(PersistentSizeError { got: len, profile })
+        );
+        assert!(error.to_string().contains(profile.name), "{error}");
+        assert_eq!(cpu.read32(profile.regions[0].addr), 0xFFFF_FFFF);
+    }
+}
+
+#[test]
+fn an_image_with_no_profile_has_no_settings_layout() {
+    let mut cpu = Cpu::new(
+        &Firmware::from_bytes(image(&THREE, &[]).image().to_vec()).unwrap(),
+        cmm2_memory(&Irqs::new()),
+        Irqs::new(),
+    )
+    .unwrap();
+    assert_eq!(cpu.profile(), None);
+    assert_eq!(cpu.persistent(), Err(NoLayout));
+    let error = cpu.load_persistent(&[0; 100]).unwrap_err();
+    assert_eq!(error, PersistentError::NoLayout(NoLayout));
+    let message = error.to_string();
+    assert!(message.contains("no settings layout"), "{message}");
+    assert!(message.contains("issue 82"), "{message}");
+}
+
+#[test]
+fn the_size_error_says_when_the_file_is_the_size_of_another_releases() {
+    let b5_file = B5.persistent_size();
+    let message = PersistentSizeError {
+        got: b5_file,
+        profile: &RC6,
+    }
+    .to_string();
+    assert!(message.contains("another release"), "{message}");
+    assert!(message.contains("7.00.00b5"), "{message}");
+    let rc6_file = RC6.persistent_size() + STATE_SIZE;
+    let message = PersistentSizeError {
+        got: rc6_file,
+        profile: &B5,
+    }
+    .to_string();
+    assert!(message.contains("7.00.00RC6"), "{message}");
+    // A size that is nobody's says nothing of the kind.
+    let message = PersistentSizeError {
+        got: 3,
+        profile: &B5,
+    }
+    .to_string();
+    assert!(!message.contains("another release"), "{message}");
 }

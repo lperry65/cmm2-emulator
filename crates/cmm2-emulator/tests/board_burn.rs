@@ -271,3 +271,82 @@ fn real_firmware_first_boot_is_remembered_and_the_next_plain_start_reaches_the_p
     assert!(!second_text.contains("Keyboard type"), "{second_text}");
     assert!(second_text.contains("PRINT 6*7\r\n 42"), "{second_text}");
 }
+
+#[test]
+fn burning_a_firmware_with_no_settings_layout_is_refused_before_the_board_is_touched() {
+    let home = Home::new("board-no-layout");
+    let program = Tmp::program("board-no-layout", &count_in_flash(SPIN));
+    let mut command = on(&home);
+    let output = command
+        .env_remove(LAYOUT_VARIABLE)
+        .env_remove(BOARD_LAYOUT_VARIABLE)
+        .args(["--burn", program.arg(), "--console", "--run", "10"])
+        .output()
+        .expect("failed to run cmm2-emulator");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "cmm2-emulator: {}: this firmware has no settings layout yet, so it cannot save or \
+             load settings (see issue 82)\n",
+            program.arg()
+        )
+    );
+    assert!(!home.0.exists(), "the refusal made the directory");
+}
+
+#[test]
+fn the_settings_layout_variable_never_lets_a_burn_of_an_unknown_firmware_through() {
+    let home = Home::new("board-burn-variable");
+    let program = Tmp::program("board-burn-variable", &count_in_flash(SPIN));
+    let mut command = on(&home);
+    let output = command
+        .env(LAYOUT_VARIABLE, "b5")
+        .env_remove(BOARD_LAYOUT_VARIABLE)
+        .args(["--burn", program.arg(), "--console", "--run", "10"])
+        .output()
+        .expect("failed to run cmm2-emulator");
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("no settings layout"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!home.0.exists(), "the refusal made the directory");
+}
+
+#[test]
+fn a_plain_start_with_an_unknown_firmware_burned_names_the_firmware_and_how_to_go_on() {
+    let home = Home::new("board-unknown-start");
+    let program = Tmp::program("board-unknown-start", &count_in_flash(SPIN));
+    // Burned with the layout that the tests name for the board, as a firmware I know would be.
+    let first = quit_run(&home, &["--burn", program.arg(), "--console"]);
+    assert!(first.status.success(), "{}", stderr(&first));
+
+    // Plain, and with the scratch variable set, which the board never looks at.
+    for scratch_layout in [None, Some("b5")] {
+        let mut command = on(&home);
+        command
+            .env_remove(LAYOUT_VARIABLE)
+            .env_remove(BOARD_LAYOUT_VARIABLE)
+            .args(["--console", "--run", "10"]);
+        if let Some(layout) = scratch_layout {
+            command.env(LAYOUT_VARIABLE, layout);
+        }
+        let output = command.output().expect("failed to run cmm2-emulator");
+
+        assert_eq!(output.status.code(), Some(1), "{scratch_layout:?}");
+        assert_eq!(
+            stderr(&output),
+            format!(
+                "cmm2-emulator: {}: the firmware burned onto the board has no settings layout \
+                 yet (see issue 82), so the board cannot keep its settings. Burn a firmware I \
+                 know with: cmm2-emulator --burn <file>\n",
+                home.file("firmware.bin").display()
+            ),
+            "{scratch_layout:?}"
+        );
+    }
+}

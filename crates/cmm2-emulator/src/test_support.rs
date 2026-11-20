@@ -4,7 +4,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use cmm2_core::{Cpu, Firmware, Irqs, cmm2_memory};
+use cmm2_core::{B5, Cpu, Firmware, Irqs, cmm2_memory};
 
 // A directory under the temp directory that is this test's own.
 pub(crate) fn scratch(name: &str) -> PathBuf {
@@ -63,7 +63,7 @@ pub(crate) fn idle_cpu() -> Cpu {
     image[4..8].copy_from_slice(&0x0800_0021u32.to_le_bytes());
     let irqs = Irqs::new();
     Cpu::new(
-        &Firmware::from_bytes(image).unwrap(),
+        &Firmware::from_bytes(image).unwrap().with_profile(&B5),
         cmm2_memory(&irqs),
         irqs,
     )

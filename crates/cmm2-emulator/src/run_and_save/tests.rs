@@ -3,7 +3,7 @@ use super::*;
 use crate::args::RunOptions;
 use crate::panic_hook::HOLDING;
 use crate::test_support::{PANICS, idle_cpu, scratch};
-use cmm2_core::PERSISTENT_SIZE;
+use cmm2_core::B5;
 use cmm2_core::SdSlot;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -56,7 +56,7 @@ fn the_files_are_saved_when_the_run_panics_and_the_panic_carries_on() {
 
     let panic = panicked.expect_err("the panic is not swallowed");
     assert_eq!(panic.downcast_ref::<&str>(), Some(&"a bug in the emulator"));
-    assert_eq!(std::fs::read(&file).unwrap().len(), PERSISTENT_SIZE);
+    assert_eq!(std::fs::read(&file).unwrap().len(), B5.persistent_size());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

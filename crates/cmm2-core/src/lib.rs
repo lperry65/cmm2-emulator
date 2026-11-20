@@ -15,6 +15,7 @@ mod machine;
 mod memory;
 mod otg;
 mod peripheral;
+mod profile;
 mod pwr;
 mod rcc;
 mod registers;
@@ -30,12 +31,10 @@ mod usb_keyboard;
 
 pub use clock::{CORE_HZ, Clock};
 pub use console::Console;
-pub use cpu::{Cpu, CpuError, Fault, PERSISTENT_SIZE, PersistentError, PersistentSizeError, Stop};
+pub use cpu::{Cpu, CpuError, Fault, NoLayout, PersistentError, PersistentSizeError, Stop};
 pub use display::{Frame, FrameError};
 pub use ds3231::{Ds3231Slot, FixedClock, HostClock, HostNow, HostTime, OffsetError, STATE_SIZE};
-pub use firmware::{
-    FLASH_BASE, FLASH_SIZE, Firmware, FirmwareError, USER_FLASH_BASE, USER_FLASH_SIZE, VectorTable,
-};
+pub use firmware::{FLASH_BASE, FLASH_SIZE, Firmware, FirmwareError, VectorTable};
 pub use flash::{FLASH_REGS_BASE, FLASH_REGS_SIZE, FlashController, FlashRegisters};
 pub use flash_ops::{FlashOp, FlashOps};
 pub use gpio::{GPIO_BASE, GPIO_PORT_SIZE, GPIO_PORTS, Gpio, GpioRegisters};
@@ -47,6 +46,7 @@ pub use memory::{
 };
 pub use otg::{OTG_BASE, OTG_SIZE, Otg, OtgRegisters};
 pub use peripheral::{Peripheral, PeripheralAccess, RegisterStub, ResetCause, StubRegisters};
+pub use profile::{B5, Profile, RC6, Region};
 pub use pwr::{PWR_BASE, PWR_SIZE, Pwr, PwrRegisters};
 pub use rcc::{RCC_BASE, RCC_SIZE, Rcc, RccRegisters};
 pub use registers::{Registers, WordAccess};

@@ -4,7 +4,7 @@ use crate::board::BoardError;
 use crate::output::Output;
 use crate::window::WindowError;
 use cmm2_core::{
-    CpuError, FirmwareError, FrameError, ImageSizeError, MIN_IMAGE_SIZE, MemoryError,
+    CpuError, FirmwareError, FrameError, ImageSizeError, MIN_IMAGE_SIZE, MemoryError, NoLayout,
     PersistentError,
 };
 use std::fmt;
@@ -39,6 +39,21 @@ pub(crate) enum RunError {
     FlashSize {
         path: String,
         source: PersistentError,
+    },
+    /// The firmware has no settings layout, so a settings file for it would be wrong data. `path`
+    /// is the file that asked for one.
+    NoLayout {
+        path: String,
+        source: NoLayout,
+    },
+    /// The firmware on the board has no settings layout; `path` is its `firmware.bin`.
+    BoardNoLayout {
+        path: String,
+    },
+    /// The variable names no layout I know.
+    BadLayoutName {
+        variable: String,
+        name: String,
     },
     /// The `--sd` file could not be read or written.
     Sd {
@@ -75,6 +90,16 @@ impl fmt::Display for RunError {
             RunError::Screenshot { path, source } => write!(f, "{path}: {source}"),
             RunError::Flash { path, source } => write!(f, "{path}: {source}"),
             RunError::FlashSize { path, source } => write!(f, "{path}: {source}"),
+            RunError::NoLayout { path, source } => write!(f, "{path}: {source}"),
+            RunError::BoardNoLayout { path } => write!(
+                f,
+                "{path}: the firmware burned onto the board has no settings layout yet (see issue \
+                 82), so the board cannot keep its settings. Burn a firmware I know with: \
+                 cmm2-emulator --burn <file>"
+            ),
+            RunError::BadLayoutName { variable, name } => {
+                write!(f, "{variable} is \"{name}\", not b5 or rc6")
+            }
             RunError::Sd { path, source } => write!(f, "{path}: {source}"),
             RunError::SdSize { path, source } => write!(f, "{path}: {source}"),
             RunError::SdTooSmall { path, size } => write!(

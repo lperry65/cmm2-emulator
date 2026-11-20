@@ -17,12 +17,13 @@ use zmu_cortex_m::executor::Executor;
 use zmu_cortex_m::peripheral::nvic::NVIC;
 
 use crate::clock::Clock;
-use crate::ds3231::{OffsetError, STATE_SIZE};
-use crate::firmware::{FLASH_BASE, FLASH_SIZE, Firmware, USER_FLASH_BASE, USER_FLASH_SIZE};
+use crate::ds3231::OffsetError;
+use crate::firmware::{FLASH_BASE, FLASH_SIZE, Firmware};
 use crate::flash_ops::{FlashOp, FlashOps};
 use crate::irq::Irqs;
 use crate::memory::MemoryMap;
 use crate::peripheral::ResetCause;
+use crate::profile::{CLOCK_SIZE, Profile, Region, VERSION_1_SIZE, WITH_DS3231_SIZE, regions_size};
 
 /// Cortex-M7 r1p1.
 const CPUID: u32 = 0x411F_C271;
@@ -43,22 +44,11 @@ impl fmt::Display for CpuError {
 
 impl std::error::Error for CpuError {}
 
-/// What a real board keeps with the power off: the user flash, then the clock's time and date
-/// (TR and DR, a word each), which its battery keeps going. This is the size of the saved
-/// state of a board whose DS3231 is as it was made.
-pub const PERSISTENT_SIZE: usize = USER_FLASH_SIZE + 8;
-
-/// The state with the DS3231's after it (`Ds3231Slot::saved`), once the guest has set its time or
-/// cleared its status.
-const WITH_DS3231_SIZE: usize = PERSISTENT_SIZE + STATE_SIZE;
-
-/// The size of the state that the first version with a DS3231 saved: the DS3231's offset from the
-/// host's local time, in seconds, an i64.
-const VERSION_1_SIZE: usize = PERSISTENT_SIZE + 8;
-
 /// Saved state that cannot be loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistentError {
+    /// The firmware is not one whose settings layout I know.
+    NoLayout(NoLayout),
     /// The wrong length.
     Size(PersistentSizeError),
     /// The DS3231's saved clock is too far from the host's.
@@ -68,6 +58,7 @@ pub enum PersistentError {
 impl fmt::Display for PersistentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            PersistentError::NoLayout(none) => none.fmt(f),
             PersistentError::Size(size) => size.fmt(f),
             PersistentError::Offset(offset) => offset.fmt(f),
         }
@@ -82,20 +73,63 @@ impl From<OffsetError> for PersistentError {
     }
 }
 
-/// Saved state of the wrong length.
+impl From<NoLayout> for PersistentError {
+    fn from(none: NoLayout) -> PersistentError {
+        PersistentError::NoLayout(none)
+    }
+}
+
+/// The firmware has no profile, so there is no saying which flash the settings are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoLayout;
+
+impl fmt::Display for NoLayout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "this firmware has no settings layout yet, so it cannot save or load settings (see \
+             issue 82)"
+        )
+    }
+}
+
+impl std::error::Error for NoLayout {}
+
+/// Saved state of the wrong length for the firmware's profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PersistentSizeError {
     pub got: usize,
+    pub profile: &'static Profile,
 }
 
 impl fmt::Display for PersistentSizeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let size = self.profile.persistent_size();
         write!(
             f,
-            "the saved flash and clock are {PERSISTENT_SIZE} bytes, or {WITH_DS3231_SIZE} with the \
-             DS3231's state ({VERSION_1_SIZE} from the first version that had it), not {}",
-            self.got
-        )
+            "the saved flash and clock for firmware {} are {size} bytes, or {} with the \
+             DS3231's state ({} from the first version that had it)",
+            self.profile.name,
+            self.profile.flash_size() + WITH_DS3231_SIZE,
+            self.profile.flash_size() + VERSION_1_SIZE,
+        )?;
+        if let Some(old) = self.profile.old_regions() {
+            write!(
+                f,
+                ", or those sizes less {} bytes from before the firmware's own block was kept",
+                self.profile.flash_size() - regions_size(old)
+            )?;
+        }
+        write!(f, ", not {}", self.got)?;
+        if let Some(other) = self.profile.other_with_size(self.got) {
+            write!(
+                f,
+                ": that is the size of a file for firmware {}, so it probably belongs to another \
+                 release",
+                other.name
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -195,6 +229,7 @@ pub struct Cpu {
     pc: Rc<Cell<u32>>,
     clock: Clock,
     resets: u32,
+    profile: Option<&'static Profile>,
 }
 
 impl Cpu {
@@ -229,6 +264,7 @@ impl Cpu {
             pc,
             clock,
             resets: 0,
+            profile: firmware.profile(),
         })
     }
 
@@ -401,13 +437,21 @@ impl Cpu {
         self.resets += 1;
     }
 
-    /// What the machine keeps with the power off: the user flash, the saved options and the
-    /// stored program, as the guest has left it, then the clock's time and date. The firmware
-    /// is not part of it.
-    pub fn persistent(&mut self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(PERSISTENT_SIZE);
-        for addr in (USER_FLASH_BASE..FLASH_BASE + FLASH_SIZE as u32).step_by(4) {
-            bytes.extend(self.read32(addr).to_le_bytes());
+    /// What the firmware in this machine keeps in flash, if it is one I know.
+    pub fn profile(&self) -> Option<&'static Profile> {
+        self.profile
+    }
+
+    /// What the machine keeps with the power off: the regions of flash that the firmware's
+    /// profile names, as the guest has left them, then the clock's time and date. The rest of
+    /// the firmware is not part of it. Refused for a firmware with no profile.
+    pub fn persistent(&mut self) -> Result<Vec<u8>, NoLayout> {
+        let profile = self.profile.ok_or(NoLayout)?;
+        let mut bytes = Vec::with_capacity(profile.persistent_size());
+        for region in profile.regions {
+            for addr in (region.addr..region.addr + region.len).step_by(4) {
+                bytes.extend(self.read32(addr).to_le_bytes());
+            }
         }
         // Straight from the clock, not over the bus, so that a trace of the peripherals does
         // not log the reads.
@@ -418,34 +462,58 @@ impl Cpu {
         // The DS3231's, if it is not as it was made, which keeps the file the size it was before
         // for a board whose clock was never set.
         bytes.extend(memory.ds3231().saved().into_iter().flatten());
-        bytes
+        Ok(bytes)
     }
 
-    /// Restores what `persistent` gave out. The firmware is not touched, so state saved from
-    /// an older firmware still loads. State saved without the DS3231's leaves it as it was
-    /// made, and the state of the first version with a DS3231 is converted. Nothing is loaded
-    /// if it is refused.
+    /// Restores what `persistent` gave out, for the same firmware: a file made by another
+    /// release is the wrong size, or at worst the wrong flash, and nothing says which. The
+    /// rest of the firmware is not touched. State saved without the DS3231's leaves it as it
+    /// was made, and the state of the first version with a DS3231 is converted. Nothing is
+    /// loaded if it is refused.
+    ///
+    /// A file from before the profile's first region was kept (a b5 file without its 32-byte
+    /// block) gets zeros there, as the firmware writes them itself on its first run: left as
+    /// the image has it (FF) the firmware would take its first-start path and lose its
+    /// function keys and program. A file from a run that stopped before the firmware wrote the
+    /// block has nothing to find there, and would skip that path; I accept that. A new file cut
+    /// to exactly an old size cannot be told from an old one.
     pub fn load_persistent(&mut self, bytes: &[u8]) -> Result<(), PersistentError> {
-        let (flash, rest) = bytes
-            .split_at_checked(USER_FLASH_SIZE)
-            .ok_or(PersistentSizeError { got: bytes.len() })
+        let profile = self.profile.ok_or(NoLayout)?;
+        let regions = profile
+            .regions_for(bytes.len())
+            .ok_or(PersistentSizeError {
+                got: bytes.len(),
+                profile,
+            })
             .map_err(PersistentError::Size)?;
+        let flash_len = regions_size(regions);
+        let (flash, rest) = bytes.split_at(flash_len);
         let ds3231 = self.memory.borrow().ds3231();
-        match bytes.len() {
-            PERSISTENT_SIZE => ds3231.load_new(),
+        match rest.len() {
+            CLOCK_SIZE => ds3231.load_new(),
             VERSION_1_SIZE => ds3231.load_v1(i64::from_le_bytes(
-                rest[8..].try_into().expect("eight bytes"),
+                rest[CLOCK_SIZE..].try_into().expect("eight bytes"),
             ))?,
-            WITH_DS3231_SIZE => ds3231.load(rest[8..].try_into().expect("the state's size"))?,
-            got => return Err(PersistentError::Size(PersistentSizeError { got })),
+            _ => ds3231.load(rest[CLOCK_SIZE..].try_into().expect("the state's size"))?,
         }
-        let (words, _) = flash.as_chunks::<4>();
-        for (addr, word) in (USER_FLASH_BASE..).step_by(4).zip(words) {
-            self.processor
-                .write32(addr, u32::from_le_bytes(*word))
-                .expect("the user flash is inside the core's flash");
+        let missing = &profile.regions[..profile.regions.len() - regions.len()];
+        for &Region { addr, len } in missing {
+            for at in (addr..addr + len).step_by(4) {
+                self.processor
+                    .write32(at, 0)
+                    .expect("a region is inside the core's flash");
+            }
         }
-        let (words, _) = rest[..8].as_chunks::<4>();
+        let mut words = flash.as_chunks::<4>().0.iter();
+        for &Region { addr, len } in regions {
+            for at in (addr..addr + len).step_by(4) {
+                let word = words.next().expect("the regions add up to the flash bytes");
+                self.processor
+                    .write32(at, u32::from_le_bytes(*word))
+                    .expect("a region is inside the core's flash");
+            }
+        }
+        let (words, _) = rest[..CLOCK_SIZE].as_chunks::<4>();
         let calendar = [words[0], words[1]].map(u32::from_le_bytes);
         self.memory.borrow().rtc().set_calendar(calendar);
         Ok(())

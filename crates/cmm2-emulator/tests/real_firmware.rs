@@ -1,6 +1,6 @@
 mod common;
 
-use common::emulator;
+use common::*;
 
 #[test]
 #[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
@@ -75,4 +75,91 @@ fn real_firmware_rnd_repeats_with_the_same_rng_seed_and_differs_with_another() {
     assert!(first.trim().starts_with("0."), "{first:?}");
     assert_eq!(rnd_with(Some("1")), first);
     assert_ne!(rnd_with(Some("2")), first);
+}
+
+// One run of the firmware on a settings file, to the prompt and `typed` there. A first boot asks
+// its setup questions (the answers are ignored when it is not asked them); the banner of a boot
+// that has been set up already ends in a prompt, and that is where the text is typed. The run
+// stops on its instruction limit, which saves the file. Returns what the console showed.
+fn run_on_settings(firmware: &str, flash: &std::path::Path, typed: &str) -> String {
+    let output = emulator()
+        // The layout is the firmware's own, never the one a variable names.
+        .env_remove(LAYOUT_VARIABLE)
+        .args(["--firmware", firmware, "--console"])
+        .args(["--flash", flash.to_str().unwrap()])
+        .args(["--on", "Keyboard type", "1"])
+        .args(["--on", "HH:MM:SS", "12:00:00\\r"])
+        .args(["--on", "DD/MM/YY", "12/11/26\\r"])
+        .args(["--on", "Allardice\r\n\r\n>", typed])
+        .args(["--run", "900000000"])
+        .output()
+        .expect("failed to run cmm2-emulator");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+// The first run with a new settings file sets the function key; the second run with the same
+// file must not ask the setup questions and must still have the key, which the firmware keeps in
+// flash. Part of that is the block inside its own image, which a first start would erase.
+fn settings_keep_the_function_key(variable: &str, name: &str, size: usize) {
+    let firmware = std::env::var(variable).unwrap_or_else(|_| panic!("{variable} must be set"));
+    let flash = flash_path(name);
+    let _ = std::fs::remove_file(&flash);
+
+    let first = run_on_settings(&firmware, &flash, "OPTION F1 \"hello\"\\r");
+    assert!(first.contains("Keyboard type"), "{first}");
+
+    let second = run_on_settings(&firmware, &flash, "OPTION LIST\\r");
+    let saved = std::fs::read(&flash).unwrap().len();
+    std::fs::remove_file(&flash).unwrap();
+    assert!(!second.contains("Keyboard type"), "{second}");
+    assert!(!second.contains("Enter time"), "{second}");
+    let listed = second.split("OPTION LIST\r\n").nth(1).unwrap_or("");
+    assert!(
+        listed.contains("hello"),
+        "OPTION LIST did not show F1: {second}"
+    );
+    assert_eq!(saved, size);
+}
+
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test --release -- --ignored"]
+fn real_firmware_b5_keeps_its_settings_in_the_flash_file() {
+    settings_keep_the_function_key("CMM2_FIRMWARE", "real-b5-settings", 917_544);
+}
+
+#[test]
+#[ignore = "needs the RC6 firmware: CMM2_FIRMWARE_RC6=<path> cargo test --release -- --ignored"]
+fn real_firmware_rc6_keeps_its_settings_in_the_flash_file() {
+    settings_keep_the_function_key("CMM2_FIRMWARE_RC6", "real-rc6-settings", 659_496);
+}
+
+// A b5 settings file from before the 32-byte block was kept is the new file without its first 32
+// bytes. The firmware must still find its function key: the loader gives it a block of zeros,
+// which is what the firmware writes there itself, and not FF, which sends it down the first-start
+// path. (A file from a run that stopped before the firmware wrote the block has no block to
+// find, and would skip the first-start setup: I accept that.)
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test --release -- --ignored"]
+fn real_firmware_b5_keeps_the_function_key_from_an_old_form_settings_file() {
+    let firmware = std::env::var("CMM2_FIRMWARE").expect("CMM2_FIRMWARE must be set");
+    let flash = flash_path("real-b5-old-form");
+    let _ = std::fs::remove_file(&flash);
+    run_on_settings(&firmware, &flash, "OPTION F1 \"hello\"\\r");
+    let new_form = std::fs::read(&flash).unwrap();
+    std::fs::write(&flash, &new_form[32..]).unwrap();
+
+    let second = run_on_settings(&firmware, &flash, "OPTION LIST\\r");
+    std::fs::remove_file(&flash).unwrap();
+
+    assert!(!second.contains("Keyboard type"), "{second}");
+    let listed = second.split("OPTION LIST\r\n").nth(1).unwrap_or("");
+    assert!(
+        listed.contains("hello"),
+        "OPTION LIST did not show F1: {second}"
+    );
 }

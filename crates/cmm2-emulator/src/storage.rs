@@ -4,7 +4,7 @@ use crate::args::RunOptions;
 use crate::atomic_write::{remove_stale_temps, write_atomically};
 use crate::error::{RunError, say};
 use crate::saveable::{access, check_regular, why_not_saveable};
-use cmm2_core::{Cpu, MIN_IMAGE_SIZE, SdSlot};
+use cmm2_core::{Cpu, MIN_IMAGE_SIZE, NoLayout, SdSlot};
 use std::io;
 use std::path::Path;
 
@@ -16,6 +16,14 @@ pub(crate) fn load_flash(cpu: &mut Cpu, path: &str) -> Result<(), RunError> {
         path: path.to_string(),
         source,
     };
+    // Before anything else, so that a first run, with no file yet, is refused too: it could not
+    // save at the end.
+    if cpu.profile().is_none() {
+        return Err(RunError::NoLayout {
+            path: path.to_string(),
+            source: NoLayout,
+        });
+    }
     check_regular(path).map_err(flash_error)?;
     if let Some(why) = why_not_saveable(path) {
         return Err(flash_error(io::Error::new(
@@ -80,7 +88,11 @@ fn save_flash(cpu: &mut Cpu, options: &RunOptions) -> Result<(), RunError> {
     let Some(path) = &options.flash else {
         return Ok(());
     };
-    write_atomically(path, &cpu.persistent()).map_err(|source| RunError::Flash {
+    let bytes = cpu.persistent().map_err(|source| RunError::NoLayout {
+        path: path.clone(),
+        source,
+    })?;
+    write_atomically(path, &bytes).map_err(|source| RunError::Flash {
         path: path.clone(),
         source,
     })

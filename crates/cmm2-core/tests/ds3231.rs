@@ -28,7 +28,7 @@ fn state_with_the_ds3231_on() -> &'static [u8] {
         let (_, spent) = type_keys(&mut cpu, &console, "OPTION DS3231 ON\r");
         println!("OPTION DS3231 ON and the reboot to the prompt took {spent} instructions");
         assert_eq!(cpu.resets(), 2);
-        cpu.persistent()
+        cpu.persistent().unwrap()
     })
 }
 
@@ -94,7 +94,7 @@ fn real_firmware_keeps_the_ds3231_time_across_a_save_and_load() {
         &console,
         &["TIME$ = \"10:20:30\"", "DATE$ = \"25/12/26\""],
     );
-    let saved = cpu.persistent();
+    let saved = cpu.persistent().unwrap();
     let offset = cpu.memory().ds3231().offset_millis();
 
     // The emulator is closed for an hour, and the host's clock goes on.
