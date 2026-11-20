@@ -8,8 +8,8 @@ Project documentation lives here as markdown.
   sources.
 - `decisions/`: short records of design decisions and the evidence for them:
   [0001-cpu-engine.md](decisions/0001-cpu-engine.md) (the CPU core) and
-  [0002-jit-first.md](decisions/0002-jit-first.md) (speed comes from an x86-64 JIT, built first, and
-  the emulator must also run on Windows).
+  [0002-jit-first.md](decisions/0002-jit-first.md) (speed comes from an x86-64 JIT, built first; the
+  result of the JIT study; the constraint that the emulator must also run on Windows).
 - [boot-trace.md](boot-trace.md): what the real firmware does at boot (written in iteration 1, and
   extended in iterations 3 and 4 as each model went in).
 - [sd-card.md](sd-card.md): how the firmware drives the SD card (SPI mode) and the card model.

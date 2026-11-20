@@ -33,9 +33,10 @@ notes, which are not in the repository):
   44.944 ms for 100,000 (issue 70). That is about 1.4 times as long as the board, and it does not
   say how fast the host runs the emulation.
 
-Galactic Raiders loads and draws everything now (my report), and is far too slow to play. In a
-reviewer's run it ran for about 95 s of host time before it stopped at an unimplemented DSP
-instruction (issue 77).
+Galactic Raiders loads and draws everything now (my report), and is far too slow to play. It no
+longer stops at a missing instruction: the DSP extension is in the core (issue 77), and a run of
+commit aafbce9 on 2026-11-18, with no keys sent to the game, went on for the whole 470 s of host
+time with no fault, and was ended with the quit key (a reviewer's run; the figures are on issue 77).
 
 ## What I looked at
 
@@ -69,6 +70,15 @@ These are correctness, not speed, and the translation needs them as they are:
 
 Building the frame off the CPU thread is independent of this, and waits for a profile.
 
+## The study (2026-11-18)
+
+The first deliverable of issue 74, a design note and a spike, is done. Both are kept locally and
+are not in the repository. The recommendation, from issue 74: a hand-written x86-64 emitter first,
+behind a block IR that does not depend on the host, with the interpreter as the fallback on every
+other host. Cranelift stays an option for aarch64 later. The nine open questions are on issue 74
+and wait for me; I have not answered them, so this record still picks nothing between the two code
+generators. The figures of the study are on that issue and are not copied here.
+
 ## What it costs
 
 - **The hard parts are the FPU and exactness.** The board's FPv5 double precision with Arm's NaN and
@@ -89,7 +99,8 @@ output), and none of it is ported yet. For this decision it means:
 
 - The choice of code generator has to weigh portability. Cranelift covers more hosts than a
   hand-written x86-64 emitter: it would also serve Windows on ARM and Apple Silicon, where an x86-64
-  emitter serves x86-64 only. I have not decided between them. This record does not pick one.
+  emitter serves x86-64 only. The study recommends the hand-written emitter behind a block IR (see
+  above); the questions on issue 74 are still open, and this record does not pick one.
 - A path with no translation always has to remain, which is the interpreter, for any host the JIT
   does not support.
 - The host differences have to be designed for from the start: how executable memory is obtained
@@ -107,5 +118,5 @@ output), and none of it is ported yet. For this decision it means:
 ## Where the evidence is
 
 My local speed notes (not in the repository) hold the profiles, the prototype results and the
-working for the estimates. Issues 74 (this decision), 75 (Windows) and 65 (wait states) are on
-GitHub.
+working for the estimates. Issues 74 (this decision and the study), 75 (Windows) and 65 (wait
+states) are on GitHub.

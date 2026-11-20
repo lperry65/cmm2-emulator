@@ -8,7 +8,7 @@ real machine and can be developed and tested without the hardware.
 
 ## Status
 
-As of commit 8260358 (2026-11-14) the emulator boots the unmodified 7.00.00b5 firmware through its
+As of commit e3e8936 (2026-11-18) the emulator boots the unmodified 7.00.00b5 firmware through its
 first-boot setup and a system reset to the `>` prompt and runs BASIC there. What works:
 
 - The Cortex-M7 (a vendored and changed copy of the zmu core, see "The CPU core" below) and the
@@ -32,29 +32,81 @@ first-boot setup and a system reset to the `>` prompt and runs BASIC there. What
   slower than the machine).
 
 Galactic Raiders, the game I am writing for the CMM2, loads and draws all its sprites and colours
-(my report). In a reviewer's run it ran for about 95 s of host time and then stopped at an ARMv7E-M
-DSP instruction that the core does not implement, at 0x08146b6c (issue 77). My own first run
-returned straight to the shell, and I do not know that it ended at that fault. In the reviewer's run
-the game printed `startup_load_ms=763.0`; I do not know what that covers, so I make no comparison
-with the board. It is far too slow to play yet (speed, issue 74).
+(my report). It is far too slow to play yet (speed, issue 74).
+
+It used to stop at an ARMv7E-M DSP instruction that the core did not have, at 0x08146b6c. A reviewer
+first read that instruction as UQADD8. It was UQSUB8 (A7.7.210), and the whole DSP extension was
+missing, not one instruction (issue 77). Batches 1 to 4 of the work on it are committed (see "The
+CPU core"). A reviewer had an agent test commit aafbce9 (2026-11-18): it ran through a pty, with a
+card built from the game's real files, and no keys were sent to the game. The game ran for the
+whole 470 s of host time with no fault trap and no error line other than the quit-key line, and
+the run was ended with the quit key. On the emulated clock the game printed `sheet loaded
+ms=335.3`, `raiders loaded ms=363.5` and `startup_load_ms=1571.3`. On the board I measured 751 ms
+for a 1 MB `LOAD DATA` and 1,740 ms for the whole start-up (issue 70). I do not know that the
+emulated figures measure the same things as the board's. If they do, the emulator is faster than
+the board in emulated time, which would fit the missing memory wait states (issue 65); that is a
+hypothesis on issue 77 and I have not checked it. My reading of why it differs from the empty `FOR`
+loop in "Speed" below, where the emulated machine is slower than the board: that figure compares
+CPU cycle counts on a loop that runs in fast memory, and the load figures involve SDRAM and file
+reads, so they are different measurements. That is a reading, not a measurement. The agent's
+screenshot at the end of the run showed the HUD (`SCORE 000300`, `HI 020000`, `WAVE 3`), a
+starfield, six empty outline boxes and a white dot, which looks like the game's demo or attract
+mode (my reading; I did not check the game's code). I make no claim about whether the boxes are the
+game's own.
+
+My own first run returned straight to the shell. The fix for silent ends is in (issue 71, closed):
+every end of a live run now says why. I still do not know what ended that first run, and the
+issue says it was not reproduced.
 
 ### The CPU core
 
 The core is my changed copy of zmu, and the changes are listed in `crates/zmu_cortex_m/NOTICE.md`,
 which is the detailed record; the decision to use it is
-[docs/decisions/0001-cpu-engine.md](docs/decisions/0001-cpu-engine.md). Since the first boot it has been checked against the
-ARMv7-M manual: exceptions that arise while another is entered are derived exceptions as the manual
-has them, an exception entry counts 12 cycles and a tail-chained entry 6 (the 6 is ARM's figure for
-the Cortex-M3 and M4, which I have not verified for the M7), a lockup is a state of its own with the
-priorities the manual gives, a reset loads the vector table from a boot address, and SMULL, which
-multiplied unsigned, is fixed (issue 64). Alignment UsageFaults are modelled (8260358, issues 68 and
-67, closed): the instructions that always fault on an unaligned address do so, LDR, STR, LDRH,
-LDRSH, STRH and TBH only with `CCR.UNALIGN_TRP` set, the fault is precise, and `CFSR.UNALIGNED` is
-recorded, with escalation to a HardFault. Not modelled is the Device and Strongly-ordered memory
-types, as the core has none. The same commit stops the DWT cycle counter in sleep unless
-`DBGSLEEP_D1` is set (the emulator does not sleep on WFI yet, issue 72) and fixes two reset-related
-bugs. What it still lacks is the rest of the ARMv7E-M DSP instructions (issue 77: the game stops at
-0x08146b6c, which the reviewer reads as UQADD8).
+[docs/decisions/0001-cpu-engine.md](docs/decisions/0001-cpu-engine.md). This is the short list of
+what it has now, from the commits and that file.
+
+Checked against the ARMv7-M manual since the first boot:
+
+- - Exceptions that arise while another is entered are derived exceptions as the manual has them. An
+  exception entry counts 12 cycles and a tail-chained entry 6 (the 6 is ARM's figure for the
+  Cortex-M3 and M4, which I have not verified for the M7).
+- - A lockup is a state of its own with the priorities the manual gives, and a reset loads the
+  vector table from a boot address.
+- - SMULL, which multiplied unsigned, is fixed (issue 64).
+- - Alignment UsageFaults are modelled (8260358, issues 68 and 67, closed): the instructions that
+  always fault on an unaligned address do so, LDR, STR, LDRH, LDRSH, STRH and TBH only with
+  `CCR.UNALIGN_TRP` set, the fault is precise, and `CFSR.UNALIGNED` is recorded, with escalation to
+  a HardFault. The same commit stops the DWT cycle counter in sleep unless `DBGSLEEP_D1` is set (the
+  emulator does not sleep on WFI yet, issue 72) and fixes two reset-related bugs.
+
+The ARMv7E-M DSP extension and the base instructions that were missing (issue 77, batches 1 to 4,
+commits 001a7bf, aafbce9, 8fc5d97 and e3e8936; the core fixes in the last bullet are from 4bd964d):
+
+- - The 36 parallel add and subtract instructions; QADD, QSUB, QDADD and QDSUB; SMMUL, SMMLA and
+  SMMLS with their R forms; USAD8 and USADA8; SXTB16, SXTAB16, UXTB16 and UXTAB16; SSAT16 and USAT16
+  (they used to decode as SSAT and USAT, so they ran with a wrong result); SMULW and SMLAW; SMUAD,
+  SMUSD, SMLAD and SMLSD with their X forms; SMLALD and SMLSLD; SMLALBB, SMLALBT, SMLALTB and
+  SMLALTT; UMAAL; and LDMDB, also written LDMEA.
+- - Each batch was compared with an independent emulator (Unicorn, which is QEMU underneath) and
+  with the reviewer's own model (issue 77). One difference is left on purpose: for SMLAD I follow
+  the manual's rule for the Q flag, which differs from the older QEMU inside Unicorn (details in
+  NOTICE.md). Real silicon was not available to decide it.
+- - Decodes that ran wrong are fixed. CSDB and the unallocated hints no longer decode as a branch,
+  and every DBG option executes as a NOP. The unprivileged loads and stores (LDRT, LDRBT, LDRHT,
+  LDRSBT, LDRSHT, STRT, STRBT and STRHT) exist; the core has no MPU model, so they act as ordinary
+  accesses. A coprocessor instruction for a coprocessor other than 10 and 11 raises NOCP, and CDP is
+  no longer decoded as MCR. MSR and MRS refuse their UNPREDICTABLE shapes.
+- - The local exclusive monitor is modelled: LDREX tags the word, STREX passes only to the tagged
+  word, and CLREX, exception entry, exception return and reset open the monitor. Before, STREX
+  always succeeded.
+- - Core fixes (commit 4bd964d): the IT state after an exception return (issue 79), the order of the
+  write back in LDM before a load of PC (issue 80), SP bits 1:0 read as zero and ignore writes
+  (issue 78, ARM B1.4.1), and one cycle rule for LDM, LDMDB and POP (1 + N, plus 3 for a load of
+  PC).
+
+What is still missing: the floating-point additions VMLA, VMLS, VNMLA, VNMLS, VCVTB, VCVTT, FLDMX
+and FSTMX (the last batch of issue 77), an MPU model, and the Device and Strongly-ordered memory
+types, as the core has none.
 
 ### Speed
 
@@ -77,6 +129,12 @@ steps (an estimate of about 2.7 to 2.8 times together; two of the five were meas
 the working is in my local speed notes) cannot reach the board's speed. See
 [docs/decisions/0002-jit-first.md](docs/decisions/0002-jit-first.md) (issue 74).
 
+The JIT study is done (2026-11-18): a design note and a spike exist locally and are not in the
+repository. Its recommendation is a hand-written x86-64 emitter behind a block IR that does not
+depend on the host, with the interpreter as the fallback; Cranelift stays an option for aarch64.
+The recommendation and nine open questions are on issue 74. The questions wait for me, and none of
+the JIT is built.
+
 ### Windows
 
 The project is cross-platform Rust. I have built and run it on Linux only so far (CI runs on
@@ -86,25 +144,25 @@ are not done. The JIT design has to weigh portability for the same reason.
 
 ### Known gaps
 
-The open issues at 8260358, from `gh issue list --state open`:
+The open issues at e3e8936, from `gh issue list --state open --limit 100`:
 
 - Speed and timing: 74 (the JIT), 15 (the speed of the machine's bus path), 16 (zmu fidelity gaps
   found while integrating), 65 (memory wait states), 72 (WFI never sleeps), 76 (timer clocks do
   not follow the RCC).
-- The CPU core: 77 (DSP instructions), 59 (zmu follow-ups after dec44de, to check against the
-  ARMv7-M manual), 17 (readable disassembly in the trace).
+- The CPU core: 77 (the DSP extension: batches 1 to 4 are done and one batch is left, the
+  floating-point additions listed under "The CPU core"), 59 (zmu follow-ups after dec44de, to
+  check against the ARMv7-M manual), 17 (readable disassembly in the trace).
 - Console and input: 66 (console input arrives faster than the baud rate), 48 (pasted lines are
-  joined), 47 (a hard fault on `ESC O D`, the SS3 left arrow), 71 (the emulator exits silently on
-  `RUN` with the console on a terminal; every end now says why, and what is left is that the line
-  cannot know where an escape sequence moves the cursor, and that the window-closed end has no
-  end-to-end test), 62 (keyboard follow-ups), 53 (USB mouse), 54 (gamepad).
+  joined), 47 (a hard fault on `ESC O D`, the SS3 left arrow), 62 (keyboard follow-ups), 53 (USB
+  mouse), 54 (gamepad), 81 (the live-run end line: the cursor tracker cannot know where an escape
+  moves the cursor, and the window-closed end has no end-to-end test).
 - Storage and the board's state: 63 (SPI3 for the SD card, `OPTION SD TIMING FAST`), 44 (a host
-  folder as the SD card), 41 (the guest writes 32 zero bytes into the firmware region of flash), 69
-  (remember the board between runs: built, see "The board"; the issue is not closed yet).
+  folder as the SD card), 41 (the guest writes 32 zero bytes into the firmware region of flash).
 - Window and platform: 39 (scaling, full screen and aspect controls), 75 (Windows).
 - Firmware and end-to-end: 57 (firmware 5.07, the version the Gen 2 shipped with), 49 (run
-  Galactic Raiders as an end-to-end test), 25 (boot to the MMBasic idle loop: the acceptance is only
-  partly met. No test asserts the idle loop; the tests assert the prompt and commands, in
+  Galactic Raiders as an end-to-end test: a run goes on for minutes with no fault, but the hash
+  test is not done), 25 (boot to the MMBasic idle loop: the acceptance is only partly met. No test
+  asserts the idle loop; the tests assert the prompt and commands, in
   `crates/cmm2-core/tests/console.rs`. `GPIOH_IDR`, `GPIOD_IDR` and `TIM5_CNT` appear in
   docs/boot-trace.md only in its iteration-1 sections, as an expectation from an earlier spike that
   was never confirmed. A speed note exists, in my local speed notes, which are not in the
@@ -139,7 +197,8 @@ In `cmm2-emulator`, `main.rs` is a short entry point over modules: `args` (the c
 `launch` (which run is on the board), `storage`, `saveable`, `atomic_write` and `run_and_save` (the
 `--flash` and `--sd` files, read at the start and saved safely at the end), `panic_hook`,
 `signals`, `output` and `error`, `trace`, `slice`, `report` and `inspect`, `script` (the `--on`
-keys), `pacing`, `terminal`, `keys`, `usb_keys`, `window` and `local_clock`. The unit tests of a
+keys), `pacing`, `terminal`, `keys`, `usb_keys`, `window` and `local_clock`. Two more, `run_id` and
+`test_support`, are built for the tests only. The unit tests of a
 module are in `<module>/tests.rs` beside it, or in the file itself for some of the smaller ones,
 and the command-line and real-firmware tests are in `crates/*/tests/`, split by topic.
 
@@ -154,15 +213,14 @@ Building needs the SDL2 development files (`libsdl2-dev` on Debian and Ubuntu). 
 it on Linux only so far; Windows is planned (issue 75).
 
 Nearly all the ignored tests run the real firmware: they need your copy of the `.bin` and take a
-while. `cargo test --workspace -- --ignored --list` counts 69 of them (counted on 2026-11-18 in the
-working tree after the board was added, on top of 4bd964d; listing needs no firmware): 44 in
-`cmm2-core` (43 in the nine files of `crates/cmm2-core/tests/`, and a display speed test in
-`display/tests.rs`), 24 in `cmm2-emulator` (3 in `tests/real_firmware.rs`, 1 in
-`tests/board_burn.rs` and 20 in the tests of `keys.rs` and `usb_keys.rs`), and one in
-`zmu_cortex_m`. Two of the 69 do not use the firmware: the display speed test, which times the
-compositing, and the `zmu_cortex_m` one, a decode dump run by hand with `ZMU_DUMP_IMAGE` and
-`ZMU_DUMP_OUT`. To run the others, point `CMM2_FIRMWARE` at the `.bin`; a release build is a good
-deal faster:
+while. `cargo test --workspace -- --ignored --list` counts 69 of them (counted on 2026-11-20 in a
+clean `git archive` copy of e3e8936; listing needs no firmware): 44 in `cmm2-core` (43 in the
+nine files of `crates/cmm2-core/tests/`, and a display speed test in `display/tests.rs`), 24 in
+`cmm2-emulator` (3 in `tests/real_firmware.rs`, 1 in `tests/board_burn.rs` and 20 in the tests of
+`keys.rs` and `usb_keys.rs`), and one in `zmu_cortex_m`. Two of the 69 do not use the firmware: the
+display speed test, which times the compositing, and the `zmu_cortex_m` one, a decode dump run by
+hand with `ZMU_DUMP_IMAGE` and `ZMU_DUMP_OUT`. To run the others, point `CMM2_FIRMWARE` at the
+`.bin`; a release build is a good deal faster:
 
 ```
 CMM2_FIRMWARE=/path/to/CMM2_MMBasic_7.00.00b5.bin cargo test --workspace --release -- --ignored
@@ -439,28 +497,30 @@ being root). A file that cannot be read is refused in words as well. A name that
 shell variable), or ends in a slash, or in `.` or `..`, or is longer than the file system allows
 (255 bytes on most) is refused too, and so is a link that leads to such a name. The temporary file
 has a short name of its own, so that a name of any allowed length can be saved. Both files have to
-be regular files: a device, a FIFO or a directory is refused before anything is opened (a FIFO
-would hang the load, and `sudo` with `--sd /dev/mmcblk0` would read a whole card and then rename a
-file over its node). What cannot be seen at the start, and so can still fail when the run is over
-and lose it, is the rest: a full disk or quota, a file made immutable during the run, a network
-file system that goes away, a security module (SELinux, AppArmor) that says no.
+be regular files: a device, a FIFO or a directory is refused before anything is opened (a FIFO would
+hang the load, and `sudo` with `--sd /dev/mmcblk0` would read a whole card and then rename a file
+over its node). What cannot be seen at the start, and so can still fail when the run is over and
+lose it, is the rest: a full disk or quota, a file made immutable during the run, a network file
+system that goes away, a security module (SELinux, AppArmor) that says no.
 
 Every end of a `--console` or `--window` run says why, on one line of stderr, after the terminal is
 put back: `cmm2-emulator: quit key (Ctrl-]) pressed`, `cmm2-emulator: stopped by SIGTERM` (or
 `SIGINT`, `SIGHUP`; `signal <n>` for any other), `cmm2-emulator: reached address 0x08000104`
 (`--stop-at`), `cmm2-emulator: instruction limit reached` (`--run`) and `cmm2-emulator: window
 closed`. The exit codes are as they were: 0 for the quit key, the limit, the address and the window
-closing, 1 for a fault (which has its own line, `fault trap: ...`), and a signal ends the process
-by that signal. If the guest left the cursor part way along a row, the line starts on a new one.
-That is worked out from the bytes the guest wrote, which tell nothing of where an escape sequence
-moves the cursor: a colour change or a window title is known to move nothing, but any other escape
-(a screen drawn with cursor moves, say) is taken as leaving the cursor on a row with something on
-it, so the line goes on a new row that may already have something on it, or may leave an empty row
+closing, 1 for a fault (which has its own line, `fault trap: ...`), and a signal ends the process by
+that signal. If the guest left the cursor part way along a row, the line starts on a new one. That
+is worked out from the bytes the guest wrote, which tell nothing of where an escape sequence moves
+the cursor: a colour change or a window title is known to move nothing, but any other escape (a
+screen drawn with cursor moves, say) is taken as leaving the cursor on a row with something on it,
+so the line goes on a new row that may already have something on it, or may leave an empty row
 before it. If the guest's output ends inside an escape sequence that was never finished (at the
 limit, say, or at a signal), the line starts with CAN, which cancels it, so that the line is not
-taken into it. A script that runs `--console --run N` and expects an empty stderr now finds
-`instruction limit reached` there. A run with no console and no window is not changed: its summary
-on stdout says how it ended.
+taken into it. The end where the window is closed is only unit-tested (the message and the
+`window_end` rule in `live/tests.rs`), with no end-to-end test (issue 81). A script that runs
+`--console --run N` and expects an empty stderr now
+finds `instruction limit reached` there. A run with no console and no window is not changed: its
+summary on stdout says how it ended.
 
 With `--console` the terminal is in raw mode, so Ctrl-C goes to the guest and the quit key is
 Ctrl-]; a signal sent from outside (SIGTERM, SIGHUP) still ends the run, and so does SIGINT with

@@ -27,7 +27,7 @@ emulator that is as useful for development as that one is.
   44).
 - **Proper keyboard (and later mouse) input**, including held-key state for games. Typing through
   the serial console alone is not enough. USB host emulation is therefore on the critical path and
-  needs an early spike. As of 8260358 (2026-11-14) the spike is done and the keyboard is built
+  needs an early spike. As of e3e8936 (2026-11-18) the spike is done and the keyboard is built
   (issues 11 and 50 to 52, closed; the model is described in [usb-host.md](usb-host.md)), and
   `KEYDOWN()` and `INKEY$` work from the window. The mouse (issue 53) and the gamepad (issue 54) are
   open.

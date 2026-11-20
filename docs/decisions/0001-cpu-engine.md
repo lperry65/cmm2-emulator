@@ -87,41 +87,62 @@ counting instructions costs a hook that takes much of the speed advantage back.
 - The CPU sits behind a small interface (step, registers, interrupts raised by the machine), so nothing outside
   that interface depends on zmu.
 
-## Since then (2026-11-14, at commit 8260358)
+## Since then (2026-11-14, updated 2026-11-20 at commit e3e8936)
 
 The decision stands, and the text above is left as I wrote it on 2026-11-12. Several things in it
 have been overtaken:
 
-- The spike patch was 225 added lines across 16 files with the blank ones counted (241 `+` lines
+- - The spike patch was 225 added lines across 16 files with the blank ones counted (241 `+` lines
   less the 16 `+++` headers), and 215 without them, so the "about 215" above is the count without
   blank lines. I counted the added lines of `spikes/zmu/patches/zmu-local.patch` (kept locally, not
   in the repository).
-- The speed comparison is superseded. The core runs about 54.5 million instructions a second at
+- - The speed comparison is superseded. The core runs about 54.5 million instructions a second at
   the prompt (measured on 2026-11-13, in `usb-host.md`), against an estimated 220 million for the
   board, so it is about four times short by that estimate, not 2.5 to 3. The profiling is in my
   local speed notes (not in the repository), and the way to speed is now a JIT built first: see
   [0002-jit-first.md](0002-jit-first.md). Issues 15 and 16 track the earlier speed work.
-- "No tail-chaining, no exception-entry cycle accounting" is no longer true. The core counts a
-  12-cycle entry and a 6-cycle tail-chained entry (the 6 is ARM's Cortex-M3 and M4 figure, which
-  I have not verified for the M7), derives exceptions as the ARMv7-M manual does, has an explicit
+- - "No tail-chaining, no exception-entry cycle accounting" is no longer true. The core counts a
+  12-cycle entry and a 6-cycle tail-chained entry (the 6 is ARM's Cortex-M3 and M4 figure, which I
+  have not verified for the M7), derives exceptions as the ARMv7-M manual does, has an explicit
   lockup state with the priorities the manual gives, and resets to the boot address. The MPU is
   still not modelled.
-- The SMULL bug (it multiplied unsigned) was fixed (issue 64). That was the one that stopped the
+- - The SMULL bug (it multiplied unsigned) was fixed (issue 64). That was the one that stopped the
   game's loader with `Program damaged: symbol table`.
-- Alignment UsageFaults are modelled (8260358, issues 68 and 67, closed): the always-aligned
+- - Alignment UsageFaults are modelled (8260358, issues 68 and 67, closed): the always-aligned
   instructions, the `CCR.UNALIGN_TRP` rule for LDR, STR, LDRH, LDRSH, STRH and TBH, precise faults,
-  and `CFSR.UNALIGNED` with escalation to a HardFault. The Device and Strongly-ordered memory types
-  are not modelled, as the core has none. The same commit stops the DWT cycle counter in sleep
-  unless `DBGSLEEP_D1` is set (WFI does not sleep yet, issue 72) and fixes two reset-related bugs.
-- What is still missing in the core: the ARMv7E-M DSP instructions beyond the few I added (issue 77:
-  Galactic Raiders stops at 0x08146b6c, which the reviewer reads as UQADD8). Issue 59 holds the
-  other core follow-ups.
-- Every change I made to the core is listed in `crates/zmu_cortex_m/NOTICE.md`, which has grown well
-  past the spike patch: the interrupt count is 240 now, the fidelity fixes came from checking the
-  core against the ARMv7-M manual, and so on.
+  and `CFSR.UNALIGNED` with escalation to a HardFault. The same commit stops the DWT cycle counter
+  in sleep unless `DBGSLEEP_D1` is set (WFI does not sleep yet, issue 72) and fixes two
+  reset-related bugs.
+- - The ARMv7E-M DSP instructions are in (issue 77, batches 1 to 4, commits 001a7bf, aafbce9,
+  8fc5d97 and e3e8936; the core fixes below are from 4bd964d). Galactic Raiders used to stop at an
+  instruction that was missing. It was UQSUB8 (A7.7.210; the reviewer first read it as UQADD8), and
+  the whole extension was missing, not one instruction. Now the core has the 36 parallel add and
+  subtract instructions, QADD, QSUB, QDADD and QDSUB, SMMUL, SMMLA and SMMLS with their R forms,
+  USAD8 and USADA8, SXTB16, SXTAB16, UXTB16 and UXTAB16, SSAT16 and USAT16 (they used to decode as
+  the wrong instruction), SMULW, SMLAW, SMUAD, SMUSD, SMLAD, SMLSD, SMLALD, SMLSLD, SMLALBB,
+  SMLALBT, SMLALTB, SMLALTT, UMAAL, and LDMDB (LDMEA). Each batch was compared with an independent
+  emulator (Unicorn, which is QEMU underneath) and with the reviewer's own model (issue 77). For
+  SMLAD I follow the manual's rule for the Q flag, which differs from the older QEMU inside Unicorn.
+- - Wrong decodes were fixed in the same work: CSDB and the unallocated hints no longer decode as a
+  branch, every DBG option executes as a NOP, the unprivileged loads and stores exist (the core has
+  no MPU model, so they act as ordinary accesses), a coprocessor instruction for a coprocessor other
+  than 10 and 11 raises NOCP, CDP is no longer decoded as MCR, and MSR and MRS refuse their
+  UNPREDICTABLE shapes. The local exclusive monitor is modelled (STREX used to always succeed). The
+  IT state after an exception return (issue 79), the write back of LDM before a load of PC (issue
+  80) and SP bits 1:0 (read as zero, writes ignored, issue 78) are fixed, and LDM, LDMDB and POP
+  follow one cycle rule (1 + N, plus 3 for a load of PC).
+- - What is still missing in the core: the floating-point additions VMLA, VMLS, VNMLA, VNMLS, VCVTB,
+  VCVTT, FLDMX and FSTMX (the last batch of issue 77; the `fstmiax` that the text above calls
+  undecoded is one of them: it is now a coprocessor instruction that raises a fault), an MPU model,
+  and the Device and Strongly-ordered memory types, as the core has none. Issue 59 holds the other
+  core follow-ups.
+- - Every change I made to the core is listed in `crates/zmu_cortex_m/NOTICE.md`, which has grown
+  well past the spike patch: the interrupt count is 240 now, the fidelity fixes came from checking
+  the core against the ARMv7-M manual, and so on.
 
 ## Where the evidence is
 
-The spike code is not in the repo. The Unicorn spike depends on a GPL-2.0 library, so it stays out of a GPL-3.0
+The spike code is not in the repo. The Unicorn spike depends on a GPL-2.0 library, so it stays out
+of a GPL-3.0
 repository. The zmu spike and its patch are kept locally in a `spikes/` folder, not in the
 repository.

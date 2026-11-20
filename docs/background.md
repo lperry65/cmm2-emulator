@@ -75,7 +75,7 @@ All from the CMM2 manuals unless marked.
 - **Likely hard parts:** page and frame-blanking timing the programs rely on, SDRAM and cache behaviour, any DMA
   used for fast block copies and fills (not confirmed), USB host, and audio mixing. A first target could be
   "boots to the prompt and shows the logo in a window". That first target is achieved: as of
-  8260358 (2026-11-14) the real firmware boots to the prompt, runs BASIC and shows the logo in an
+  e3e8936 (2026-11-18) the real firmware boots to the prompt, runs BASIC and shows the logo in an
   SDL window (`--window`, see [boot-trace.md](boot-trace.md)).
 
 ## 5. Sources

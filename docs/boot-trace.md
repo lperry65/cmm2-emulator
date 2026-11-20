@@ -352,7 +352,7 @@ run.
 As of the end of iteration 2 (the LTDC frame): it does not block at the prompt: commands run, and
 the frame shows the prompt. I had not run past `PRINT` to find the next wait.
 
-As of 8260358 (2026-11-14) what works after the prompt, each described in its own document:
+As of e3e8936 (2026-11-18) what works after the prompt, each described in its own document:
 
 - The DS3231 clock chip (commit 2330adc) answers the firmware's bit-banged I2C, so `TIME$`,
   `DATE$` and `OPTION DS3231 ON` work ([ds3231.md](ds3231.md)).
@@ -362,14 +362,15 @@ As of 8260358 (2026-11-14) what works after the prompt, each described in its ow
   ([sd-card.md](sd-card.md)).
 - Video in every mode and depth, layers, blending and page flips (commit 1d3c8f2,
   [video.md](video.md)), and floating point at the prompt.
-- Saved flash and options between runs, and the machine's clock held to the wall clock.
+- Saved flash and options between runs, a board that remembers its firmware, settings and card
+  (issue 69, closed), and the machine's clock held to the wall clock.
 - `TIMER` and `PAUSE` count properly, with the timers' update interrupts (issues 28 and 70,
   [timers.md](timers.md)), and `RND` follows the modelled RNG (issue 22, [rng.md](rng.md)).
 
 What is still missing is listed in the status and known gaps sections of the README. I have not
 hunted for the next wait after the prompt as I meant to in iteration 2. The open problems I know of
-at the prompt are issue 47 (a hard fault on `ESC O D`, the SS3 left arrow), issue 48 (pasted lines
-are joined) and issue 71 (the emulator exits silently on `RUN` with the console on a terminal).
-Issue 46 (`Error:1` after the first `FILES` or `NEW`, and a blank first error message) is closed:
-the false `Error:1` came from the missing RNG and is gone (the commit that modelled the RNG is
-0c4af96).
+at the prompt are issue 47 (a hard fault on `ESC O D`, the SS3 left arrow) and issue 48 (pasted
+lines are joined). Issue 71 (the emulator exits silently on `RUN` with the console on a terminal)
+is closed: every end of a live run now says why. Issue 46 (`Error:1` after the first `FILES` or
+`NEW`, and a blank first error message) is closed: the false `Error:1` came from the missing RNG
+and is gone (the commit that modelled the RNG is 0c4af96).
