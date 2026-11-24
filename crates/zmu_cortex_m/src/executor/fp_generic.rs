@@ -41,8 +41,8 @@ pub enum FPExc {
     InputDenorm,
 }
 
-/// The two formats the FPU works in, binary32 as `u32` and binary64 as `u64`. Everything about
-/// a format follows from the widths of its exponent and fraction.
+/// The formats the FPU works in: binary16 as `u16`, binary32 as `u32` and binary64 as `u64`.
+/// Everything about a format follows from the widths of its exponent and fraction.
 pub trait FloatOps {
     /// The bits of a value of the format
     type Bits: PartialOrd + Into<u64> + Copy;
@@ -105,6 +105,21 @@ impl FloatOps for u32 {
     fn from_integer(value: u64) -> u32 {
         value as u32
     }
+}
+
+impl FloatOps for u16 {
+    type Bits = u16;
+    const EXP_BITS: usize = 5;
+    const FRAC_BITS: usize = 10;
+
+    fn from_integer(value: u64) -> u16 {
+        value as u16
+    }
+}
+
+/// `FPNeg` (A2.5): the sign bit turned over and nothing else, a NaN taken in with it.
+pub(crate) fn fp_negate<T: FloatOps>(value: T::Bits) -> T::Bits {
+    T::from_integer(value.into() ^ (1 << (T::n() - 1)))
 }
 
 impl FloatOps for u64 {
@@ -339,7 +354,7 @@ impl FloatingPointHiddenOperations for Processor {
         op: T::Bits,
         fpscr_val: u32,
     ) -> T::Bits {
-        let topfrac = if T::n() == 32 { 22 } else { 51 };
+        let topfrac = T::FRAC_BITS - 1;
         let mut result = op;
         if type1 == FPType::SNaN {
             result = T::set_bit(result, topfrac, true);
@@ -415,8 +430,9 @@ impl FloatingPointHiddenOperations for Processor {
                 (false, false) => FPType::SNaN,
             };
             (fptype, false)
-        } else if exp == 0 && frac != 0 && fpscr_val.get_fz() {
-            // A subnormal input is flushed to zero.
+        } else if exp == 0 && frac != 0 && fpscr_val.get_fz() && T::n() != 16 {
+            // A subnormal input is flushed to zero. FPUnpack (A2.5) does this only for the 32-
+            // and 64-bit formats; a half-precision input is read as the denormal it is.
             self.fp_process_exception(FPExc::InputDenorm);
             (FPType::Zero, false)
         } else if bits.get_bits(0..T::n() - 1) == 0 {

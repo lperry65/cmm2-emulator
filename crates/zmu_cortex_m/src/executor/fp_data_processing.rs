@@ -1,16 +1,16 @@
 use crate::Processor;
 use crate::core::fpregister::{FPRounding, Fpscr};
 use crate::core::instruction::{
-    VAddSubParamsf32, VAddSubParamsf64, VCVTFixedParams, VCVTParams, VCVTParamsF32F64,
-    VCVTParamsF64F32, VCmpParamsf32, VCmpParamsf64, VMinMaxNumParamsf32, VMinMaxNumParamsf64,
-    VMovRegParamsf32, VMovRegParamsf64, VRintParamsf32, VRintParamsf64, VSelParamsf32,
-    VSelParamsf64,
+    VAddSubParamsf32, VAddSubParamsf64, VCVTFixedParams, VCVTParams, VCVTParamsF16F32,
+    VCVTParamsF16F64, VCVTParamsF32F16, VCVTParamsF32F64, VCVTParamsF64F16, VCVTParamsF64F32,
+    VCmpParamsf32, VCmpParamsf64, VMinMaxNumParamsf32, VMinMaxNumParamsf64, VMovRegParamsf32,
+    VMovRegParamsf64, VRintParamsf32, VRintParamsf64, VSelParamsf32, VSelParamsf64,
 };
 
 use crate::executor::ExecuteSuccess;
 
 use super::ExecuteResult;
-use super::fp_generic::{FloatingPointChecks, FloatingPointPublicOperations};
+use super::fp_generic::{FloatOps, FloatingPointChecks, FloatingPointPublicOperations, fp_negate};
 use crate::core::register::{ExtensionReg, ExtensionRegOperations};
 use crate::executor::ExecutorHelper;
 
@@ -61,6 +61,14 @@ pub trait IsaFloatingPointDataProcessing {
     fn exec_vfnms_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult;
     fn exec_vfnma_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult;
     fn exec_vfnma_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult;
+    fn exec_vmla_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult;
+    fn exec_vmla_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult;
+    fn exec_vmls_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult;
+    fn exec_vmls_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult;
+    fn exec_vnmla_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult;
+    fn exec_vnmla_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult;
+    fn exec_vnmls_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult;
+    fn exec_vnmls_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult;
     fn exec_vmul_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult;
     fn exec_vmul_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult;
     fn exec_vnmul_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult;
@@ -73,6 +81,14 @@ pub trait IsaFloatingPointDataProcessing {
     fn exec_vcvt_fixed(&mut self, params: &VCVTFixedParams) -> ExecuteResult;
     fn exec_vcvt_f64_f32(&mut self, params: VCVTParamsF64F32) -> ExecuteResult;
     fn exec_vcvt_f32_f64(&mut self, params: VCVTParamsF32F64) -> ExecuteResult;
+    fn exec_vcvtb_f16_f32(&mut self, params: VCVTParamsF16F32) -> ExecuteResult;
+    fn exec_vcvtt_f16_f32(&mut self, params: VCVTParamsF16F32) -> ExecuteResult;
+    fn exec_vcvtb_f16_f64(&mut self, params: VCVTParamsF16F64) -> ExecuteResult;
+    fn exec_vcvtt_f16_f64(&mut self, params: VCVTParamsF16F64) -> ExecuteResult;
+    fn exec_vcvtb_f32_f16(&mut self, params: VCVTParamsF32F16) -> ExecuteResult;
+    fn exec_vcvtt_f32_f16(&mut self, params: VCVTParamsF32F16) -> ExecuteResult;
+    fn exec_vcvtb_f64_f16(&mut self, params: VCVTParamsF64F16) -> ExecuteResult;
+    fn exec_vcvtt_f64_f16(&mut self, params: VCVTParamsF64F16) -> ExecuteResult;
     fn exec_vsel_f32(&mut self, params: VSelParamsf32) -> ExecuteResult;
     fn exec_vsel_f64(&mut self, params: VSelParamsf64) -> ExecuteResult;
 }
@@ -398,6 +414,110 @@ impl IsaFloatingPointDataProcessing for Processor {
         Ok(ExecuteSuccess::NotTaken)
     }
 
+    fn exec_vmla_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let accumulator = self.get_sr(params.sd);
+            let op1 = self.get_sr(params.sn);
+            let op2 = self.get_sr(params.sm);
+            let result = self.multiply_accumulate::<u32>(accumulator, op1, op2, false, false);
+            self.set_sr(params.sd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vmla_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let accumulator = self.get_dr_bits(params.dd);
+            let op1 = self.get_dr_bits(params.dn);
+            let op2 = self.get_dr_bits(params.dm);
+            let result = self.multiply_accumulate::<u64>(accumulator, op1, op2, false, false);
+            self.set_dr_bits(params.dd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vmls_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let accumulator = self.get_sr(params.sd);
+            let op1 = self.get_sr(params.sn);
+            let op2 = self.get_sr(params.sm);
+            let result = self.multiply_accumulate::<u32>(accumulator, op1, op2, false, true);
+            self.set_sr(params.sd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vmls_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let accumulator = self.get_dr_bits(params.dd);
+            let op1 = self.get_dr_bits(params.dn);
+            let op2 = self.get_dr_bits(params.dm);
+            let result = self.multiply_accumulate::<u64>(accumulator, op1, op2, false, true);
+            self.set_dr_bits(params.dd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vnmla_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let accumulator = self.get_sr(params.sd);
+            let op1 = self.get_sr(params.sn);
+            let op2 = self.get_sr(params.sm);
+            let result = self.multiply_accumulate::<u32>(accumulator, op1, op2, true, true);
+            self.set_sr(params.sd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vnmla_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let accumulator = self.get_dr_bits(params.dd);
+            let op1 = self.get_dr_bits(params.dn);
+            let op2 = self.get_dr_bits(params.dm);
+            let result = self.multiply_accumulate::<u64>(accumulator, op1, op2, true, true);
+            self.set_dr_bits(params.dd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vnmls_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let accumulator = self.get_sr(params.sd);
+            let op1 = self.get_sr(params.sn);
+            let op2 = self.get_sr(params.sm);
+            let result = self.multiply_accumulate::<u32>(accumulator, op1, op2, true, false);
+            self.set_sr(params.sd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vnmls_f64(&mut self, params: &VAddSubParamsf64) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let accumulator = self.get_dr_bits(params.dd);
+            let op1 = self.get_dr_bits(params.dn);
+            let op2 = self.get_dr_bits(params.dm);
+            let result = self.multiply_accumulate::<u64>(accumulator, op1, op2, true, false);
+            self.set_dr_bits(params.dd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
     fn exec_vmul_f32(&mut self, params: &VAddSubParamsf32) -> ExecuteResult {
         if self.condition_passed() {
             self.execute_fp_check()?;
@@ -627,6 +747,109 @@ impl IsaFloatingPointDataProcessing for Processor {
         Ok(ExecuteSuccess::NotTaken)
     }
 
+    // VCVTB and VCVTT (A7.7.231): the half-precision number sits in half of a single register.
+    // The .f16 forms take the other half of the destination with them, so the destination is
+    // read as well as written; the forms that read one leave the other half of the source
+    // alone.
+
+    fn exec_vcvtb_f16_f32(&mut self, params: VCVTParamsF16F32) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let source = self.get_sr(params.sm);
+            let half = self.fp_convert::<u32, u16>(source);
+            let destination = self.get_sr(params.sd);
+            self.set_sr(params.sd, (destination & 0xffff_0000) | u32::from(half));
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vcvtt_f16_f32(&mut self, params: VCVTParamsF16F32) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let source = self.get_sr(params.sm);
+            let half = self.fp_convert::<u32, u16>(source);
+            let destination = self.get_sr(params.sd);
+            self.set_sr(
+                params.sd,
+                (destination & 0x0000_ffff) | (u32::from(half) << 16),
+            );
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vcvtb_f16_f64(&mut self, params: VCVTParamsF16F64) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let source = self.get_dr_bits(params.dm);
+            let half = self.fp_convert::<u64, u16>(source);
+            let destination = self.get_sr(params.sd);
+            self.set_sr(params.sd, (destination & 0xffff_0000) | u32::from(half));
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vcvtt_f16_f64(&mut self, params: VCVTParamsF16F64) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let source = self.get_dr_bits(params.dm);
+            let half = self.fp_convert::<u64, u16>(source);
+            let destination = self.get_sr(params.sd);
+            self.set_sr(
+                params.sd,
+                (destination & 0x0000_ffff) | (u32::from(half) << 16),
+            );
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vcvtb_f32_f16(&mut self, params: VCVTParamsF32F16) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let half = (self.get_sr(params.sm) & 0xffff) as u16;
+            let result = self.fp_convert::<u16, u32>(half);
+            self.set_sr(params.sd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vcvtt_f32_f16(&mut self, params: VCVTParamsF32F16) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let half = (self.get_sr(params.sm) >> 16) as u16;
+            let result = self.fp_convert::<u16, u32>(half);
+            self.set_sr(params.sd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vcvtb_f64_f16(&mut self, params: VCVTParamsF64F16) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let half = (self.get_sr(params.sm) & 0xffff) as u16;
+            let result = self.fp_convert::<u16, u64>(half);
+            self.set_dr_bits(params.dd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
+    fn exec_vcvtt_f64_f16(&mut self, params: VCVTParamsF64F16) -> ExecuteResult {
+        if self.condition_passed() {
+            self.execute_fp_check()?;
+            let half = (self.get_sr(params.sm) >> 16) as u16;
+            let result = self.fp_convert::<u16, u64>(half);
+            self.set_dr_bits(params.dd, result);
+            return Ok(ExecuteSuccess::Taken { cycles: 1 });
+        }
+        Ok(ExecuteSuccess::NotTaken)
+    }
+
     fn exec_vsel_f32(&mut self, params: VSelParamsf32) -> ExecuteResult {
         self.execute_fp_check()?;
         let result = if self.condition_passed_b(params.cond) {
@@ -647,6 +870,34 @@ impl IsaFloatingPointDataProcessing for Processor {
         };
         self.set_dr(params.dd, result.0, result.1);
         Ok(ExecuteSuccess::Taken { cycles: 1 })
+    }
+}
+
+impl Processor {
+    // The body of the four multiply-accumulates (A7.7.238 and A7.7.250): the product of the
+    // two factors is rounded, the instruction's FPNeg turns the sign bit over, and the sum is
+    // rounded again. Keeping the two roundings apart is the difference from VFMA and friends,
+    // and negating the bits, not subtracting, is the difference in what a NaN ends up as.
+    fn multiply_accumulate<T: FloatOps>(
+        &mut self,
+        accumulator: T::Bits,
+        op1: T::Bits,
+        op2: T::Bits,
+        negate_accumulator: bool,
+        negate_product: bool,
+    ) -> T::Bits {
+        let product = self.fp_mul::<T>(op1, op2, true);
+        let product = if negate_product {
+            fp_negate::<T>(product)
+        } else {
+            product
+        };
+        let accumulator = if negate_accumulator {
+            fp_negate::<T>(accumulator)
+        } else {
+            accumulator
+        };
+        self.fp_add::<T>(accumulator, product, true)
     }
 }
 

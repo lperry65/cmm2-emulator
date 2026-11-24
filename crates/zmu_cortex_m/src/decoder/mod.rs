@@ -157,6 +157,8 @@ mod vldr;
 #[cfg(feature = "has-fp")]
 mod vminmaxnm;
 #[cfg(feature = "has-fp")]
+mod vmla;
+#[cfg(feature = "has-fp")]
 mod vmov;
 #[cfg(feature = "has-fp")]
 mod vmrs;
@@ -338,11 +340,16 @@ use {
     vabs::decode_VABS_t1,
     vadd_vsub::{decode_VADD_t1, decode_VSUB_t1},
     vcmp::{decode_VCMP_t1, decode_VCMP_t2},
-    vcvt::{decode_VCVT_ds_t1, decode_VCVT_fixed_t1, decode_VCVT_rm_t1, decode_VCVT_t1},
+    vcvt::{
+        decode_VCVT_ds_t1, decode_VCVT_fixed_t1, decode_VCVT_rm_t1, decode_VCVT_t1,
+        decode_VCVTB_from_f16_t1, decode_VCVTB_to_f16_t1, decode_VCVTT_from_f16_t1,
+        decode_VCVTT_to_f16_t1,
+    },
     vfma::{decode_VFMA_t1, decode_VFMS_t1, decode_VFNMA_t1, decode_VFNMS_t1},
     vldm::{decode_VLDM_t1, decode_VLDM_t2},
     vldr::{decode_VLDR_t1, decode_VLDR_t2},
     vminmaxnm::decode_VMINMAXNM_t1,
+    vmla::{decode_VMLA_t1, decode_VMLS_t1, decode_VNMLA_t1, decode_VNMLS_t1},
     vmov::decode_VMOV_cr_scalar,
     vmov::decode_VMOV_cr_sp,
     vmov::decode_VMOV_cr2_dp,

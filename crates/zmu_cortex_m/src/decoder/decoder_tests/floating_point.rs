@@ -3,8 +3,8 @@ use super::*;
 use crate::core::fpregister::FPRounding;
 use crate::core::instruction::AddressingMode;
 use crate::core::instruction::{
-    VCVTFixedParams, VMinMaxNumParamsf32, VMinMaxNumParamsf64, VRintParamsf32, VRintParamsf64,
-    VSelParamsf64,
+    VCVTFixedParams, VCVTParamsF16F32, VCVTParamsF16F64, VCVTParamsF32F16, VCVTParamsF64F16,
+    VMinMaxNumParamsf32, VMinMaxNumParamsf64, VRintParamsf32, VRintParamsf64, VSelParamsf64,
 };
 
 #[test]
@@ -1082,12 +1082,556 @@ fn test_the_new_floating_point_instructions_are_shown_as_assembly() {
         (0xeefe_7ac8, "vcvt.s32.f32 S15, S15, #16"),
         (0xeefa_6ae9, "vcvt.f32.s32 S13, S13, #13"),
         (0xeebb_2bc0, "vcvt.f64.u32 D2, D2, #32"),
+        (0xee00_0a01, "vmla.f32 s0, s0, s2"),
+        (0xee47_7a26, "vmla.f32 s15, s14, s13"),
+        (0xee42_3ae1, "vmls.f32 s7, s5, s3"),
+        (0xee57_7a66, "vnmla.f32 s15, s14, s13"),
+        (0xee15_5a86, "vnmls.f32 s10, s11, s12"),
+        (0xee01_1b01, "vmla.f64 d1, d1, d1"),
+        (0xee0e_fb0d, "vmla.f64 d15, d14, d13"),
+        (0xee05_7b43, "vmls.f64 d7, d5, d3"),
+        (0xee19_8b4a, "vnmla.f64 d8, d9, d10"),
+        (0xee1e_fb0d, "vnmls.f64 d15, d14, d13"),
+        (0xee0e_fb4d, "vmls.f64 d15, d14, d13"),
+        (0xeef3_0a60, "vcvtb.f16.f32 s1, s1"),
+        (0xeef3_7ac7, "vcvtt.f16.f32 s15, s14"),
+        (0xeef2_0a60, "vcvtb.f32.f16 s1, s1"),
+        (0xeef2_3ae4, "vcvtt.f32.f16 s7, s9"),
+        (0xeeb3_fb4f, "vcvtb.f16.f64 s30, d15"),
+        (0xeef3_fbcf, "vcvtt.f16.f64 s31, d15"),
+        (0xeeb2_1b62, "vcvtb.f64.f16 d1, s5"),
+        (0xeeb2_fbc7, "vcvtt.f64.f16 d15, s14"),
     ];
     for (opcode, expected) in cases {
         let text = decode_32(opcode).to_string();
         assert!(
             text.eq_ignore_ascii_case(expected),
             "{opcode:#010x}: {text} against {expected}"
+        );
+    }
+}
+
+// VMLA, VMLS, VNMLA and VNMLS (A7.7.238 and A7.7.250). Every opcode is the llvm-mc encoding.
+
+#[test]
+fn test_decode_vmla_f32() {
+    // ee00 0a01       vmla.f32        s0, s0, s2
+    assert_eq!(
+        decode_32(0xee00_0a01),
+        Instruction::VMLA_f32 {
+            params: VAddSubParamsf32 {
+                sd: SingleReg::S0,
+                sn: SingleReg::S0,
+                sm: SingleReg::S2,
+            }
+        }
+    );
+    // ee47 7a26       vmla.f32        s15, s14, s13
+    assert_eq!(
+        decode_32(0xee47_7a26),
+        Instruction::VMLA_f32 {
+            params: VAddSubParamsf32 {
+                sd: SingleReg::S15,
+                sn: SingleReg::S14,
+                sm: SingleReg::S13,
+            }
+        }
+    );
+    // ee08 8a89       vmla.f32        s16, s17, s18
+    assert_eq!(
+        decode_32(0xee08_8a89),
+        Instruction::VMLA_f32 {
+            params: VAddSubParamsf32 {
+                sd: SingleReg::S16,
+                sn: SingleReg::S17,
+                sm: SingleReg::S18,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vmls_f32() {
+    // ee42 3ae1       vmls.f32        s7, s5, s3
+    assert_eq!(
+        decode_32(0xee42_3ae1),
+        Instruction::VMLS_f32 {
+            params: VAddSubParamsf32 {
+                sd: SingleReg::S7,
+                sn: SingleReg::S5,
+                sm: SingleReg::S3,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vnmla_f32() {
+    // ee57 7a66       vnmla.f32       s15, s14, s13
+    assert_eq!(
+        decode_32(0xee57_7a66),
+        Instruction::VNMLA_f32 {
+            params: VAddSubParamsf32 {
+                sd: SingleReg::S15,
+                sn: SingleReg::S14,
+                sm: SingleReg::S13,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vnmls_f32() {
+    // ee15 5a86       vnmls.f32       s10, s11, s12
+    assert_eq!(
+        decode_32(0xee15_5a86),
+        Instruction::VNMLS_f32 {
+            params: VAddSubParamsf32 {
+                sd: SingleReg::S10,
+                sn: SingleReg::S11,
+                sm: SingleReg::S12,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vmla_f64() {
+    // ee01 1b01       vmla.f64        d1, d1, d1
+    assert_eq!(
+        decode_32(0xee01_1b01),
+        Instruction::VMLA_f64 {
+            params: VAddSubParamsf64 {
+                dd: DoubleReg::D1,
+                dn: DoubleReg::D1,
+                dm: DoubleReg::D1,
+            }
+        }
+    );
+    // ee0e fb0d       vmla.f64        d15, d14, d13
+    assert_eq!(
+        decode_32(0xee0e_fb0d),
+        Instruction::VMLA_f64 {
+            params: VAddSubParamsf64 {
+                dd: DoubleReg::D15,
+                dn: DoubleReg::D14,
+                dm: DoubleReg::D13,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vmls_f64() {
+    // ee05 7b43       vmls.f64        d7, d5, d3
+    assert_eq!(
+        decode_32(0xee05_7b43),
+        Instruction::VMLS_f64 {
+            params: VAddSubParamsf64 {
+                dd: DoubleReg::D7,
+                dn: DoubleReg::D5,
+                dm: DoubleReg::D3,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vnmla_f64() {
+    // ee19 8b4a       vnmla.f64       d8, d9, d10
+    assert_eq!(
+        decode_32(0xee19_8b4a),
+        Instruction::VNMLA_f64 {
+            params: VAddSubParamsf64 {
+                dd: DoubleReg::D8,
+                dn: DoubleReg::D9,
+                dm: DoubleReg::D10,
+            }
+        }
+    );
+    // ee51 0be2       vnmla.f64       d16, d17, d18 - the FPU is FPv5-D16, so an encoding
+    // naming a higher double is undefined.
+    assert!(matches!(decode_32(0xee51_0be2), Instruction::UDF { .. }));
+}
+
+#[test]
+fn test_decode_vnmls_f64() {
+    // ee1e fb0d       vnmls.f64       d15, d14, d13
+    assert_eq!(
+        decode_32(0xee1e_fb0d),
+        Instruction::VNMLS_f64 {
+            params: VAddSubParamsf64 {
+                dd: DoubleReg::D15,
+                dn: DoubleReg::D14,
+                dm: DoubleReg::D13,
+            }
+        }
+    );
+}
+
+// VCVTB and VCVTT (A7.7.231). The .f16 forms write one half of the destination and read the
+// whole source; the .f32.f16 and .f64.f16 forms read one half of the source S register.
+
+#[test]
+fn test_decode_vcvtb_f16_f32() {
+    // eef3 0a60       vcvtb.f16.f32   s1, s1
+    assert_eq!(
+        decode_32(0xeef3_0a60),
+        Instruction::VCVTB_f16_f32 {
+            params: VCVTParamsF16F32 {
+                sd: SingleReg::S1,
+                sm: SingleReg::S1,
+            }
+        }
+    );
+    // eef3 7a47       vcvtb.f16.f32   s15, s14
+    assert_eq!(
+        decode_32(0xeef3_7a47),
+        Instruction::VCVTB_f16_f32 {
+            params: VCVTParamsF16F32 {
+                sd: SingleReg::S15,
+                sm: SingleReg::S14,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vcvtt_f16_f32() {
+    // eef3 7ac7       vcvtt.f16.f32   s15, s14
+    assert_eq!(
+        decode_32(0xeef3_7ac7),
+        Instruction::VCVTT_f16_f32 {
+            params: VCVTParamsF16F32 {
+                sd: SingleReg::S15,
+                sm: SingleReg::S14,
+            }
+        }
+    );
+    // eef3 1ac1       vcvtt.f16.f32   s3, s2
+    assert_eq!(
+        decode_32(0xeef3_1ac1),
+        Instruction::VCVTT_f16_f32 {
+            params: VCVTParamsF16F32 {
+                sd: SingleReg::S3,
+                sm: SingleReg::S2,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vcvtb_f32_f16() {
+    // eef2 0a60       vcvtb.f32.f16   s1, s1
+    assert_eq!(
+        decode_32(0xeef2_0a60),
+        Instruction::VCVTB_f32_f16 {
+            params: VCVTParamsF32F16 {
+                sd: SingleReg::S1,
+                sm: SingleReg::S1,
+            }
+        }
+    );
+    // eef2 7a47       vcvtb.f32.f16   s15, s14
+    assert_eq!(
+        decode_32(0xeef2_7a47),
+        Instruction::VCVTB_f32_f16 {
+            params: VCVTParamsF32F16 {
+                sd: SingleReg::S15,
+                sm: SingleReg::S14,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vcvtt_f32_f16() {
+    // eef2 3ae4       vcvtt.f32.f16   s7, s9
+    assert_eq!(
+        decode_32(0xeef2_3ae4),
+        Instruction::VCVTT_f32_f16 {
+            params: VCVTParamsF32F16 {
+                sd: SingleReg::S7,
+                sm: SingleReg::S9,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vcvtb_f16_f64() {
+    // eeb3 fb4f       vcvtb.f16.f64   s30, d15
+    assert_eq!(
+        decode_32(0xeeb3_fb4f),
+        Instruction::VCVTB_f16_f64 {
+            params: VCVTParamsF16F64 {
+                sd: SingleReg::S30,
+                dm: DoubleReg::D15,
+            }
+        }
+    );
+    // eeb3 8b64       vcvtb.f16.f64   s16, d20 - D20 does not exist on FPv5-D16.
+    assert!(matches!(decode_32(0xeeb3_8b64), Instruction::UDF { .. }));
+}
+
+#[test]
+fn test_decode_vcvtt_f16_f64() {
+    // eef3 fbcf       vcvtt.f16.f64   s31, d15
+    assert_eq!(
+        decode_32(0xeef3_fbcf),
+        Instruction::VCVTT_f16_f64 {
+            params: VCVTParamsF16F64 {
+                sd: SingleReg::S31,
+                dm: DoubleReg::D15,
+            }
+        }
+    );
+    // eef3 fbef       vcvtt.f16.f64   s31, d31 - D31 does not exist on FPv5-D16.
+    assert!(matches!(decode_32(0xeef3_fbef), Instruction::UDF { .. }));
+}
+
+#[test]
+fn test_decode_vcvtb_f64_f16() {
+    // eeb2 1b62       vcvtb.f64.f16   d1, s5
+    assert_eq!(
+        decode_32(0xeeb2_1b62),
+        Instruction::VCVTB_f64_f16 {
+            params: VCVTParamsF64F16 {
+                dd: DoubleReg::D1,
+                sm: SingleReg::S5,
+            }
+        }
+    );
+    // eef2 fb48       vcvtb.f64.f16   d31, s16 - D31 does not exist on FPv5-D16.
+    assert!(matches!(decode_32(0xeef2_fb48), Instruction::UDF { .. }));
+    // eeb2 1b68       vcvtb.f64.f16   d1, s17 - the positive control: S16 and above do
+    // exist (they are the halves of d8 to d15), so only the D side may gate to UDF.
+    assert_eq!(
+        decode_32(0xeeb2_1b68),
+        Instruction::VCVTB_f64_f16 {
+            params: VCVTParamsF64F16 {
+                dd: DoubleReg::D1,
+                sm: SingleReg::S17,
+            }
+        }
+    );
+}
+
+#[test]
+fn test_decode_vcvtt_f64_f16() {
+    // eeb2 fbc7       vcvtt.f64.f16   d15, s14
+    assert_eq!(
+        decode_32(0xeeb2_fbc7),
+        Instruction::VCVTT_f64_f16 {
+            params: VCVTParamsF64F16 {
+                dd: DoubleReg::D15,
+                sm: SingleReg::S14,
+            }
+        }
+    );
+    // eef2 0bef       vcvtt.f64.f16   d16, s31 - D16 does not exist on FPv5-D16.
+    assert!(matches!(decode_32(0xeef2_0bef), Instruction::UDF { .. }));
+    // eeb2 1be8       vcvtt.f64.f16   d1, s17 - the positive control: s17 is a legal half.
+    assert_eq!(
+        decode_32(0xeeb2_1be8),
+        Instruction::VCVTT_f64_f16 {
+            params: VCVTParamsF64F16 {
+                dd: DoubleReg::D1,
+                sm: SingleReg::S17,
+            }
+        }
+    );
+}
+
+// FLDMX and FSTMX (D2.3.1): the VLDM and VSTM encodings for doubles with the low bit of the
+// word count set. They are the same instructions: the register count drops the bit and the
+// address advances by the full word count, so the odd word of the range is skipped.
+
+#[test]
+fn test_decode_fldmx_is_a_vldm_with_an_odd_word_count() {
+    // ecb0 0b11       vldmia r0!, {d0-d7} with imm8 = 0x11: FLDMX r0!, {d0-d7}
+    match decode_32(0xecb0_0b11) {
+        Instruction::VLDM_T1 { params } => {
+            assert_eq!(params.mode, AddressingMode::IncrementAfter);
+            assert_eq!(params.rn, Reg::R0);
+            assert!(params.write_back);
+            assert_eq!(params.imm32, 68);
+            let regs: Vec<_> = params.list.iter().collect();
+            assert_eq!(
+                vec![
+                    DoubleReg::D0,
+                    DoubleReg::D1,
+                    DoubleReg::D2,
+                    DoubleReg::D3,
+                    DoubleReg::D4,
+                    DoubleReg::D5,
+                    DoubleReg::D6,
+                    DoubleReg::D7,
+                ],
+                regs
+            );
+        }
+        other => unreachable!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_decode_fstmx_is_a_vstm_with_an_odd_word_count() {
+    // eca0 0b11       vstmia r0!, {d0-d7} with imm8 = 0x11: FSTMX r0!, {d0-d7}
+    match decode_32(0xeca0_0b11) {
+        Instruction::VSTM_T1 { params } => {
+            assert_eq!(params.mode, AddressingMode::IncrementAfter);
+            assert_eq!(params.rn, Reg::R0);
+            assert!(params.write_back);
+            assert_eq!(params.imm32, 68);
+            assert_eq!(8, params.list.len());
+        }
+        other => unreachable!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_decode_fldmx_decrement_before() {
+    // ed30 0b11       vldmdb r0!, {d0-d7} with imm8 = 0x11
+    match decode_32(0xed30_0b11) {
+        Instruction::VLDM_T1 { params } => {
+            assert_eq!(params.mode, AddressingMode::DecrementBefore);
+            assert!(params.write_back);
+            assert_eq!(params.imm32, 68);
+            assert_eq!(8, params.list.len());
+        }
+        other => unreachable!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_decode_vldm_and_vstm_even_word_counts_are_unchanged() {
+    // ecb0 0b10       vldmia r0!, {d0-d7}
+    match decode_32(0xecb0_0b10) {
+        Instruction::VLDM_T1 { params } => {
+            assert_eq!(params.imm32, 64);
+            assert_eq!(8, params.list.len());
+        }
+        other => unreachable!("{other:?}"),
+    }
+    // eca0 0b10       vstmia r0!, {d0-d7}
+    match decode_32(0xeca0_0b10) {
+        Instruction::VSTM_T1 { params } => {
+            assert_eq!(params.imm32, 64);
+            assert_eq!(8, params.list.len());
+        }
+        other => unreachable!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_decode_vldm_vstm_pu_space_never_reaches_ldc_stc() {
+    // DDI0403E A7.7.235: in the word-list space with hw2 bits 11-8 = 1011, P == U with
+    // writeback is UNDEFINED. It must not fall through to the LDC and STC patterns, whose
+    // coprocessor field is the same 1011 (coprocessor 11): these are the coprocessor
+    // load and store lookalikes that llvm-mc also rejects.
+    for opcode in [0xedb1_2b02u32, 0xec31_2b02, 0xeda0_0b16, 0xec20_0b16] {
+        assert!(
+            matches!(decode_32(opcode), Instruction::UDF { .. }),
+            "{opcode:#x}"
+        );
+    }
+    // The legal modes of the same space keep their decoders: P = 0, U = 1 is Increment After
+    // (with and without writeback) and P = 1, U = 0, W = 1 is Decrement Before.
+    assert!(matches!(
+        decode_32(0xecb0_0b10),
+        Instruction::VLDM_T1 { .. }
+    ));
+    assert!(matches!(
+        decode_32(0xec90_0b10),
+        Instruction::VLDM_T1 { .. }
+    ));
+    assert!(matches!(
+        decode_32(0xed30_0b10),
+        Instruction::VLDM_T1 { .. }
+    ));
+    // P = 1, W = 0 is the offset form of VLDR and VSTR, claimed before the word-list forms.
+    // This is the tie the PU split of the word-list rows creates: the same words match a
+    // VLDR_t1/VSTR_t1 pattern and a VLDM_t1/VSTM_t1 row, and RESOLVED_OVERLAPS settles it
+    // for the load side with ("VLDR_t1","VLDM_t1") and the store side with
+    // ("VSTR_t1","VSTM_t1"). The parameters are pinned too: an offset below the base,
+    // 64 bytes of it (A7.7.236/239 say the address is Rn - imm32, and llvm-mc writes it
+    // "[r0, #-64]"). Reversing either pair in the table turns these words into a
+    // write-back-less word list of eight doubles.
+    assert_eq!(
+        decode_32(0xed10_0b10), // vldr d0, [r0, #-64]
+        Instruction::VLDR {
+            params: VLoadAndStoreParams {
+                dd: ExtensionReg::Double { reg: DoubleReg::D0 },
+                rn: Reg::R0,
+                add: false,
+                imm32: 64,
+            }
+        }
+    );
+    assert_eq!(
+        decode_32(0xed00_0b10), // vstr d0, [r0, #-64]
+        Instruction::VSTR {
+            params: VLoadAndStoreParams {
+                dd: ExtensionReg::Double { reg: DoubleReg::D0 },
+                rn: Reg::R0,
+                add: false,
+                imm32: 64,
+            }
+        }
+    );
+    // The same tie at the top of the register bank and with PC as the base register
+    // (ed9f 7b86 and ed8f 7b86, both v?r d7, [pc, #536]).
+    assert_eq!(
+        decode_32(0xed9f_7b86), // vldr d7, [pc, #536]
+        Instruction::VLDR {
+            params: VLoadAndStoreParams {
+                dd: ExtensionReg::Double { reg: DoubleReg::D7 },
+                rn: Reg::PC,
+                add: true,
+                imm32: 0x86 << 2,
+            }
+        }
+    );
+    assert_eq!(
+        decode_32(0xed8f_7b86), // vstr d7, [pc, #536]
+        Instruction::VSTR {
+            params: VLoadAndStoreParams {
+                dd: ExtensionReg::Double { reg: DoubleReg::D7 },
+                rn: Reg::PC,
+                add: true,
+                imm32: 0x86 << 2,
+            }
+        }
+    );
+    // P = 0, U = 0, W = 0 with D = 1 in the same space is the 64-bit transfer MRRC.
+    assert!(matches!(decode_32(0xec53_2b00), Instruction::COPROC { .. }));
+}
+
+#[test]
+fn test_decode_fldmx_fstmx_past_the_last_register_decode_as_udf() {
+    // An odd word count reaches the word-list decoder now (D2.3.1), and the register rule of
+    // the even counts is unchanged: half of the words, rounded down, starting at the first
+    // register, and an empty or out-of-the-bank list is refused. imm8 = 5 is two doubles
+    // from D15, imm8 = 5 from D16 does not even start in the bank, and imm8 = 1 leaves no
+    // double at all. llvm-mc has no name for a register past D15: it prints the list cut
+    // at the bank edge (fldmiax r0!, {d15}) and reads the words that start past the bank
+    // as unrelated instructions.
+    for opcode in [
+        0xecb0_fb05u32, // llvm-mc: fldmiax r0!, {d15}
+        0xed30_fb05,    // llvm-mc: fldmdbx r0!, {d15}
+        0xeca0_fb05,    // llvm-mc: fstmiax r0!, {d15}
+        0xed20_fb05,    // llvm-mc: fstmdbx r0!, {d15}
+        0xecf0_0b05,    // first register D16, out of the bank
+        0xece0_0b05,    // the same store
+        0xecb0_0b01,    // imm8 = 1: half of one is no double, refused like the empty even list
+        0xeca0_0b01,    // the same store
+        0xed30_0b01,    // decrement before, same count
+        0xed20_0b01,    // the same store
+    ] {
+        assert!(
+            matches!(decode_32(opcode), Instruction::UDF { .. }),
+            "{opcode:#x}"
         );
     }
 }

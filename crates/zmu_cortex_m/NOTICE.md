@@ -701,8 +701,8 @@ also on, `build.rs` stops.
   that, and the TRM was not available. CP10 and CP11 with the FPU built in exist: the FP
   instructions are decoded first, and any other encoding for those numbers decodes as `COPROC` too,
   and the executor looks at CPACR (A2.6, A5.3.18): UFSR.UNDEFINSTR with the FPU enabled, NOCP with
-  it disabled (`exec_coprocessor`). VMLA, VMLS, VNMLA and VNMLS are such encodings until FP batch 5
-  adds them (the VMLA and VMLS half is the new behaviour; they were silent no-ops). An encoding
+  it disabled (`exec_coprocessor`). VMLA, VMLS, VNMLA and VNMLS were such encodings until FP batch 5
+  added them (the VMLA and VMLS half had been a silent no-op). An encoding
   inside a pattern that an FP decoder owns and refuses (for example VLDM with P = 0, U = 0, W = 1)
   is still UDF whatever CPACR says, as before. Without the FPU (the armv7m and armv6m builds) CP10
   and CP11 are absent coprocessors like the rest and take NOCP; one existing test
@@ -720,7 +720,8 @@ also on, `build.rs` stops.
   VLDM in A7.7, D2.3.1) were a silent no-op (FLDMX, as LDC) or UDF (FSTMX); they are now coprocessor
   instructions that give UNDEFINSTR (FPU on) or NOCP (off). The firmware has both as real code
   (libgcc's `__gnu_Unwind_Restore_VFP` and `__gnu_Unwind_Save_VFP`), reached only by EHABI
-  unwinding, which MMBasic does not do. FP batch 5 will implement them. The FP decode is untouched
+  unwinding, which MMBasic does not do. FP batch 5 (below) implements them as the odd word count
+  forms of VLDM and VSTM. The FP decode is untouched
   (the FP tests pass unchanged); 12 FP encodings that llvm calls invalid decode as FP here, as they
   did before. Executed on the core with CPACR at reset: every kind x 14 numbers gives CFSR.NOCP and
   the UsageFault with registers and memory untouched.
@@ -747,6 +748,74 @@ also on, `build.rs` stops.
   unprivileged executor's own condition check (the ordinary executor it calls checks it, and the MPU
   hook is a stub), and the hint executor's condition check (it only changes the result kind of a
   skipped hint). Five planted bugs in the Unicorn comparison were all seen.
+ - FP batch 5 (issue 77, the last batch): VMLA, VMLS, VNMLA and VNMLS in F32 and F64 (A7.7.238,
+   A7.7.250); VCVTB and VCVTT between half precision and single or double precision, both
+   directions (A7.7.231); and FLDMX and FSTMX, the odd-word-count forms of VLDM and VSTM (D2.3.1,
+   the `imm8<0> = 1` case the VLDM page calls SEE FLDMX). The patterns are 16 new table rows,
+   confirmed word for word against llvm-mc. `decoder/vmla.rs` and `decoder/vcvt.rs` wrappers
+   decode the operands (Vd and Vm with the D and M extension bits); destinations outside the
+   register bank of the built profile decode as UDF.
+ - The multiply-accumulate executes the legacy pseudocode, not the FMA one: the product is
+   rounded first, and the negation of VMLS, VNMLA and VNMLS is a sign-bit flip (FPNeg, A2.5) of
+   the rounded product, of the accumulator, or of both — never a fused multiply-add and never a
+   multiply by −1, because both differ when the accumulator and the two factors are the same
+   register. Inf × 0 and a sum of two infinities of opposite sign (which is what adding an
+   accumulator to its negation is) give the default NaN and set IOC; 0 × −finite is −0. The add
+   takes the accumulator as its first operand, which is observable: with DN clear and both the
+   accumulator and the product quiet NaNs, the accumulator's payload is the result.
+ - Half precision converts through the generic engine with a `FloatOps for u16` instance:
+   round-to-nearest-even, overflow to ±Infinity with OF and IX, input sticky flags kept, and one
+   F16 value of the source half (VCVTB the low half, VCVTT the high half) read or written, the
+   other half of the destination untouched. FPSCR.FZ never flushes a half-precision value: the
+   flush tests in FPUnpack and FPRound are guarded by `N != 16` (A2.5; ARMv7-M has no FZ16 bit),
+   and IDC is set only where a flush really happened, on the single or double side. FPSCR.DN
+   does apply to half results: a NaN in or a NaN result becomes the default NaN of that width.
+   FPSCR bit 26, the alternate half-precision mode (AHP in the FPSCR description, AH in the
+   A2.5 pseudocode — one bit, 26, both names mean it), is not modelled: the conversions take
+   the IEEE path whatever the bit holds, and `test_ahp_seeded_conversions_stay_on_the_ieee_path`
+   pins that documented limitation. Bit 26 was not observable before this batch; the half
+   converts make it observable, so the gap is now testable and pinned rather than silent.
+ - The odd word count is a real FLDMX: the base moves by imm8 words (17 words is 68 bytes)
+   while only (imm8 − 1)/2 doubles are transferred; the pseudocode reads the registers upward
+   from the low end of the range, so the highest-addressed word of the range is the one no
+   transfer reads or writes, in either addressing mode. Even counts are unchanged.
+ - Splitting the VLDM and VSTM table rows by PU (needed so an odd count with P ≠ U is claimed by the
+   word list and not by LDC or STC) first dropped the rule `P == U` with writeback is UNDEFINED
+   (A7.7.235): such words fell through to the LDC and STC patterns for coprocessor 11, which llvm-mc
+   rejects too. Fixed with four reject rows: two per direction, each pinning P and U (bits 24-23) to
+   00 or 11 and W (bit 21) to 1, and the load/store bit (bit 20) to 1 on the load rows and 0 on the
+   store rows. They keep the words inside the word-list pattern, which refuses them, so they decode
+   as UDF. `P = 0, U = 0` belongs to the 64-bit transfers (MRRC and MCRR with D = 1, UDF with D = 0)
+   and `P = 1, W = 0` to VLDR and VSTR. The split changed the decode space beyond the word list: a
+   diff of every decode the table can reach (hw1 0xEC00-0xEFFF and 0xFC00-0xFFFF against every hw2,
+   134,217,728 words, batch against pre-batch) shows 42,336 coprocessor-11 words — 21,952 MCRR and
+   20,384 MRRC, hw1 0xEC40-0xEC5F — that decoded as UNDEFINED before the batch and decode as
+   coprocessor transfers with it; llvm-mc's assembler emits these encodings (its disassembler
+   rejects some, the six words noted below). Two batch-4 test entries that used a `P == U, W = 1`
+   lookalike as a "not the FPU" example were replaced with llvm-encoded MRRC words.
+ - Checks for batch 5: 84,000 vectors against a Unicorn 2.1.5 oracle (12,000 each: the four MAC
+   operations in each width, the VCVT half conversions in both directions and widths, and
+   FLDMX/FSTMX) — all 84,000 bit-exact on the spilled D-register words, the FPSCR flags and
+   mode bits, the 16-word memory window and the core registers R0-R12, SP and LR. PC is read
+   but not compared: the two sides map the vector blob at different addresses, so its absolute
+   value can never match; the Unicorn side proves each blob ran exactly to its stop address
+   instead. The harness asserts per vector that the FPSCR it writes has reached the oracle
+   before the vector runs — Unicorn initialises FP state lazily, and a write before the first
+   FP instruction is dropped: an unwarmed first harness ran each bucket's first vector with
+   FPSCR = 0 and reported five mismatches that were harness artifacts, not behaviours of the
+   oracle. A review-side harness built independently compares the base registers of the
+   transfers directly: it reports 0 mismatches in 25,000 vectors for each MAC kind and 20,000
+   FLDMX/FSTMX vectors, and catches two planted bugs. The corrected harness, its inputs,
+   results and logs live under spikes/oracle-b5/ (locally excluded from git). A decode sweep of
+   5,200 words against llvm-mc (encode, disassemble, compare with zmu decode and Display) found no
+   decode mismatch; six words are cases where llvm-mc's disassembler rejects MCRR and MRRC
+   encodings its own assembler emits. Twelve planted bugs in the new code (the MAC negations and
+   operand order, the half-word extract and store, the F16 FZ guard, FPNeg, the IA and DB base
+   arithmetic, the FLDMX word count, the PU reject row, the VCVTT half flag) were run against the
+   suite: ten were caught at once, the operand-order one survived until a NaN-payload test was
+   added for it, and the one that rewrote a table row tripped the table's duplicate-pattern guard
+   so it was replaced by the equivalent decoder-wrapper mutation, which was caught. The firmware
+   tests print the same 33 instruction-count lines as before batch 5.
 
 `cargo clippy -p zmu_cortex_m --all-targets -- -D warnings` is clean (the crate denies
 `clippy::pedantic`; the test code had unseparated long literals, `assert!` with `==`, and a few

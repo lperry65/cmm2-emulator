@@ -619,6 +619,34 @@ pub struct VCVTParamsF32F64 {
 
 #[allow(missing_docs)]
 #[derive(PartialEq, Debug, Copy, Clone)]
+pub struct VCVTParamsF16F32 {
+    pub sd: SingleReg,
+    pub sm: SingleReg,
+}
+
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub struct VCVTParamsF16F64 {
+    pub sd: SingleReg,
+    pub dm: DoubleReg,
+}
+
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub struct VCVTParamsF32F16 {
+    pub sd: SingleReg,
+    pub sm: SingleReg,
+}
+
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub struct VCVTParamsF64F16 {
+    pub dd: DoubleReg,
+    pub sm: SingleReg,
+}
+
+#[allow(missing_docs)]
+#[derive(PartialEq, Debug, Copy, Clone)]
 pub struct VSelParamsf32 {
     pub sd: SingleReg,
     pub sn: SingleReg,
@@ -1797,6 +1825,38 @@ pub enum Instruction {
         params: VAddSubParamsf64,
     },
     #[cfg(feature = "has-fp")]
+    VMLA_f32 {
+        params: VAddSubParamsf32,
+    },
+    #[cfg(feature = "has-fp")]
+    VMLA_f64 {
+        params: VAddSubParamsf64,
+    },
+    #[cfg(feature = "has-fp")]
+    VMLS_f32 {
+        params: VAddSubParamsf32,
+    },
+    #[cfg(feature = "has-fp")]
+    VMLS_f64 {
+        params: VAddSubParamsf64,
+    },
+    #[cfg(feature = "has-fp")]
+    VNMLA_f32 {
+        params: VAddSubParamsf32,
+    },
+    #[cfg(feature = "has-fp")]
+    VNMLA_f64 {
+        params: VAddSubParamsf64,
+    },
+    #[cfg(feature = "has-fp")]
+    VNMLS_f32 {
+        params: VAddSubParamsf32,
+    },
+    #[cfg(feature = "has-fp")]
+    VNMLS_f64 {
+        params: VAddSubParamsf64,
+    },
+    #[cfg(feature = "has-fp")]
     VCMP_f32 {
         params: VCmpParamsf32,
     },
@@ -1819,6 +1879,38 @@ pub enum Instruction {
     #[cfg(feature = "has-fp")]
     VCVT_f32_f64 {
         params: VCVTParamsF32F64,
+    },
+    #[cfg(feature = "has-fp")]
+    VCVTB_f16_f32 {
+        params: VCVTParamsF16F32,
+    },
+    #[cfg(feature = "has-fp")]
+    VCVTT_f16_f32 {
+        params: VCVTParamsF16F32,
+    },
+    #[cfg(feature = "has-fp")]
+    VCVTB_f16_f64 {
+        params: VCVTParamsF16F64,
+    },
+    #[cfg(feature = "has-fp")]
+    VCVTT_f16_f64 {
+        params: VCVTParamsF16F64,
+    },
+    #[cfg(feature = "has-fp")]
+    VCVTB_f32_f16 {
+        params: VCVTParamsF32F16,
+    },
+    #[cfg(feature = "has-fp")]
+    VCVTT_f32_f16 {
+        params: VCVTParamsF32F16,
+    },
+    #[cfg(feature = "has-fp")]
+    VCVTB_f64_f16 {
+        params: VCVTParamsF64F16,
+    },
+    #[cfg(feature = "has-fp")]
+    VCVTT_f64_f16 {
+        params: VCVTParamsF64F16,
     },
     #[cfg(feature = "has-fp")]
     VSEL_f32 {
@@ -3353,6 +3445,70 @@ impl fmt::Display for Instruction {
                 write!(f, "vfnma.f64 {}, {}, {}", params.dd, params.dn, params.dm)
             }
             #[cfg(feature = "has-fp")]
+            Self::VMLA_f32 { params } => {
+                write!(f, "vmla.f32 {}, {}, {}", params.sd, params.sn, params.sm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VMLA_f64 { params } => {
+                write!(f, "vmla.f64 {}, {}, {}", params.dd, params.dn, params.dm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VMLS_f32 { params } => {
+                write!(f, "vmls.f32 {}, {}, {}", params.sd, params.sn, params.sm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VMLS_f64 { params } => {
+                write!(f, "vmls.f64 {}, {}, {}", params.dd, params.dn, params.dm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VNMLA_f32 { params } => {
+                write!(f, "vnmla.f32 {}, {}, {}", params.sd, params.sn, params.sm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VNMLA_f64 { params } => {
+                write!(f, "vnmla.f64 {}, {}, {}", params.dd, params.dn, params.dm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VNMLS_f32 { params } => {
+                write!(f, "vnmls.f32 {}, {}, {}", params.sd, params.sn, params.sm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VNMLS_f64 { params } => {
+                write!(f, "vnmls.f64 {}, {}, {}", params.dd, params.dn, params.dm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VCVTB_f16_f32 { params } => {
+                write!(f, "vcvtb.f16.f32 {}, {}", params.sd, params.sm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VCVTT_f16_f32 { params } => {
+                write!(f, "vcvtt.f16.f32 {}, {}", params.sd, params.sm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VCVTB_f16_f64 { params } => {
+                write!(f, "vcvtb.f16.f64 {}, {}", params.sd, params.dm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VCVTT_f16_f64 { params } => {
+                write!(f, "vcvtt.f16.f64 {}, {}", params.sd, params.dm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VCVTB_f32_f16 { params } => {
+                write!(f, "vcvtb.f32.f16 {}, {}", params.sd, params.sm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VCVTT_f32_f16 { params } => {
+                write!(f, "vcvtt.f32.f16 {}, {}", params.sd, params.sm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VCVTB_f64_f16 { params } => {
+                write!(f, "vcvtb.f64.f16 {}, {}", params.dd, params.sm)
+            }
+            #[cfg(feature = "has-fp")]
+            Self::VCVTT_f64_f16 { params } => {
+                write!(f, "vcvtt.f64.f16 {}, {}", params.dd, params.sm)
+            }
+            #[cfg(feature = "has-fp")]
             Self::VSQRT_f32 { params } => write!(f, "vsqrt.f32 {}, {}", params.sd, params.sm),
             #[cfg(feature = "has-fp")]
             Self::VSQRT_f64 { params } => write!(f, "vsqrt.f64 {}, {}", params.dd, params.dm),
@@ -3746,6 +3902,38 @@ pub fn instruction_size(instruction: &Instruction) -> usize {
         Instruction::VFNMA_f32 { .. } => 4,
         #[cfg(feature = "has-fp")]
         Instruction::VFNMA_f64 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VMLA_f32 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VMLA_f64 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VMLS_f32 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VMLS_f64 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VNMLA_f32 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VNMLA_f64 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VNMLS_f32 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VNMLS_f64 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VCVTB_f16_f32 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VCVTT_f16_f32 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VCVTB_f16_f64 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VCVTT_f16_f64 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VCVTB_f32_f16 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VCVTT_f32_f16 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VCVTB_f64_f16 { .. } => 4,
+        #[cfg(feature = "has-fp")]
+        Instruction::VCVTT_f64_f16 { .. } => 4,
         #[cfg(feature = "has-fp")]
         Instruction::VLDM_T1 { .. } => 4,
         #[cfg(feature = "has-fp")]

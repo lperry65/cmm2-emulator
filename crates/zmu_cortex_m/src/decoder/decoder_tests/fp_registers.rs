@@ -102,7 +102,9 @@ fn test_register_lists_past_the_last_register_decode_as_udf() {
             for d in [0_u32, 1] {
                 for vd in [0_u32, 7, 15] {
                     for imm8 in [0_u32, 1, 2, 3, 31, 32, 33, 64, 127, 128, 129, 200, 254, 255] {
-                        // an odd count of words in the double form is not VLDM, it is LDC
+                        // an odd count of words in the double form is the FLDMX form; its
+                        // past-the-bank UDF is pinned by
+                        // test_decode_fldmx_fstmx_past_the_last_register_decode_as_udf
                         if double && imm8 % 2 == 1 {
                             continue;
                         }

@@ -32,8 +32,6 @@ What does not work yet, or is incomplete:
 
 - Speed: the host is too slow for the machine's clock, so Galactic Raiders is far too slow to
   play. The plan is an x86-64 JIT ([issue 74](https://github.com/lperry65/cmm2-emulator/issues/74)).
-- The floating-point instructions of the DSP work still to do
-  ([issue 77](https://github.com/lperry65/cmm2-emulator/issues/77)).
 - Memory wait states ([issue 65](https://github.com/lperry65/cmm2-emulator/issues/65)).
 - Other peripherals: the USB mouse and gamepad, SPI3 for the SD card, and sound (the DAC) are
   not done.

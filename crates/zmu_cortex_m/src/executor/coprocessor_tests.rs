@@ -135,28 +135,24 @@ fn test_in_an_it_block_that_does_not_pass_there_is_no_fault() {
 
 /// Coprocessor instructions for CP10 or CP11 that are not instructions of the FPU: a move to and
 /// from a core register with operands that no VMOV or VMRS has, the two-register moves with an
-/// opc1 that VMOV does not use, a load and a store that are not VLDR, VSTR or VLDM (P = 0,
-/// U = 0 and W = 1 is no FP form), and VMLA, VMLS, VNMLA and VNMLS (llvm-mc: vmla.f32 s0, s1,
-/// s2 and so on), single and double. Only the first group is new behaviour of the batch: VNMLA
-/// and VNMLS were already UDF, VMLA and VMLS were swallowed by the MCR entry and ran as a silent
-/// no-op. Until the floating-point batch adds all four they are not FP instructions.
-const NOT_FP: [(u32, &str); 14] = [
+/// opc1 that VMOV does not use, and an MRRC whose second register field is even, which the
+/// FPU does not use. In the load and store space of coprocessor 11 every addressing mode is
+/// claimed: P = 0, U = 0 with D = 1 is MRRC or MCRR, the modes P = U with writeback are UNDEFINED
+/// and refused by the word-list patterns, and the rest are VLDM, VSTM, VLDR and VSTR (A7.7.235).
+/// Until the floating-point batches added VMLA, VMLS, VNMLA and VNMLS and the odd word counts of
+/// FLDMX and FSTMX, all of those were in this list.
+const NOT_FP: [(u32, &str); 7] = [
     (0xee22_1a93, "mcr p10"),
     (0xee32_1b93, "mrc p11"),
     (0xec42_1a03, "mcrr p10"),
     (0xec52_1b03, "mrrc p11"),
-    // odd imm8 is not a VLDM or VSTM of doubles (it is FLDMX and FSTMX, which no FP instruction
-    // here is); the even ones are in the VLDM and VSTM patterns, which refuse P = 0, U = 0 as UDF
-    (0xec32_1b03, "ldc p11"),
-    (0xec22_1b03, "stc p11"),
-    (0xee00_0a81, "vmla.f32"),
-    (0xee01_0b02, "vmla.f64"),
-    (0xee00_0ac1, "vmls.f32"),
-    (0xee01_0b42, "vmls.f64"),
-    (0xee10_0ac1, "vnmla.f32"),
-    (0xee11_0b42, "vnmla.f64"),
-    (0xee10_0a81, "vnmls.f32"),
-    (0xee11_0b02, "vnmls.f64"),
+    // an MRRC whose register fields make its low halfword read like a double-word list marker;
+    // P = 0, U = 0 is the space of the 64-bit transfers, which no word-list pattern names
+    (0xec52_0b02, "mrrc p10 with Rt2 = 2"),
+    // the same 64-bit transfer space with the group fields that the FPU does not use, encoded
+    // by llvm-mc as mrrc p10, #7, r1, r0, cr9 and mrrc p11, #0, r2, r3, cr0
+    (0xec50_1a79, "mrrc p10, #7, r1, r0, cr9"),
+    (0xec53_2b00, "mrrc p11, #0, r2, r3, cr0"),
 ];
 
 /// CP10 and CP11 exist when the FPU is built in, so an instruction for them that is not the FPU's

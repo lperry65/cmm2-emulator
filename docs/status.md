@@ -41,7 +41,7 @@ Galactic Raiders, the game I am writing for the CMM2, loads and draws all its sp
 
 It used to stop at an ARMv7E-M DSP instruction that the core did not have, at 0x08146b6c. A
 reviewer first read that instruction as UQADD8. It was UQSUB8 (A7.7.210), and the whole DSP
-extension was missing, not one instruction (issue 77). Batches 1 to 4 of the work on it are
+extension was missing, not one instruction (issue 77). All five batches of the work on it are
 committed (see "The CPU core").
 
 A reviewer had an agent test commit aafbce9 (2026-11-18): it ran through a pty, with a card built
@@ -89,15 +89,18 @@ Checked against the ARMv7-M manual since the first boot:
   to a HardFault. The same commit stops the DWT cycle counter in sleep unless `DBGSLEEP_D1` is
   set (the emulator does not sleep on WFI yet, issue 72) and fixes two reset-related bugs.
 
-The ARMv7E-M DSP extension and the base instructions that were missing (issue 77, batches 1 to 4,
-commits 001a7bf, aafbce9, 8fc5d97 and e3e8936; the core fixes in the last bullet are from
-4bd964d):
+The ARMv7E-M DSP extension and the base instructions that were missing (issue 77, in five
+batches; batches 1 to 4 are commits 001a7bf, aafbce9, 8fc5d97 and e3e8936, and the last batch
+adds the floating-point instructions; the core fixes in the last bullet are from 4bd964d):
 
 - The 36 parallel add and subtract instructions; QADD, QSUB, QDADD and QDSUB; SMMUL, SMMLA and
   SMMLS with their R forms; USAD8 and USADA8; SXTB16, SXTAB16, UXTB16 and UXTAB16; SSAT16 and
   USAT16 (they used to decode as SSAT and USAT, so they ran with a wrong result); SMULW and SMLAW;
   SMUAD, SMUSD, SMLAD and SMLSD with their X forms; SMLALD and SMLSLD; SMLALBB, SMLALBT, SMLALTB
   and SMLALTT; UMAAL; and LDMDB, also written LDMEA.
+- The floating-point additions, the last batch: VMLA, VMLS, VNMLA and VNMLS in F32 and F64; VCVTB
+  and VCVTT between half precision and single or double precision, both directions; and FLDMX and
+  FSTMX, the odd-word-count forms of VLDM and VSTM.
 - Each batch was compared with an independent emulator (Unicorn, which is QEMU underneath) and
   with the reviewer's own model (issue 77). One difference is left on purpose: for SMLAD I follow
   the manual's rule for the Q flag, which differs from the older QEMU inside Unicorn (details in
@@ -115,9 +118,8 @@ commits 001a7bf, aafbce9, 8fc5d97 and e3e8936; the core fixes in the last bullet
   writes (issue 78, ARM B1.4.1), and one cycle rule for LDM, LDMDB and POP (1 + N, plus 3 for a
   load of PC).
 
-What is still missing: the floating-point additions VMLA, VMLS, VNMLA, VNMLS, VCVTB, VCVTT, FLDMX
-and FSTMX (the last batch of issue 77), an MPU model, and the Device and Strongly-ordered memory
-types, as the core has none.
+What is still missing: an MPU model, and the Device and Strongly-ordered memory types, as the
+core has none.
 
 ## Speed
 
@@ -166,8 +168,8 @@ The open issues at 208c7fb, from `gh issue list --state open --limit 100`:
 - Speed and timing: 74 (the JIT), 15 (the speed of the machine's bus path), 16 (zmu fidelity gaps
   found while integrating), 65 (memory wait states), 72 (WFI never sleeps), 76 (timer clocks do
   not follow the RCC).
-- The CPU core: 77 (the DSP extension: batches 1 to 4 are done and one batch is left, the
-  floating-point additions listed under "The CPU core"), 59 (zmu follow-ups after dec44de, to
+- The CPU core: 77 (the DSP extension and the missing base instructions: done, in five batches,
+  the last one the floating-point additions), 59 (zmu follow-ups after dec44de, to
   check against the ARMv7-M manual), 17 (readable disassembly in the trace).
 - Console and input: 66 (console input arrives faster than the baud rate), 48 (pasted lines are
   joined), 47 (a hard fault on `ESC O D`, the SS3 left arrow), 62 (keyboard follow-ups), 53 (USB

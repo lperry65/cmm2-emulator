@@ -124,6 +124,10 @@ pub(crate) const IXC: u32 = 1 << 4;
 pub(crate) const IDC: u32 = 1 << 7;
 pub(crate) const FZ: u32 = 1 << 24;
 pub(crate) const DN: u32 = 1 << 25;
+// FPSCR bit 26, the alternate half-precision mode. The manual calls it AHP in the FPSCR
+// description and "AH" in the A2.5 conversion pseudocode; the model reads it nowhere, and
+// test_ahp_seeded_conversions_stay_on_the_ieee_path pins that.
+pub(crate) const AHP: u32 = 1 << 26;
 // The FPSCR rounding mode field, which sits in bits 22 and 23, and the bits of the flags.
 pub(crate) const RP: u32 = 1 << 22;
 pub(crate) const RM: u32 = 2 << 22;

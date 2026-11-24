@@ -235,7 +235,9 @@ pub(crate) fn round<T: FloatOps>(value: Real, rounding: FPRounding, flush: bool)
     let exponent = value.exp + top_bit(value.sig);
     let min_exponent = 1 - T::BIAS;
     let tiny = exponent < min_exponent;
-    if tiny && flush {
+    // FPRound (A2.5) flushes a tiny result only for the 32- and 64-bit formats: a half-precision
+    // result is kept as a denormal however flush-to-zero is set.
+    if tiny && flush && T::n() != 16 {
         return Packed {
             bits: T::fp_zero(sign),
             underflow: true,

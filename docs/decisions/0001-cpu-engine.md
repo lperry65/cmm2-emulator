@@ -113,14 +113,18 @@ have been overtaken:
   and `CFSR.UNALIGNED` with escalation to a HardFault. The same commit stops the DWT cycle counter
   in sleep unless `DBGSLEEP_D1` is set (WFI does not sleep yet, issue 72) and fixes two
   reset-related bugs.
-- - The ARMv7E-M DSP instructions are in (issue 77, batches 1 to 4, commits 001a7bf, aafbce9,
-  8fc5d97 and e3e8936; the core fixes below are from 4bd964d). Galactic Raiders used to stop at an
+- - The ARMv7E-M DSP instructions are in (issue 77, batches 1 to 4 in commits 001a7bf, aafbce9,
+  8fc5d97 and e3e8936, and the fifth batch, the floating-point additions, with this work; the
+  core fixes below are from 4bd964d). Galactic Raiders used to stop at an
   instruction that was missing. It was UQSUB8 (A7.7.210; the reviewer first read it as UQADD8), and
   the whole extension was missing, not one instruction. Now the core has the 36 parallel add and
   subtract instructions, QADD, QSUB, QDADD and QDSUB, SMMUL, SMMLA and SMMLS with their R forms,
   USAD8 and USADA8, SXTB16, SXTAB16, UXTB16 and UXTAB16, SSAT16 and USAT16 (they used to decode as
   the wrong instruction), SMULW, SMLAW, SMUAD, SMUSD, SMLAD, SMLSD, SMLALD, SMLSLD, SMLALBB,
-  SMLALBT, SMLALTB, SMLALTT, UMAAL, and LDMDB (LDMEA). Each batch was compared with an independent
+  SMLALBT, SMLALTB, SMLALTT, UMAAL, and LDMDB (LDMEA); and, with the fifth batch, VMLA, VMLS,
+  VNMLA and VNMLS in F32 and F64, VCVTB and VCVTT between half precision and single or double
+  precision, and FLDMX and FSTMX.
+  Each batch was compared with an independent
   emulator (Unicorn, which is QEMU underneath) and with the reviewer's own model (issue 77). For
   SMLAD I follow the manual's rule for the Q flag, which differs from the older QEMU inside Unicorn.
 - - Wrong decodes were fixed in the same work: CSDB and the unallocated hints no longer decode as a
@@ -131,11 +135,10 @@ have been overtaken:
   IT state after an exception return (issue 79), the write back of LDM before a load of PC (issue
   80) and SP bits 1:0 (read as zero, writes ignored, issue 78) are fixed, and LDM, LDMDB and POP
   follow one cycle rule (1 + N, plus 3 for a load of PC).
-- - What is still missing in the core: the floating-point additions VMLA, VMLS, VNMLA, VNMLS, VCVTB,
-  VCVTT, FLDMX and FSTMX (the last batch of issue 77; the `fstmiax` that the text above calls
-  undecoded is one of them: it is now a coprocessor instruction that raises a fault), an MPU model,
-  and the Device and Strongly-ordered memory types, as the core has none. Issue 59 holds the other
-  core follow-ups.
+- - The floating-point additions are in now too (the last batch of issue 77), so the `fstmiax`
+  that the text above calls undecoded runs instead of raising a fault. What is still missing in
+  the core: an MPU model, and the Device and Strongly-ordered memory types, as the core has none.
+  Issue 59 holds the other core follow-ups.
 - - Every change I made to the core is listed in `crates/zmu_cortex_m/NOTICE.md`, which has grown
   well past the spike patch: the interrupt count is 240 now, the fidelity fixes came from checking
   the core against the ARMv7-M manual, and so on.

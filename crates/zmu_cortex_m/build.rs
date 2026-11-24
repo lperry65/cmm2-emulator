@@ -159,6 +159,10 @@ const RESOLVED_OVERLAPS: &[(&str, &str)] = &[
     ("MRRC2_t2", "LDC2_lit_t2"),
     // VLDM with Rn = PC is the literal space of LDC (VLDM refuses Rn = PC itself)
     ("LDC_lit_t1", "VLDM_t2"),
+    // the offset forms of VLDR and VSTR (P = 1, W = 0) sit inside the Decrement Below pattern
+    // of the word-list forms, and are matched before it
+    ("VLDR_t1", "VLDM_t1"),
+    ("VSTR_t1", "VSTM_t1"),
     // ADD SP, SP, SP: T2 says Rm = SP is T1
     ("ADD_reg_sp_t1", "ADD_reg_sp_t2"),
 ];
@@ -453,17 +457,39 @@ fn main() -> Result<(), Box<dyn Error>> {
             ("111011101.110111....101.11.0....", "VCVT_ds_t1"),
             ("111011101.111.......101..1.0....", "VCVT_t1"),
             ("111011101.111.1.....101..1.0....", "VCVT_fixed_t1"),
-            //("111011101.11001.....101..1.0....": "VCVTB"),
+            ("111011101.110011....101.01.0....", "VCVTB_to_f16_t1"),
+            ("111011101.110011....101.11.0....", "VCVTT_to_f16_t1"),
+            ("111011101.110010....101.01.0....", "VCVTB_from_f16_t1"),
+            ("111011101.110010....101.11.0....", "VCVTT_from_f16_t1"),
             ("111011101.00........101..0.0....", "VDIV_t1"),
             ("111011101.10........101..1.0....", "VFMS_t1"),
             ("111011101.10........101..0.0....", "VFMA_t1"),
             ("111011101.01........101..0.0....", "VFNMS_t1"),
             ("111011101.01........101..1.0....", "VFNMA_t1"),
+            ("111011100.00........101..0.0....", "VMLA_t1"),
+            ("111011100.00........101..1.0....", "VMLS_t1"),
+            ("111011100.01........101..1.0....", "VNMLA_t1"),
+            ("111011100.01........101..0.0....", "VNMLS_t1"),
             ("1110111011110001....101000010000", "VMRS"),
             ("1110111011100001....101000010000", "VMSR"),
-            ("1110110....1........1011.......0", "VLDM_t1"),
+            // The word-list forms, split by addressing mode: P = 0, U = 0 with no writeback
+            // belongs to the coprocessor transfer space (LDC and STC, or MRRC and MCRR with
+            // D = 1), which is no word list, and (P = 1, W = 0) is the offset form of VLDR and
+            // VSTR, matched by the more specific patterns below. P == U with writeback is
+            // UNDEFINED (A7.7.235), and the two extra rows per direction keep those words in
+            // this pattern, which refuses them, instead of letting them fall through to the
+            // LDC and STC patterns whose coprocessor field reads the same bits. The last bit
+            // of the word count is not pinned to zero: set, it is the FLDMX and FSTMX form of
+            // D2.3.1, where one word of the range is skipped.
+            ("111011001..1........1011........", "VLDM_t1"),
+            ("111011010..1........1011........", "VLDM_t1"),
+            ("111011000.11........1011........", "VLDM_t1"),
+            ("111011011.11........1011........", "VLDM_t1"),
             ("1110110....1........1010........", "VLDM_t2"),
-            ("1110110....0........1011.......0", "VSTM_t1"),
+            ("111011001..0........1011........", "VSTM_t1"),
+            ("111011010..0........1011........", "VSTM_t1"),
+            ("111011000.10........1011........", "VSTM_t1"),
+            ("111011011.10........1011........", "VSTM_t1"),
             ("1110110....0........1010........", "VSTM_t2"),
             ("11101101..01........1011........", "VLDR_t1"),
             ("11101101..01........1010........", "VLDR_t2"),

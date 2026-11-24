@@ -2,7 +2,10 @@ use super::decode_UDF_t2;
 use crate::core::{
     bits::Bits,
     fpregister::FPRounding,
-    instruction::{Instruction, VCVTFixedParams, VCVTParams, VCVTParamsF32F64, VCVTParamsF64F32},
+    instruction::{
+        Instruction, VCVTFixedParams, VCVTParams, VCVTParamsF16F32, VCVTParamsF16F64,
+        VCVTParamsF32F16, VCVTParamsF32F64, VCVTParamsF64F16, VCVTParamsF64F32,
+    },
     register::{DoubleReg, ExtensionReg, SingleReg},
 };
 
@@ -155,6 +158,95 @@ pub fn decode_VCVT_ds_t1(opcode: u32) -> Instruction {
                 dd,
                 sm: SingleReg::from((vm << 1) | m),
             },
+        }
+    }
+}
+
+// VCVTB and VCVTT (A7.7.231): one half of a single register holds the half-precision number.
+// The destination of the .f16 forms and the source of the forms that read one are single
+// registers numbered like the S banks; the wider operand is a whole register.
+
+/// The bottom half of the source goes to the bottom half of the destination; bit 8 says
+/// whether the source is single or double.
+#[allow(non_snake_case)]
+#[inline(always)]
+pub fn decode_VCVTB_to_f16_t1(opcode: u32) -> Instruction {
+    decode_vcvt_half(opcode, false, false)
+}
+
+/// The top half of the source goes to the bottom half of the destination.
+#[allow(non_snake_case)]
+#[inline(always)]
+pub fn decode_VCVTT_to_f16_t1(opcode: u32) -> Instruction {
+    decode_vcvt_half(opcode, false, true)
+}
+
+/// The bottom half of the source goes to the whole destination.
+#[allow(non_snake_case)]
+#[inline(always)]
+pub fn decode_VCVTB_from_f16_t1(opcode: u32) -> Instruction {
+    decode_vcvt_half(opcode, true, false)
+}
+
+/// The top half of the source goes to the whole destination.
+#[allow(non_snake_case)]
+#[inline(always)]
+pub fn decode_VCVTT_from_f16_t1(opcode: u32) -> Instruction {
+    decode_vcvt_half(opcode, true, true)
+}
+
+fn decode_vcvt_half(opcode: u32, from_f16: bool, top: bool) -> Instruction {
+    let vm = opcode.get_bits(0..4) as u8;
+    let m = u8::from(opcode.get_bit(5));
+    let sz = opcode.get_bit(8);
+    let vd = opcode.get_bits(12..16) as u8;
+    let d = u8::from(opcode.get_bit(22));
+    let sd = SingleReg::from((vd << 1) | d);
+    let sm = SingleReg::from((vm << 1) | m);
+
+    if from_f16 {
+        if sz {
+            let Some(dd) = DoubleReg::new((d << 4) | vd) else {
+                return decode_UDF_t2(opcode);
+            };
+            if top {
+                Instruction::VCVTT_f64_f16 {
+                    params: VCVTParamsF64F16 { dd, sm },
+                }
+            } else {
+                Instruction::VCVTB_f64_f16 {
+                    params: VCVTParamsF64F16 { dd, sm },
+                }
+            }
+        } else if top {
+            Instruction::VCVTT_f32_f16 {
+                params: VCVTParamsF32F16 { sd, sm },
+            }
+        } else {
+            Instruction::VCVTB_f32_f16 {
+                params: VCVTParamsF32F16 { sd, sm },
+            }
+        }
+    } else if sz {
+        let Some(dm) = DoubleReg::new((m << 4) | vm) else {
+            return decode_UDF_t2(opcode);
+        };
+        if top {
+            Instruction::VCVTT_f16_f64 {
+                params: VCVTParamsF16F64 { sd, dm },
+            }
+        } else {
+            Instruction::VCVTB_f16_f64 {
+                params: VCVTParamsF16F64 { sd, dm },
+            }
+        }
+    } else if top {
+        Instruction::VCVTT_f16_f32 {
+            params: VCVTParamsF16F32 { sd, sm },
+        }
+    } else {
+        Instruction::VCVTB_f16_f32 {
+            params: VCVTParamsF16F32 { sd, sm },
         }
     }
 }
