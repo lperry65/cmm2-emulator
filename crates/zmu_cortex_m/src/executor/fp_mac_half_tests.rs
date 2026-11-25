@@ -1042,7 +1042,7 @@ fn test_a_skipped_half_conversion_changes_nothing() {
 // low bit and the offset keeps it).
 
 #[test]
-fn test_fldmx_loads_eight_doubles_and_moves_by_nineteen_words() {
+fn test_fldmx_loads_eight_doubles_and_moves_by_seventeen_words() {
     let mut processor = fpu();
     let base = 0x2000_0100;
     for word in 0..17u32 {
@@ -1069,7 +1069,7 @@ fn test_fldmx_loads_eight_doubles_and_moves_by_nineteen_words() {
 }
 
 #[test]
-fn test_fstmx_stores_eight_doubles_and_moves_by_nineteen_words() {
+fn test_fstmx_stores_eight_doubles_and_moves_by_seventeen_words() {
     let mut processor = fpu();
     let base = 0x2000_0100;
     let sentinel = 0xdead_beef_u32;

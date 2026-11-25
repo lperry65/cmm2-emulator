@@ -721,10 +721,10 @@ also on, `build.rs` stops.
   instructions that give UNDEFINSTR (FPU on) or NOCP (off). The firmware has both as real code
   (libgcc's `__gnu_Unwind_Restore_VFP` and `__gnu_Unwind_Save_VFP`), reached only by EHABI
   unwinding, which MMBasic does not do. FP batch 5 (below) implements them as the odd word count
-  forms of VLDM and VSTM. The FP decode is untouched
-  (the FP tests pass unchanged); 12 FP encodings that llvm calls invalid decode as FP here, as they
-  did before. Executed on the core with CPACR at reset: every kind x 14 numbers gives CFSR.NOCP and
-  the UsageFault with registers and memory untouched.
+  forms of VLDM and VSTM. Batch 4 left the FP decode alone (its FP tests passed unchanged);
+  the batch-5 block below changes it deliberately. 12 FP encodings that llvm calls invalid decode
+  as FP here, as they did before. Executed on the core with CPACR at reset: every kind x 14
+  numbers gives CFSR.NOCP and the UsageFault with registers and memory untouched.
 - MSR and MRS (B5.2.2, B5.2.3): MSR now refuses Rn = SP or PC and a SYSm outside 0 to 3, 5 to 9 and
   16 to 20 (for any mask), and MRS refuses Rd = SP or PC and the same SYSm set; all UDF. The MRS
   decoder also read Rd from five bits (8..13); it is four now (cosmetic: the table pattern fixes
@@ -749,12 +749,14 @@ also on, `build.rs` stops.
   hook is a stub), and the hint executor's condition check (it only changes the result kind of a
   skipped hint). Five planted bugs in the Unicorn comparison were all seen.
  - FP batch 5 (issue 77, the last batch): VMLA, VMLS, VNMLA and VNMLS in F32 and F64 (A7.7.238,
-   A7.7.250); VCVTB and VCVTT between half precision and single or double precision, both
-   directions (A7.7.231); and FLDMX and FSTMX, the odd-word-count forms of VLDM and VSTM (D2.3.1,
-   the `imm8<0> = 1` case the VLDM page calls SEE FLDMX). The patterns are 16 new table rows,
-   confirmed word for word against llvm-mc. `decoder/vmla.rs` and `decoder/vcvt.rs` wrappers
-   decode the operands (Vd and Vm with the D and M extension bits); destinations outside the
-   register bank of the built profile decode as UDF.
+   A7.7.250); VCVTB and VCVTT between half precision and single or double precision, both directions
+   (A7.7.231); and FLDMX and FSTMX, the odd-word-count forms of VLDM and VSTM (D2.3.1, the `imm8<0>
+   = 1` case the VLDM page calls SEE FLDMX). The patterns are 16 added table rows — 4
+   multiply-accumulate, 4 F16 convert, and 8 word-list, of the latter 4 the `P == U` reject rows —
+   replacing the 2 wildcard word-list rows the 8 split, net 14; confirmed word for word against
+   llvm-mc. `decoder/vmla.rs` and `decoder/vcvt.rs` wrappers decode the operands (Vd and Vm with the
+   D and M extension bits); destinations outside the register bank of the built profile decode as
+   UDF.
  - The multiply-accumulate executes the legacy pseudocode, not the FMA one: the product is
    rounded first, and the negation of VMLS, VNMLA and VNMLS is a sign-bit flip (FPNeg, A2.5) of
    the rounded product, of the accumulator, or of both — never a fused multiply-add and never a
@@ -786,36 +788,49 @@ also on, `build.rs` stops.
    00 or 11 and W (bit 21) to 1, and the load/store bit (bit 20) to 1 on the load rows and 0 on the
    store rows. They keep the words inside the word-list pattern, which refuses them, so they decode
    as UDF. `P = 0, U = 0` belongs to the 64-bit transfers (MRRC and MCRR with D = 1, UDF with D = 0)
-   and `P = 1, W = 0` to VLDR and VSTR. The split changed the decode space beyond the word list: a
+   and `P = 1, W = 0` to VLDR and VSTR. The split changed the decode space beyond the word list. A
    diff of every decode the table can reach (hw1 0xEC00-0xEFFF and 0xFC00-0xFFFF against every hw2,
-   134,217,728 words, batch against pre-batch) shows 42,336 coprocessor-11 words — 21,952 MCRR and
-   20,384 MRRC, hw1 0xEC40-0xEC5F — that decoded as UNDEFINED before the batch and decode as
-   coprocessor transfers with it; llvm-mc's assembler emits these encodings (its disassembler
-   rejects some, the six words noted below). Two batch-4 test entries that used a `P == U, W = 1`
-   lookalike as a "not the FPU" example were replaced with llvm-encoded MRRC words.
+   134,217,728 words, batch against pre-batch) moves 918,880 words between decode classes. The four
+   groups, each sampled back through both decoders: 710,976 the pre-batch table decoded as LDC, STC
+   or CDP for coprocessor 11 now decode as UNDEFINED; counted exhaustively against the new table
+   rows: 245,760 match one of the four reject rows, 348,480 an accepted split word-list row and are
+   refused there — 2,816 with a word count under one double and 345,664 with a list running past D15
+   — and 116,736 a new MAC or F16-convert row naming D16-D31 beyond the 16-double bank; the three
+   parts sum to the group. Separately 153,600 it decoded as CDP are now the new MAC and F16-convert
+   instructions; 11,968 it decoded as LDC and STC decode as VLDM and VSTM — every one of them
+   odd-count, the FLDMX and FSTMX forms; and 42,336 that decoded as UNDEFINED — 21,952 MCRR and
+   20,384 MRRC, hw1 0xEC40-0xEC5F — decode as coprocessor transfers, encodings llvm-mc's assembler
+   emits (its disassembler rejects some, the six words noted below). Two batch-4 test entries that
+   used a `P == U, W = 1` lookalike as a "not the FPU" example were replaced with llvm-encoded MRRC
+   words.
  - Checks for batch 5: 84,000 vectors against a Unicorn 2.1.5 oracle (12,000 each: the four MAC
    operations in each width, the VCVT half conversions in both directions and widths, and
-   FLDMX/FSTMX) — all 84,000 bit-exact on the spilled D-register words, the FPSCR flags and
-   mode bits, the 16-word memory window and the core registers R0-R12, SP and LR. PC is read
-   but not compared: the two sides map the vector blob at different addresses, so its absolute
-   value can never match; the Unicorn side proves each blob ran exactly to its stop address
-   instead. The harness asserts per vector that the FPSCR it writes has reached the oracle
-   before the vector runs — Unicorn initialises FP state lazily, and a write before the first
-   FP instruction is dropped: an unwarmed first harness ran each bucket's first vector with
-   FPSCR = 0 and reported five mismatches that were harness artifacts, not behaviours of the
-   oracle. A review-side harness built independently compares the base registers of the
-   transfers directly: it reports 0 mismatches in 25,000 vectors for each MAC kind and 20,000
-   FLDMX/FSTMX vectors, and catches two planted bugs. The corrected harness, its inputs,
-   results and logs live under spikes/oracle-b5/ (locally excluded from git). A decode sweep of
-   5,200 words against llvm-mc (encode, disassemble, compare with zmu decode and Display) found no
-   decode mismatch; six words are cases where llvm-mc's disassembler rejects MCRR and MRRC
+   FLDMX/FSTMX) — all 84,000 bit-exact on the spilled D-register words, the FPSCR under the compare
+   mask only (cumulative exception flags, IDC, rounding mode, FZ, DN — not the whole word), the
+   16-word memory window and the core registers R0-R12, SP and LR. The transfer base of the
+   FLDMX/FSTMX buckets is the first word of the compared window, so the stores of the IA forms land
+   inside it while the stores of the DB forms, which run downwards from the base, land below it:
+   those stored words are verified through the spilled D registers only, not in memory. PC is read
+   but not compared: the two sides map the vector blob at different addresses, so its absolute value
+   can never match; the Unicorn side proves each blob ran exactly to its stop address instead. The
+   harness asserts per vector that the FPSCR it writes has reached the oracle before the vector runs
+   — Unicorn initialises FP state lazily, and a write before the first FP instruction is dropped: an
+   unwarmed first harness ran each bucket's first vector with FPSCR = 0 and reported five mismatches
+   that were harness artifacts, not behaviours of the oracle. A reviewer also ran a harness of their
+   own, built independently, which compares the transfer base registers directly; it lives outside
+   this repo and is not re-runnable here, so its figures are quoted as reported: 0 mismatches in
+   25,000 vectors for each MAC kind and 20,000 FLDMX/FSTMX vectors, two planted bugs caught. What is
+   on disk and re-runnable is this crate's own harness and its run. The corrected harness, its
+   inputs, results and logs live under spikes/oracle-b5/ (locally excluded from git). A decode sweep
+   of 5,200 words against llvm-mc (encode, disassemble, compare with zmu decode and Display) found
+   no decode mismatch; six words are cases where llvm-mc's disassembler rejects MCRR and MRRC
    encodings its own assembler emits. Twelve planted bugs in the new code (the MAC negations and
    operand order, the half-word extract and store, the F16 FZ guard, FPNeg, the IA and DB base
    arithmetic, the FLDMX word count, the PU reject row, the VCVTT half flag) were run against the
-   suite: ten were caught at once, the operand-order one survived until a NaN-payload test was
-   added for it, and the one that rewrote a table row tripped the table's duplicate-pattern guard
-   so it was replaced by the equivalent decoder-wrapper mutation, which was caught. The firmware
-   tests print the same 33 instruction-count lines as before batch 5.
+   suite: ten were caught at once, the operand-order one survived until a NaN-payload test was added
+   for it, and the one that rewrote a table row tripped the table's duplicate-pattern guard so it
+   was replaced by the equivalent decoder-wrapper mutation, which was caught. The firmware tests
+   print the same 33 instruction-count lines as before batch 5.
 
 `cargo clippy -p zmu_cortex_m --all-targets -- -D warnings` is clean (the crate denies
 `clippy::pedantic`; the test code had unseparated long literals, `assert!` with `==`, and a few
