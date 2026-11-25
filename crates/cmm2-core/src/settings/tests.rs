@@ -462,6 +462,78 @@ fn the_hash_gate_fires_on_a_wrong_length_or_hash_and_names_both() {
     );
 }
 
+// Every byte of the hash counts: a gate that looked at the first half only would take another
+// image's settings.
+#[test]
+fn the_hash_gate_compares_every_byte_of_the_hash() {
+    let image = synthetic_image(1 << 16);
+    for byte in [0usize, 15, 16, 31] {
+        let mut file = encoded_sample(&image);
+        file[12 + byte] ^= 0x01;
+        assert!(
+            matches!(
+                decode_v2(&file, &image, &B5),
+                Err(SettingsError::Mismatch { .. })
+            ),
+            "a hash that differs in byte {byte} only is another image's"
+        );
+    }
+}
+
+// An entry is whole inside one region: at the edges of every region of both profiles, the first
+// and last rows are taken, and a row past either end, or an entry that runs over one, is not.
+#[test]
+fn entries_are_accepted_only_whole_inside_a_region() {
+    let image = synthetic_image(1 << 16);
+    let row = ROW as u32;
+    for profile in [&B5, &RC6] {
+        let read = |addr: u32, len: u32| {
+            let settings = Settings {
+                entries: vec![(addr, vec![0x5A; len as usize])],
+                clock: [0, 0],
+                ds3231: None,
+            };
+            decode_v2(&encode(&image, &sha256(&image), &settings), &image, profile)
+        };
+        for region in profile.regions {
+            let end = region.addr + region.len;
+            let name = format!("{} region at {:#010X}", profile.name, region.addr);
+            assert!(read(region.addr, row).is_ok(), "{name}: the first row");
+            assert!(read(end - row, row).is_ok(), "{name}: the last row");
+            assert!(read(end, row).is_err(), "{name}: one row past the end");
+            assert!(
+                read(region.addr - row, row).is_err(),
+                "{name}: one row before"
+            );
+            assert!(
+                read(end - row, 2 * row).is_err(),
+                "{name}: runs one row over the end"
+            );
+            assert!(
+                read(region.addr - row, 2 * row).is_err(),
+                "{name}: starts one row before"
+            );
+        }
+        // The last region ends where flash does: an entry there that runs past it would write
+        // beyond the flash.
+        let last = profile.regions.last().unwrap();
+        assert_eq!(last.addr + last.len, 0x0820_0000, "{}", profile.name);
+        assert!(
+            read(0x081F_FFE0, 64).is_err(),
+            "{}: past the end of flash",
+            profile.name
+        );
+        // An entry that spans two regions is refused too, whatever lies between them.
+        let (first, second) = (profile.regions[0], profile.regions[1]);
+        let span = second.addr + row - first.addr;
+        assert!(
+            read(first.addr, span).is_err(),
+            "{}: spans two regions",
+            profile.name
+        );
+    }
+}
+
 #[test]
 fn an_unknown_saved_firmware_is_named_as_unknown() {
     let image = synthetic_image(1 << 16);

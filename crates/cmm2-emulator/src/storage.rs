@@ -2,15 +2,17 @@
 
 use crate::args::RunOptions;
 use crate::atomic_write::{
-    create_new_atomically, remove_stale_temps, replace_atomically, write_atomically,
+    create_new_atomically, remove_stale_temps, remove_stale_temps_beside, replace_atomically,
+    write_atomically,
 };
 use crate::error::{RunError, say};
-use crate::saveable::{access, check_regular, why_not_saveable};
+use crate::saveable::{access, check_regular, why_not_replaceable, why_not_saveable};
 use cmm2_core::{
     Cpu, FileKind, MAGIC, MIN_IMAGE_SIZE, NoLayout, PersistentError, PersistentSizeError, Profile,
     SdSlot, SettingsError, classify, decode_v2,
 };
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 /// Loads the saved flash and clock from the `--flash` file. A file that is not there yet is the
@@ -30,13 +32,25 @@ pub(crate) fn load_flash(cpu: &mut Cpu, path: &str) -> Result<(), RunError> {
         });
     }
     check_regular(path).map_err(flash_error)?;
-    if let Some(why) = why_not_saveable(path) {
+    // The v2 save replaces the name it is given and does not follow a link there, so the board's
+    // file is judged, and its stale temporary files cleared, in the directory of that name; the
+    // raw save writes through a link, and uses the directory the link leads to.
+    let v2 = cpu.settings_v2();
+    if let Some(why) = if v2 {
+        why_not_replaceable(path)
+    } else {
+        why_not_saveable(path)
+    } {
         return Err(flash_error(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("{why}, so the run could not save its flash and clock"),
         )));
     }
-    remove_stale_temps(path);
+    if v2 {
+        remove_stale_temps_beside(path);
+    } else {
+        remove_stale_temps(path);
+    }
     // A file is measured before it is read, because the bound is the format's and not the
     // file's: nothing larger than the longest file either format can be is a settings file, and
     // a stranger's huge file should cost a `stat`. A file that cannot be measured is left for
@@ -59,7 +73,7 @@ pub(crate) fn load_flash(cpu: &mut Cpu, path: &str) -> Result<(), RunError> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(source) => return Err(flash_error(source)),
     };
-    if cpu.settings_v2() {
+    if v2 {
         return load_v2(cpu, path, &bytes);
     }
     // The raw layout, read as always, except that a file with the v2 magic is not raw: nothing
@@ -112,16 +126,22 @@ fn load_v2(cpu: &mut Cpu, path: &str, bytes: &[u8]) -> Result<(), RunError> {
     }
 }
 
-/// A refusal's error. A corrupt file also names the copy of the old settings that can be
-/// restored, when that copy is there: the first backup name, the `--flash` path with `.v1` on
-/// the end, whatever that path was called.
+/// A refusal's error. A corrupt file also lists the copies of older settings that sit beside it,
+/// if there are any, as ways back: they are named as they are, the `--flash` path with `.v1` or
+/// `.v1.2` and so on on the end, whatever that path was called.
 fn settings_error(path: &str, source: SettingsError) -> RunError {
-    let backup = backup_name(path, 1);
-    let worth_naming = matches!(source, SettingsError::Corrupt(_)) && Path::new(&backup).exists();
+    let backups = if matches!(source, SettingsError::Corrupt(_)) {
+        (1..=MAX_BACKUPS)
+            .map(|n| backup_name(path, n))
+            .filter(|name| std::fs::symlink_metadata(name).is_ok_and(|m| m.file_type().is_file()))
+            .collect()
+    } else {
+        Vec::new()
+    };
     RunError::Settings {
         path: path.to_string(),
         source: Box::new(source),
-        backup: worth_naming.then_some(backup),
+        backups,
     }
 }
 
@@ -237,12 +257,15 @@ fn keep_backup(
 /// copy: every check first, then the backup, then the live file. A crash between two steps leaves
 /// the old file or the new one, never half of either.
 fn migrate(cpu: &mut Cpu, path: &str, original: &[u8]) -> Result<(), RunError> {
+    // The copy is as private as the file it copies: the mode of the file as it was read, which
+    // the live file is about to stop being.
+    let mode = std::fs::metadata(path).map_or(0o600, |meta| meta.mode() & 0o777);
     migrate_with(
         cpu,
         path,
         original,
         Cpu::save_settings,
-        create_new_atomically,
+        |name, bytes| create_new_atomically(name, bytes, mode),
         read_file,
         replace_atomically,
     )

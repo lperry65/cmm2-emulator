@@ -249,11 +249,11 @@ fn the_temporary_file_of_a_save_is_locked_while_it_is_open() {
     let dir = scratch("locked-temp");
     let _alone = spawning();
     let temp = dir.join(".cmm2.4242.1.tmp");
-    let file = create_locked(&temp).unwrap();
+    let file = create_locked(&temp, None).unwrap();
 
     // Nothing else can lock it, and it is the file that is made new, never one taken over.
     assert!(!try_lock(&File::open(&temp).unwrap()));
-    assert!(create_locked(&temp).is_err());
+    assert!(create_locked(&temp, None).is_err());
 
     drop(file);
     assert!(try_lock(&File::open(&temp).unwrap()));
@@ -286,11 +286,11 @@ fn a_new_file_is_made_and_a_name_that_is_taken_is_never_replaced() {
     let target = dir.join("a");
     let path = target.to_str().unwrap();
 
-    create_new_atomically(path, b"first").unwrap();
+    create_new_atomically(path, b"first", 0o600).unwrap();
     assert_eq!(std::fs::read(&target).unwrap(), b"first");
     assert_eq!(files_in(&dir), ["a"], "no temporary file is left");
 
-    let err = create_new_atomically(path, b"second").unwrap_err();
+    let err = create_new_atomically(path, b"second", 0o600).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     assert_eq!(std::fs::read(&target).unwrap(), b"first");
     assert_eq!(
@@ -303,7 +303,7 @@ fn a_new_file_is_made_and_a_name_that_is_taken_is_never_replaced() {
     let victim = dir.join("victim");
     std::fs::write(&victim, b"theirs").unwrap();
     symlink(&victim, dir.join("link")).unwrap();
-    let err = create_new_atomically(dir.join("link").to_str().unwrap(), b"x").unwrap_err();
+    let err = create_new_atomically(dir.join("link").to_str().unwrap(), b"x", 0o600).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     assert_eq!(std::fs::read(&victim).unwrap(), b"theirs");
 }

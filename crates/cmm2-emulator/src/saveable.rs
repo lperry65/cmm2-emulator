@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Whether a path cannot be that of a file: it is empty, or ends in a slash, or in . or .., which
 /// is a directory even if there is nothing there yet to say so.
@@ -131,9 +131,18 @@ fn has_cap_fowner() -> bool {
 /// or append-only, and not another user's in a sticky directory). The file's own permissions do
 /// not matter to that. What cannot be seen from here (a full disk, say) is left to the save.
 pub(crate) fn why_not_saveable(path: &str) -> Option<String> {
-    let target = match resolve(Path::new(path)) {
-        Ok(target) => target,
-        Err(err) => return Some(why_path_failed(&err, Path::new(path), NOT_SEARCHABLE)),
+    why_not_saveable_as(path, true)
+}
+
+/// `why_not_saveable`, for a save that follows a link at `path` (`follow`) or replaces it.
+fn why_not_saveable_as(path: &str, follow: bool) -> Option<String> {
+    let target = if follow {
+        match resolve(Path::new(path)) {
+            Ok(target) => target,
+            Err(err) => return Some(why_path_failed(&err, Path::new(path), NOT_SEARCHABLE)),
+        }
+    } else {
+        PathBuf::from(path)
     };
     // A link can point at a name that is not one (`ln -s newfile/ link`), which the name given
     // does not show.
@@ -177,8 +186,15 @@ pub(crate) fn why_not_saveable(path: &str) -> Option<String> {
     }
     // What is known of the file without opening it comes first, as a file that cannot be read
     // (which `check_regular` has already said) has its attributes too.
-    let file_meta = std::fs::metadata(&target).ok()?;
-    if File::open(&target).is_ok_and(|file| is_immutable(&file)) {
+    let file_meta = if follow {
+        std::fs::metadata(&target)
+    } else {
+        std::fs::symlink_metadata(&target)
+    }
+    .ok()?;
+    // A link itself has no attribute flags (`chattr` refuses one), so only what it leads to
+    // could be immutable, and a save that replaces the link does not touch that.
+    if !file_meta.is_symlink() && File::open(&target).is_ok_and(|file| is_immutable(&file)) {
         return Some("the file is immutable or append-only".to_string());
     }
     // SAFETY: geteuid has no arguments and cannot fail.
@@ -191,6 +207,14 @@ pub(crate) fn why_not_saveable(path: &str) -> Option<String> {
         has_cap_fowner(),
     )
     .then(|| "its directory is sticky and the file is another user's".to_string())
+}
+
+/// `why_not_saveable` for a file that is replaced and not written through (`replace_atomically`:
+/// the board's v2 settings). A link at the name is not followed by the save, so it is judged as
+/// the thing that is replaced: by its own directory, where the temporary file is made, and by its
+/// own owner for the sticky bit, and not by where it leads.
+pub(crate) fn why_not_replaceable(path: &str) -> Option<String> {
+    why_not_saveable_as(path, false)
 }
 
 #[cfg(test)]

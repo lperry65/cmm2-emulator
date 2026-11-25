@@ -4,7 +4,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use cmm2_core::{B5, Cpu, Firmware, Irqs, cmm2_memory};
+use cmm2_core::{B5, Cpu, Firmware, Irqs, Profile, cmm2_memory};
 
 // A directory under the temp directory that is this test's own, removed when it is dropped, a
 // failed test too (a test that ends the process with `_exit`, as `in_own_process`'s child does,
@@ -59,14 +59,19 @@ pub(crate) fn mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-// A machine that does nothing, with `options` for its files.
+// A machine that does nothing, with the settings layout of b5.
 pub(crate) fn idle_cpu() -> Cpu {
+    idle_cpu_with(&B5)
+}
+
+// A machine that does nothing, with the settings layout of `profile`.
+pub(crate) fn idle_cpu_with(profile: &'static Profile) -> Cpu {
     let mut image = vec![0; 64];
     image[..4].copy_from_slice(&0x2000_8000u32.to_le_bytes());
     image[4..8].copy_from_slice(&0x0800_0021u32.to_le_bytes());
     let irqs = Irqs::new();
     Cpu::new(
-        &Firmware::from_bytes(image).unwrap().with_profile(&B5),
+        &Firmware::from_bytes(image).unwrap().with_profile(profile),
         cmm2_memory(&irqs),
         irqs,
     )

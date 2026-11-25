@@ -92,3 +92,59 @@ fn an_ordinary_directory_is_not_append_only() {
     assert!(!is_immutable(&File::open(&dir).unwrap()));
     assert_eq!(why_not_saveable(dir.join("flash").to_str().unwrap()), None);
 }
+
+// A name that a save replaces and does not follow is judged by its own directory, and a link at it
+// is judged as the thing the save replaces: by its own owner, not its target's. No second user is
+// to be had here, so what is tried is a link of this user's in the sticky /tmp, pointing at a file
+// of another user's: the link's owner is the caller, so it is replaceable. (The decision itself,
+// for a link owned by someone else, is `sticky_refuses`, tried above with every owner.) Skipped
+// where /tmp is not a sticky directory of another user's, or the caller has CAP_FOWNER.
+#[test]
+fn a_link_in_a_sticky_directory_is_judged_by_its_own_owner_and_not_its_targets() {
+    use std::os::unix::fs::MetadataExt;
+    let (dir, target) = (Path::new("/tmp"), Path::new("/etc/passwd"));
+    // SAFETY: geteuid has no arguments and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let (Ok(dir_meta), Ok(target_meta)) = (std::fs::metadata(dir), std::fs::metadata(target))
+    else {
+        eprintln!("skipped: no /tmp or no /etc/passwd");
+        return;
+    };
+    if dir_meta.mode() & libc::S_ISVTX == 0
+        || dir_meta.uid() == me
+        || target_meta.uid() == me
+        || has_cap_fowner()
+    {
+        eprintln!("skipped: /tmp is not a sticky directory of another user's, or no other owner");
+        return;
+    }
+    let link = dir.join(format!("cmm2-main-{}-sticky-link", std::process::id()));
+    let _ = std::fs::remove_file(&link);
+    symlink(target, &link).unwrap();
+
+    let why = why_not_replaceable(link.to_str().unwrap());
+
+    std::fs::remove_file(&link).unwrap();
+    assert_eq!(why, None);
+}
+
+// The name a link at which was once used as a stand-in for "the file in this directory" is not
+// special: a link planted there leads nowhere, because nothing is looked up through it.
+#[test]
+fn a_link_planted_at_the_probe_name_is_never_followed() {
+    if root() {
+        return;
+    }
+    let dir = scratch("probe-link");
+    let (open, locked) = (dir.join("open"), dir.join("locked"));
+    std::fs::create_dir(&open).unwrap();
+    std::fs::create_dir(&locked).unwrap();
+    symlink("../locked/x", open.join(".cmm2.probe")).unwrap();
+    symlink("elsewhere", open.join("settings.flash")).unwrap();
+    mode(&locked, 0o555);
+
+    let why = why_not_replaceable(open.join("settings.flash").to_str().unwrap());
+
+    mode(&locked, 0o755);
+    assert_eq!(why, None, "the directory of the name is writable");
+}

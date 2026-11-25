@@ -41,12 +41,12 @@ pub(crate) enum RunError {
         source: PersistentError,
     },
     /// The settings file was refused as v2 (issue 82): too new, saved for another firmware,
-    /// larger than any settings file is, or corrupt. `backup` names the copy of the old file
-    /// that sits beside it, which is worth saying only when it is there to restore.
+    /// larger than any settings file is, or corrupt. `backups` lists the copies of older settings
+    /// that sit beside it, which is worth saying only when there are any to restore.
     Settings {
         path: String,
         source: Box<SettingsError>,
-        backup: Option<String>,
+        backups: Vec<String>,
     },
     /// A run that reads the raw layout was given a board's v2 file (issue 82): the file is
     /// fine, the run is the wrong kind.
@@ -150,11 +150,18 @@ impl fmt::Display for RunError {
             RunError::Settings {
                 path,
                 source,
-                backup,
+                backups,
             } => {
                 write!(f, "{path}: {source}")?;
-                if let Some(backup) = backup {
-                    write!(f, " Restore {backup} or start fresh by deleting them.")?;
+                if !backups.is_empty() {
+                    write!(
+                        f,
+                        " Older settings are kept beside it: {}. Restoring one of them gives back \
+                         the settings of the time it was made, and everything saved since is \
+                         lost; which one holds the settings you want is for you to say. Or start \
+                         fresh by deleting {path}.",
+                        backups.join(", ")
+                    )?;
                 }
                 Ok(())
             }

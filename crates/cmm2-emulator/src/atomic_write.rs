@@ -43,7 +43,7 @@ const MAX_LINKS: usize = 40;
 /// file's name, and so that two emulators on one file, or a temporary file that an earlier
 /// crash left under a repeated process id (in a container), do not get in the way.
 pub(crate) fn write_atomically(path: &str, bytes: &[u8]) -> io::Result<()> {
-    write_over(path, resolve(Path::new(path))?, bytes, rename_over)
+    write_over(path, resolve(Path::new(path))?, bytes, None, rename_over)
 }
 
 /// `write_atomically`, but a symbolic link at `path` is replaced by the new file and not followed:
@@ -51,22 +51,26 @@ pub(crate) fn write_atomically(path: &str, bytes: &[u8]) -> io::Result<()> {
 /// file in its place in one step. This is for the board's own files, which are the board's
 /// and not the user's to link elsewhere.
 pub(crate) fn replace_atomically(path: &str, bytes: &[u8]) -> io::Result<()> {
-    write_over(path, PathBuf::from(path), bytes, rename_over)
+    write_over(path, PathBuf::from(path), bytes, None, rename_over)
 }
 
 /// Makes a new file at `path` that appears whole or not at all, and never replaces a name that is
 /// taken: the bytes are written to a temporary file as for `write_atomically`, which is then
 /// hard-linked to the name (the link fails with `AlreadyExists` if anything is there, a link
-/// included, which is not followed) and removed. For the copies of old settings.
-pub(crate) fn create_new_atomically(path: &str, bytes: &[u8]) -> io::Result<()> {
-    write_over(path, PathBuf::from(path), bytes, link_to)
+/// included, which is not followed) and removed. For the copies of old settings. The file is made
+/// with `mode` (less what the umask takes away, so never wider), from the start, so that its
+/// bytes are never readable by more than `mode` lets.
+pub(crate) fn create_new_atomically(path: &str, bytes: &[u8], mode: u32) -> io::Result<()> {
+    write_over(path, PathBuf::from(path), bytes, Some(mode), link_to)
 }
 
 /// Puts the finished temporary file at the target's name as a second name for it, which fails if
-/// the name is taken. A file system that has no hard links says EPERM or EOPNOTSUPP (the same number as ENOTSUP on
-/// Linux; no other system's names are handled); that
-/// is told apart from the other errors of the write (a directory that cannot be written is EACCES,
-/// and so is a failed temporary file) by making it `ErrorKind::Unsupported`.
+/// the name is taken. A file system that has no hard links says EPERM or EOPNOTSUPP (the same
+/// number as ENOTSUP on Linux). That is told apart from the other errors of the write (a directory
+/// that cannot be written is EACCES, and so is a failed temporary file) by making it
+/// `ErrorKind::Unsupported`. This is the Linux mapping, and the crate is unix-only today: the
+/// Windows port (issue 75) must revisit it, as a FAT file system there fails with
+/// ERROR_INVALID_FUNCTION, which is not one of these.
 fn link_to(temp: &Path, target: &Path) -> io::Result<()> {
     std::fs::hard_link(temp, target).map_err(|err| match err.raw_os_error() {
         Some(libc::EPERM | libc::EOPNOTSUPP) => {
@@ -85,6 +89,7 @@ fn write_over(
     path: &str,
     target: PathBuf,
     bytes: &[u8],
+    mode: Option<u32>,
     publish: fn(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
     let dir = match target.parent() {
@@ -96,7 +101,7 @@ fn write_over(
         .map_or(0, |since| since.as_nanos());
     let temp = dir.join(format!(".cmm2.{}.{nanos}.tmp", std::process::id()));
 
-    let mut file = create_locked(&temp)?;
+    let mut file = create_locked(&temp, mode)?;
     let written = write_synced(&mut file, &target, bytes).and_then(|()| publish(&temp, &target));
     // A rename has used the temporary file up (this finds nothing); a link has not.
     let _ = std::fs::remove_file(&temp);
@@ -137,8 +142,14 @@ fn try_lock(file: &File) -> bool {
 
 /// Makes the temporary file, which must not be there, and locks it at once, for as long as it is
 /// open, so that `remove_stale_temps` can tell it from one that nobody is writing.
-fn create_locked(temp: &Path) -> io::Result<File> {
-    let file = OpenOptions::new().write(true).create_new(true).open(temp)?;
+fn create_locked(temp: &Path, mode: Option<u32>) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    if let Some(mode) = mode {
+        options.mode(mode);
+    }
+    let file = options.open(temp)?;
     // A file system that has no locks (some network ones) says no, and then the file is simply
     // not protected from the cleanup, which keeps to files it can lock.
     try_lock(&file);
@@ -164,6 +175,16 @@ pub(crate) fn remove_stale_temps(path: &str) {
         return;
     };
     let dir = match target.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    remove_stale_temps_in(dir);
+}
+
+/// `remove_stale_temps` for the directory of the name `path` itself, a link there not followed: for
+/// a file that is replaced and not written through (`replace_atomically`).
+pub(crate) fn remove_stale_temps_beside(path: &str) {
+    let dir = match Path::new(path).parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
     };

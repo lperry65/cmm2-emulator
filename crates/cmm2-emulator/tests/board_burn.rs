@@ -4,6 +4,7 @@ mod common;
 
 use common::board::*;
 use common::*;
+use std::path::PathBuf;
 
 #[test]
 fn a_plain_start_with_nothing_burned_says_how_to_burn_and_where_the_board_is() {
@@ -419,7 +420,8 @@ fn real_rc6_settings_are_the_v2_format_after_two_saves() {
 // The hash gate: burn one release over the settings of another, and the board names both
 // firmwares by hash and leaves the file alone.
 #[test]
-#[ignore = "needs both firmwares: CMM2_FIRMWARE=<path> CMM2_FIRMWARE_RC6=<path> cargo test --release -- --ignored"]
+#[ignore = "needs both firmwares: CMM2_FIRMWARE=<path> CMM2_FIRMWARE_RC6=<path> cargo test \
+            --release -- --ignored"]
 fn a_board_burned_with_another_release_names_both_hashes_and_refuses_the_settings() {
     let home = Home::new("board-mismatch");
     let b5 = Tmp::file("board-mismatch-b5", "bin");
@@ -538,4 +540,103 @@ fn a_plain_start_with_an_unknown_firmware_burned_names_the_firmware_and_how_to_g
             "{scratch_layout:?}"
         );
     }
+}
+
+// Removes a directory tree that a test made, giving its directories back their rights first, so
+// that a failed assertion leaves nothing behind.
+struct Unlock(PathBuf);
+
+impl Drop for Unlock {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in ["L", "T"] {
+            let _ =
+                std::fs::set_permissions(self.0.join(dir), std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+// The v2 save replaces the name it is given and does not follow a link there, so a settings file
+// that is a link is judged by the directory the link is in, and a run that could not save is
+// refused at the start. Two cases: a `--flash` link in a directory that cannot be written, and
+// the board's own `settings.flash` link in a board directory that cannot be written.
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test --release -- --ignored"]
+fn a_symlinked_settings_file_in_a_directory_that_cannot_be_written_is_refused_at_the_start() {
+    use std::os::unix::fs::PermissionsExt;
+    if root() {
+        eprintln!("skipped: root can write in any directory, so none is refused");
+        return;
+    }
+    let home = Home::new("board-ro-link");
+    let copy = Tmp::file("board-ro-link", "bin");
+    std::fs::copy(real_firmware(), &copy.0).unwrap();
+    let burn = quit_run(&home, &["--burn", copy.arg(), "--console", "--run", "1000"]);
+    assert!(burn.status.success(), "{}", stderr(&burn));
+    drop(copy);
+    let tree = Unlock(temp_path("board-ro-link", "tree"));
+    let (links, targets) = (tree.0.join("L"), tree.0.join("T"));
+    std::fs::create_dir_all(&links).unwrap();
+    std::fs::create_dir_all(&targets).unwrap();
+    let v2 = std::fs::read(home.file("settings.flash")).unwrap();
+    std::fs::write(targets.join("t.flash"), &v2).unwrap();
+
+    // `--flash` a link in a directory that cannot be written.
+    let link = links.join("link.flash");
+    std::os::unix::fs::symlink("../T/t.flash", &link).unwrap();
+    std::fs::set_permissions(&links, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let mut command = on(&home);
+    let output = command
+        .args([
+            "--flash",
+            link.to_str().unwrap(),
+            "--console",
+            "--run",
+            "1000",
+            "--no-sd",
+        ])
+        .output()
+        .expect("failed to run cmm2-emulator");
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "cmm2-emulator: {}: its directory is not writable, so the run could not save its \
+             flash and clock\n",
+            link.display()
+        )
+    );
+    assert_eq!(
+        std::fs::read(targets.join("t.flash")).unwrap(),
+        v2,
+        "nothing was written"
+    );
+
+    // The board's own file, a link, in a board directory that cannot be written.
+    let own = home.file("settings.flash");
+    std::fs::remove_file(&own).unwrap();
+    std::os::unix::fs::symlink(targets.join("t.flash"), &own).unwrap();
+    std::fs::set_permissions(&home.0, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let mut command = on(&home);
+    let output = command
+        .args(["--console", "--run", "1000", "--no-sd"])
+        .output()
+        .expect("failed to run cmm2-emulator");
+    std::fs::set_permissions(&home.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "cmm2-emulator: {}: its directory is not writable, so the run could not save its \
+             flash and clock\n",
+            own.display()
+        )
+    );
+    assert_eq!(
+        std::fs::read(targets.join("t.flash")).unwrap(),
+        v2,
+        "nothing was written"
+    );
 }

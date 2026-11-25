@@ -4,7 +4,9 @@ use crate::atomic_write::write_atomically;
 use crate::atomic_write::{create_new_atomically, replace_atomically};
 use crate::error::RunError;
 use crate::saveable::{check_regular, why_not_saveable};
-use crate::test_support::{age, files_in, idle_cpu, in_own_process, mode, root, scratch};
+use crate::test_support::{
+    age, files_in, idle_cpu, idle_cpu_with, in_own_process, mode, root, scratch,
+};
 use cmm2_core::{B5, Firmware, Irqs, MIN_IMAGE_SIZE, RC6, STATE_SIZE, SdSlot, cmm2_memory};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -1010,7 +1012,7 @@ fn a_migration_whose_new_file_does_not_read_back_writes_nothing() {
             bytes[last] ^= 0x80; // a checksum that does not fit the file
             Ok(bytes)
         },
-        create_new_atomically,
+        |name, bytes| create_new_atomically(name, bytes, 0o600),
         read_file,
         replace_atomically,
     )
@@ -1141,7 +1143,7 @@ fn a_retried_migration_reuses_the_backup_it_already_made() {
             path,
             &original,
             Cpu::save_settings,
-            create_new_atomically,
+            |name, bytes| create_new_atomically(name, bytes, 0o600),
             read_file,
             |_, _| Err(io::Error::other("the planned failure")),
         )
@@ -1242,7 +1244,7 @@ fn only_a_backup_of_the_same_length_is_read_to_see_if_it_is_the_copy() {
         path,
         &original,
         Cpu::save_settings,
-        create_new_atomically,
+        |name, bytes| create_new_atomically(name, bytes, 0o600),
         |name| {
             read.borrow_mut().push(name.to_string());
             std::fs::read(name)
@@ -1331,7 +1333,7 @@ fn a_backup_name_taken_just_before_the_write_is_not_replaced() {
             if !std::mem::replace(&mut planted, true) {
                 std::fs::write(name, b"somebody else's file")?;
             }
-            create_new_atomically(name, bytes)
+            create_new_atomically(name, bytes, 0o600)
         },
         read_file,
         replace_atomically,
@@ -1372,6 +1374,7 @@ fn every_b5_size_form_migrates_with_its_own_bytes_kept() {
     let mut state_tail = clock.to_vec();
     state_tail.extend([0u8; STATE_SIZE - 2]);
     state_tail.extend([1, 0x08]); // the chip's state, with the time marked set
+    let state_bytes: [u8; STATE_SIZE] = state_tail[CLOCK_BYTES..].try_into().unwrap();
     let tails = [
         ("clock", clock.to_vec()),
         ("offset", offset_tail),
@@ -1424,8 +1427,20 @@ fn every_b5_size_form_migrates_with_its_own_bytes_kept() {
         );
         let live = std::fs::read(&file).unwrap();
         assert!(live.starts_with(&MAGIC), "{what}: the live file is v2 now");
-        decode_v2(&live, cpu.image(), &B5)
+        let settings = decode_v2(&live, cpu.image(), &B5)
             .unwrap_or_else(|err| panic!("{what}: the migrated file must read back: {err}"));
+        // The chip's state is in the migrated file: as the file had it, or converted from the
+        // offset form into a state that says the time was set.
+        if what.ends_with("ds3231 tail") {
+            assert_eq!(settings.ds3231, Some(state_bytes), "{what}");
+        } else if what.ends_with("offset tail") {
+            let state = settings
+                .ds3231
+                .unwrap_or_else(|| panic!("{what}: no state kept"));
+            assert_eq!(state[8] & 1, 1, "{what}: the time is marked set");
+        } else {
+            assert_eq!(settings.ds3231, None, "{what}");
+        }
         // A board that starts again on the migrated file takes it as its own: the converted tail
         // of the offset form has to survive the round trip, not just its first write.
         let mut again = idle_cpu();
@@ -1472,10 +1487,38 @@ fn a_raw_run_that_meets_a_v2_file_says_how_to_go_on_without_naming_a_variable() 
     );
 }
 
-// The clause that offers a restore names the backup that is really there, whatever the
-// `--flash` file was called.
+// The same for RC6, whose file is the one set of regions: the chip's state in the old file is in
+// the new one, and a board that starts again reads it back.
 #[test]
-fn the_restore_clause_names_the_backup_of_the_file_that_was_named() {
+fn an_rc6_file_with_the_chips_state_migrates_with_it() {
+    let dir = scratch("migrate-rc6-state");
+    let file = dir.join("settings.flash");
+    let mut cpu = idle_cpu_with(&RC6);
+    let mut seed = cpu.persistent().unwrap();
+    let mut state = [0u8; STATE_SIZE];
+    state[STATE_SIZE - 2..].copy_from_slice(&[1, 0x08]);
+    seed.extend(state);
+    assert_eq!(seed.len(), RC6.flash_size() + 8 + STATE_SIZE);
+    std::fs::write(&file, &seed).unwrap();
+    cpu.use_settings_v2();
+
+    load_flash(&mut cpu, file.to_str().unwrap()).unwrap();
+
+    assert_eq!(std::fs::read(dir.join("settings.flash.v1")).unwrap(), seed);
+    let live = std::fs::read(&file).unwrap();
+    assert_eq!(
+        decode_v2(&live, cpu.image(), &RC6).unwrap().ds3231,
+        Some(state)
+    );
+    let mut again = idle_cpu_with(&RC6);
+    again.use_settings_v2();
+    load_flash(&mut again, file.to_str().unwrap()).unwrap();
+}
+
+// The clause that offers a restore lists the copies that are really there, whatever the
+// `--flash` file was called, and says what a restore costs.
+#[test]
+fn the_restore_clause_lists_the_copies_beside_the_file_that_was_named() {
     let dir = scratch("restore-names-itself");
     let file = dir.join("myflash");
     let mut cpu = idle_cpu();
@@ -1493,11 +1536,226 @@ fn the_restore_clause_names_the_backup_of_the_file_that_was_named() {
         err.to_string(),
         format!(
             "{path}: the settings file is corrupt (the checksum does not match the file); \
-             nothing was loaded. Restore {path}.v1 or start fresh by deleting them."
+             nothing was loaded. Older settings are kept beside it: {path}.v1. Restoring one of \
+             them gives back the settings of the time it was made, and everything saved since is \
+             lost; which one holds the settings you want is for you to say. Or start fresh by \
+             deleting {path}."
         )
     );
-    assert!(
-        !err.to_string().contains("settings.flash.v1"),
-        "it names the file that exists, not the default one"
+}
+
+// With more than one copy, they are all listed, in order; a copy is not always `.v1`.
+#[test]
+fn the_restore_clause_lists_every_copy_and_not_only_the_first() {
+    let dir = scratch("restore-lists-all");
+    let file = dir.join("settings.flash");
+    let mut cpu = idle_cpu();
+    cpu.use_settings_v2();
+    let mut bytes = cpu.save_settings().unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x80;
+    std::fs::write(&file, &bytes).unwrap();
+    std::fs::write(dir.join("settings.flash.v1"), b"an older copy").unwrap();
+    std::fs::write(dir.join("settings.flash.v1.2"), b"the newer copy").unwrap();
+    // A link is not a copy, and a name that is a directory is not either.
+    symlink("settings.flash.v1", dir.join("settings.flash.v1.3")).unwrap();
+    std::fs::create_dir(dir.join("settings.flash.v1.4")).unwrap();
+    let path = file.to_str().unwrap();
+
+    let err = load_flash(&mut cpu, path).unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{path}: the settings file is corrupt (the checksum does not match the file); \
+             nothing was loaded. Older settings are kept beside it: {path}.v1, {path}.v1.2. \
+             Restoring one of them gives back the settings of the time it was made, and \
+             everything saved since is lost; which one holds the settings you want is for you to \
+             say. Or start fresh by deleting {path}."
+        )
     );
+}
+
+// A file that is good, and for another firmware, is not corrupt: nothing is wrong with it, so no
+// restore is offered whatever copies sit beside it.
+#[test]
+fn a_firmware_mismatch_offers_no_restore() {
+    let dir = scratch("mismatch-no-restore");
+    let file = dir.join("settings.flash");
+    let mut cpu = idle_cpu();
+    cpu.use_settings_v2();
+    let other = vec![0xA5u8; 65];
+    let saved = cmm2_core::encode(
+        &other,
+        &cmm2_core::sha256(&other),
+        &cmm2_core::Settings {
+            entries: vec![],
+            clock: [0, 0],
+            ds3231: None,
+        },
+    );
+    std::fs::write(&file, &saved).unwrap();
+    std::fs::write(dir.join("settings.flash.v1"), b"an older copy").unwrap();
+    let path = file.to_str().unwrap();
+    let hex =
+        |bytes: &[u8; 32]| -> String { bytes[..6].iter().map(|b| format!("{b:02x}")).collect() };
+
+    let err = load_flash(&mut cpu, path).unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{path}: these settings were saved for a different firmware (unknown firmware, image \
+             65 bytes, sha256 {}; this run's is 7.00.00b5, image 64 bytes, sha256 {}). Burn the \
+             firmware they were made for, or start fresh by deleting them.",
+            hex(&cmm2_core::sha256(&other)),
+            hex(&cmm2_core::sha256(cpu.image())),
+        )
+    );
+}
+
+// A save of a v2 file replaces the name it was given and does not follow a link there, so a link
+// is judged by its own directory, which is where the temporary file is made. Reproduced: a
+// directory that cannot be written holds the link, and its target's directory can be.
+#[test]
+fn a_symlinked_v2_file_in_a_directory_that_cannot_be_written_is_refused_at_the_start() {
+    if root() {
+        eprintln!("skipped: root can write in any directory, so none is refused");
+        return;
+    }
+    for name in ["link.flash", "settings.flash"] {
+        let dir = scratch("v2-link-dir");
+        let (links, targets) = (dir.join("L"), dir.join("T"));
+        std::fs::create_dir(&links).unwrap();
+        std::fs::create_dir(&targets).unwrap();
+        let mut cpu = idle_cpu();
+        cpu.use_settings_v2();
+        let v2 = cpu.save_settings().unwrap();
+        std::fs::write(targets.join("t.flash"), &v2).unwrap();
+        symlink("../T/t.flash", links.join(name)).unwrap();
+        mode(&links, 0o555);
+        let path = links.join(name);
+        let path = path.to_str().unwrap();
+
+        let loaded = load_flash(&mut cpu, path);
+        // The rights are given back first, so that a failed assertion leaves nothing behind.
+        mode(&links, 0o755);
+        let err = loaded.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{path}: its directory is not writable, so the run could not save its flash \
+                 and clock"
+            ),
+            "{name}"
+        );
+        assert_eq!(
+            std::fs::read(targets.join("t.flash")).unwrap(),
+            v2,
+            "{name}"
+        );
+        assert_eq!(files_in(&targets), ["t.flash"], "{name}");
+        assert_eq!(files_in(&links), [name], "{name}: nothing was written");
+    }
+}
+
+// The same link on a raw run is still judged by where it leads, as it is followed there.
+#[test]
+fn a_symlinked_raw_file_is_still_judged_by_its_targets_directory() {
+    if root() {
+        return;
+    }
+    let dir = scratch("raw-link-dir");
+    let (links, targets) = (dir.join("L"), dir.join("T"));
+    std::fs::create_dir(&links).unwrap();
+    std::fs::create_dir(&targets).unwrap();
+    let mut cpu = idle_cpu();
+    std::fs::write(targets.join("t.flash"), cpu.persistent().unwrap()).unwrap();
+    symlink("../T/t.flash", links.join("link.flash")).unwrap();
+    mode(&links, 0o555);
+
+    let loaded = load_flash(&mut cpu, links.join("link.flash").to_str().unwrap());
+
+    mode(&links, 0o755);
+    assert!(loaded.is_ok(), "{loaded:?}");
+}
+
+// A v2 save is made in the directory of the name it is given, so that is where the stale
+// temporary files of an earlier save are cleared, and not the link's target's.
+#[test]
+fn a_symlinked_v2_file_clears_the_stale_temporary_files_of_its_own_directory() {
+    let dir = scratch("v2-link-stale");
+    let (links, targets) = (dir.join("L"), dir.join("T"));
+    std::fs::create_dir(&links).unwrap();
+    std::fs::create_dir(&targets).unwrap();
+    let mut cpu = idle_cpu();
+    cpu.use_settings_v2();
+    std::fs::write(targets.join("t.flash"), cpu.save_settings().unwrap()).unwrap();
+    symlink("../T/t.flash", links.join("link.flash")).unwrap();
+    let stale = links.join(".cmm2.4242.1.tmp");
+    std::fs::write(&stale, b"x").unwrap();
+    age(&stale, 3600);
+
+    load_flash(&mut cpu, links.join("link.flash").to_str().unwrap()).unwrap();
+
+    assert!(!stale.exists(), "the stale temporary file is cleared");
+}
+
+// The backup does not make private settings readable by others: it has the mode of the file it
+// copies, and never a wider one.
+#[test]
+fn a_backup_has_the_mode_of_the_file_it_copies() {
+    for file_mode in [0o600, 0o640] {
+        let dir = scratch("backup-mode");
+        let file = dir.join("settings.flash");
+        let mut cpu = idle_cpu();
+        std::fs::write(&file, cpu.persistent().unwrap()).unwrap();
+        mode(&file, file_mode);
+        cpu.use_settings_v2();
+
+        load_flash(&mut cpu, file.to_str().unwrap()).unwrap();
+
+        let backup = std::fs::metadata(dir.join("settings.flash.v1")).unwrap();
+        assert_eq!(backup.mode() & 0o777, file_mode, "{file_mode:o}");
+    }
+}
+
+// The backup is made with its mode from the start, so the umask narrows it: a raw file of 0666
+// under the umask 077 gives 0600, under 022 gives 0644, and under 0 gives 0666. A mode set by a
+// later chmod would ignore the umask and give 0666 every time. The umask is the process's, so each
+// case is run in a process of its own.
+#[test]
+fn a_backup_is_made_with_its_mode_narrowed_by_the_umask() {
+    for (umask, want) in [(0o077, 0o600), (0o022, 0o644), (0o000, 0o666)] {
+        let dir = scratch("backup-umask");
+        let ran = in_own_process(
+            "storage::tests::a_backup_is_made_with_its_mode_narrowed_by_the_umask",
+            &format!("{umask:o}"),
+            &[],
+            |_| {
+                // SAFETY: umask only sets this process's mask.
+                unsafe { libc::umask(umask) };
+                let file = dir.join("settings.flash");
+                let mut cpu = idle_cpu();
+                std::fs::write(&file, cpu.persistent().unwrap()).unwrap();
+                mode(&file, 0o666);
+                cpu.use_settings_v2();
+
+                load_flash(&mut cpu, file.to_str().unwrap()).unwrap();
+
+                let backup = std::fs::metadata(dir.join("settings.flash.v1")).unwrap();
+                assert_eq!(backup.mode() & 0o7777, want, "umask {umask:o}");
+                // The child ends with `_exit`, so its own directory is removed here.
+                std::fs::remove_dir_all(&*dir).unwrap();
+            },
+        );
+        if let Some(ran) = ran {
+            assert_eq!(
+                ran.ended,
+                crate::test_support::Ended::Exit(0),
+                "{}",
+                ran.stderr
+            );
+        }
+    }
 }

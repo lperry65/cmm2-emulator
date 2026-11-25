@@ -150,6 +150,15 @@ migrated is that backup already made, by a migration that was cut short before t
 replaced; it is used and nothing more is written, so a failing replace does not fill up the names
 with identical copies. The check reads such a file only when it is as long as the raw file.
 
+The backup gets the raw file's permission bits (the nine rwx bits of its metadata, read before
+the migration), narrowed by the umask; the setuid, setgid and sticky bits are not carried, and if
+the metadata cannot be read the backup gets 0600. The bits are set when the temporary file is
+created, so the backup's bytes are never readable by more than the original allowed.
+
+A refusal of a corrupt file lists the backups that exist (`.v1`, `.v1.2`, ... that are plain
+files) and says that restoring one loses everything saved since it was made; a file for another
+firmware is refused without that offer.
+
 The copy is made with a hard link, and a file system that refuses one (EPERM or EOPNOTSUPP) stops
 the migration with a message that names the hard link and says that nothing was written and the
 live file is untouched. There is no fallback to a plain copy, which could be replaced under the

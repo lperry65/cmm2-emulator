@@ -5,7 +5,7 @@
 
 use crate::atomic_write::{remove_stale_temps_in, replace_atomically, try_lock_exclusive};
 use crate::error::RunError;
-use crate::saveable::{check_regular, why_not_saveable};
+use crate::saveable::{check_regular, why_not_replaceable};
 use cmm2_core::Firmware;
 use std::ffi::OsString;
 use std::fmt;
@@ -339,13 +339,11 @@ impl Board {
             source,
         };
         let link = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink());
-        // What a link leads to is not looked at (it is not written), only the directory is: a
-        // name that is not there stands for the file in that.
-        let probe = Path::new(path).with_file_name(".cmm2.probe");
+        // What a link leads to is not looked at (it is not written), only the directory is.
         if !link {
             check_regular(path).map_err(error)?;
         }
-        if let Some(why) = why_not_saveable(if link { probe.to_str().unwrap() } else { path }) {
+        if let Some(why) = why_not_replaceable(path) {
             let source = io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("{why}, so the board could not {what}"),

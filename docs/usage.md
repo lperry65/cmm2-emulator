@@ -399,6 +399,16 @@ file is replaced with its v2 form only after that form has been read back and ch
   copy. The copy is made with a hard link. A file system that refuses one stops the migration
   with a message that says so; nothing is written, the live file is untouched, and no other way of
   copying is tried.
+- The copy gets the raw file's permission bits (the nine rwx bits, read from its metadata before
+  the migration), narrowed by the umask. The setuid, setgid and sticky bits are not carried. If
+  the metadata cannot be read, the copy gets 0600. The bits are given when the file is created, so
+  settings kept private (mode 0600, say) are never readable by others in the copy, not even for
+  an instant.
+- If the file is corrupt, the message lists the copies of older settings that sit beside it
+  (`.v1`, `.v1.2` and so on, plain files only), and says that restoring one gives back the
+  settings of the time it was made and loses everything saved since; which one holds the
+  settings I want is for me to say. A file that is good but made for another firmware gets no such
+  offer.
 - **A symbolic link is replaced, not followed.** If `settings.flash` (or the file given with
   `--flash` to the board) is a symlink, the migration and every later board save replace the
   link itself with the v2 file, and what it pointed to is left as it was. Anyone who links the
@@ -441,6 +451,10 @@ held and the new message are written at once, so that they are not lost with it.
   file it points to is the one replaced and the link stays. The board's v2 file is the
   exception: it is the board's own file, and it is replaced rather than followed, as
   `firmware.bin` is.
+- The board's v2 file is judged at the start by the directory of the name it is given, a link
+  there not followed, as that is where the save makes its temporary file: a symlink in a
+  directory that cannot be written is refused at the start, even when the directory it points
+  into can be, and the stale temporary files that are cleared are that directory's.
 - The file keeps its permissions. It does not keep its owner, which only a privileged process
   can set, and a hard link to the old file stops seeing the contents, as the file is replaced
   and not written in place.
