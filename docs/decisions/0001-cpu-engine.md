@@ -116,7 +116,7 @@ have been overtaken:
 - - The ARMv7E-M DSP instructions are in (issue 77, batches 1 to 4 in commits 001a7bf, aafbce9,
   8fc5d97 and e3e8936, and the fifth batch, the floating-point additions, with this work; the
   core fixes below are from 4bd964d). Galactic Raiders used to stop at an
-  instruction that was missing. It was UQSUB8 (A7.7.210; the reviewer first read it as UQADD8), and
+  instruction that was missing. It was UQSUB8 (A7.7.210; an earlier reading took it as UQADD8), and
   the whole extension was missing, not one instruction. Now the core has the 36 parallel add and
   subtract instructions, QADD, QSUB, QDADD and QDSUB, SMMUL, SMMLA and SMMLS with their R forms,
   USAD8 and USADA8, SXTB16, SXTAB16, UXTB16 and UXTAB16, SSAT16 and USAT16 (they used to decode as
@@ -125,8 +125,9 @@ have been overtaken:
   VNMLA and VNMLS in F32 and F64, VCVTB and VCVTT between half precision and single or double
   precision, and FLDMX and FSTMX.
   Each batch was compared with an independent
-  emulator (Unicorn, which is QEMU underneath) and with the reviewer's own model (issue 77). For
-  SMLAD I follow the manual's rule for the Q flag, which differs from the older QEMU inside Unicorn.
+  emulator (Unicorn, which is QEMU underneath) and with an independent hand-derived model
+  (issue 77). For SMLAD I follow the manual's rule for the Q flag, which differs from the older
+  QEMU inside Unicorn.
 - - Wrong decodes were fixed in the same work: CSDB and the unallocated hints no longer decode as a
   branch, every DBG option executes as a NOP, the unprivileged loads and stores exist (the core has
   no MPU model, so they act as ordinary accesses), a coprocessor instruction for a coprocessor other

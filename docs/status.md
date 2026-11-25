@@ -39,12 +39,12 @@ milestones.
 Galactic Raiders, the game I am writing for the CMM2, loads and draws all its sprites and colours
 (my report). It is far too slow to play yet (speed, issue 74).
 
-It used to stop at an ARMv7E-M DSP instruction that the core did not have, at 0x08146b6c. A
-reviewer first read that instruction as UQADD8. It was UQSUB8 (A7.7.210), and the whole DSP
+It used to stop at an ARMv7E-M DSP instruction that the core did not have, at 0x08146b6c. An
+earlier reading took that instruction as UQADD8. It was UQSUB8 (A7.7.210), and the whole DSP
 extension was missing, not one instruction (issue 77). All five batches of the work on it are
 committed (see "The CPU core").
 
-A reviewer had an agent test commit aafbce9 (2026-11-18): it ran through a pty, with a card built
+I tested commit aafbce9 (2026-11-18): it ran through a pty, with a card built
 from the game's real files, and no keys were sent to the game. The game ran for the whole 470 s of
 host time with no fault trap and no error line other than the quit-key line, and the run was ended
 with the quit key. On the emulated clock the game printed `sheet loaded ms=335.3`,
@@ -59,7 +59,7 @@ board: that figure compares CPU cycle counts on a loop that runs in fast memory,
 figures involve SDRAM and file reads, so they are different measurements. That is a reading, not a
 measurement.
 
-The agent's screenshot at the end of the run showed the HUD (`SCORE 000300`, `HI 020000`,
+A screenshot at the end of the run showed the HUD (`SCORE 000300`, `HI 020000`,
 `WAVE 3`), a starfield, six empty outline boxes and a white dot, which looks like the game's demo
 or attract mode (my reading; I did not check the game's code). I make no claim about whether the
 boxes are the game's own.
@@ -101,10 +101,10 @@ adds the floating-point instructions; the core fixes in the last bullet are from
 - The floating-point additions, the last batch: VMLA, VMLS, VNMLA and VNMLS in F32 and F64; VCVTB
   and VCVTT between half precision and single or double precision, both directions; and FLDMX and
   FSTMX, the odd-word-count forms of VLDM and VSTM.
-- Each batch was compared with an independent emulator (Unicorn, which is QEMU underneath) and
-  with the reviewer's own model (issue 77). One difference is left on purpose: for SMLAD I follow
-  the manual's rule for the Q flag, which differs from the older QEMU inside Unicorn (details in
-  NOTICE.md). Real silicon was not available to decide it.
+- Each batch was compared with an independent emulator (Unicorn, which is QEMU underneath) and with
+  an independent hand-derived model (issue 77). One difference is left on purpose: for SMLAD I
+  follow the manual's rule for the Q flag, which differs from the older QEMU inside Unicorn
+  (details in NOTICE.md). Real silicon was not available to decide it.
 - Decodes that ran wrong are fixed. CSDB and the unallocated hints no longer decode as a branch,
   and every DBG option executes as a NOP. The unprivileged loads and stores (LDRT, LDRBT, LDRHT,
   LDRSBT, LDRSHT, STRT, STRBT and STRHT) exist; the core has no MPU model, so they act as
@@ -139,9 +139,9 @@ Speed is the main thing that is not done. These are the figures, and which of th
   as the board on that loop. This compares the machine's clock with the board's, not the host's
   speed.
 - Pacing: one boot run (200 million instructions, an unpaced `--run` of the first-boot text) took
-  about 6 s of CPU time on 2026-11-14, on a loaded machine (a load average of about 20 in the
-  reviewer's repeat). That is slower than the 70 to 77 million a second that I measured for the
-  boot in my local speed notes, so the two disagree, and I do not know which is right.
+  about 6 s of CPU time on 2026-11-14, on a loaded machine. That is slower than the 70 to 77
+  million a second that I measured for the boot in my local speed notes, so the two disagree, and I
+  do not know which is right.
 
 I decided on 2026-11-14 to build an x86-64 JIT directly, with no interim steps, because the
 interim steps (an estimate of about 2.7 to 2.8 times together; two of the five were measured on

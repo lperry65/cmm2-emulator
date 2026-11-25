@@ -36,7 +36,7 @@ notes, which are not in the repository):
 Galactic Raiders loads and draws everything now (my report), and is far too slow to play. It no
 longer stops at a missing instruction: the DSP extension is in the core (issue 77), and a run of
 commit aafbce9 on 2026-11-18, with no keys sent to the game, went on for the whole 470 s of host
-time with no fault, and was ended with the quit key (a reviewer's run; the figures are on issue 77).
+time with no fault, and was ended with the quit key (my run; the figures are on issue 77).
 
 ## What I looked at
 

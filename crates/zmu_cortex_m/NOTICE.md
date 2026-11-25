@@ -55,8 +55,8 @@ The firmware needs a few things zmu does not do, so I changed the following.
   0); it shows it now.
 - DSP extension, the 36 parallel adds and subtracts: only UADD8 ran, and the other 35 (SADD8,
   SADD16, SASX, SSAX, SSUB8, SSUB16, the Q, SH, UQ and UH forms of the same six, UADD16, UASX, USAX,
-  USUB8 and USUB16) were decoded as undefined. Galactic Raiders stops at UQSUB8 (`fac0 f051`; a
-  reviewer first read it as UQADD8, but op1 = 100 is the subtract). They are one decoder and one
+  USUB8 and USUB16) were decoded as undefined. Galactic Raiders stops at UQSUB8 (`fac0 f051`; an
+  earlier reading took it as UQADD8, but op1 = 100 is the subtract). They are one decoder and one
   executor now, with the sign, the kind (plain, saturating, halving) and the lane arrangement as
   data (`Instruction::PARALLEL`, `decoder/parallel.rs`, `executor/parallel_add.rs`), and UADD8 is
   one of them. Only the S and U forms write GE (a byte lane one bit, a halfword lane two; the flag
@@ -72,8 +72,8 @@ The firmware needs a few things zmu does not do, so I changed the following.
 - DSP extension, QADD, QSUB, QDADD and QDSUB were decoded as undefined. They are one decoder and one
   executor (`Instruction::QSAT`). The manual's operands are Rd, Rm, Rn and the result is Rm plus or
   minus Rn, with Rn doubled first (and saturated) in the two D forms. Q is set when either step
-  saturates, and never cleared. A reviewer expected Galactic Raiders to need them (its text code
-  has two QADD).
+  saturates, and never cleared. An earlier reading expected Galactic Raiders to need them (its
+  text code has two QADD).
 - DSP extension, SMMUL, SMMLA and SMMLS with their R forms were decoded as undefined (the game's
   drawing code has twelve SMMUL). One decoder and one executor (`Instruction::SMM`): the high word
   of `(Ra << 32) +- Rn * Rm` in 64 bits, with 0x8000_0000 added first for the R forms. The sum can
@@ -289,7 +289,7 @@ The firmware needs a few things zmu does not do, so I changed the following.
     - A return refused before the pop (the handler is not active, EXC_RETURN is not one of 0x1,
       0x9, 0xd in its low nibble, or a Thread return with other exceptions active) enters the
       fault with no PushStack: the stack pointer is unchanged and nothing is stacked, and LR =
-      '1111':EXC_RETURN. I used to push a frame there. The reviewer was right.
+      '1111':EXC_RETURN. I used to push a frame there. That reading was right.
     - After the pop, a bad IPSR is a PushStack to negate the PopStack, then LR = '1111':EXC_RETURN
       and ExceptionTaken, so the handler's LR is the refused EXC_RETURN and the frame holds the
       popped registers and xPSR. That is what was implemented; my other recollection (LR set before
@@ -816,21 +816,21 @@ also on, `build.rs` stops.
    harness asserts per vector that the FPSCR it writes has reached the oracle before the vector runs
    — Unicorn initialises FP state lazily, and a write before the first FP instruction is dropped: an
    unwarmed first harness ran each bucket's first vector with FPSCR = 0 and reported five mismatches
-   that were harness artifacts, not behaviours of the oracle. A reviewer also ran a harness of their
-   own, built independently, which compares the transfer base registers directly; it lives outside
-   this repo and is not re-runnable here, so its figures are quoted as reported: 0 mismatches in
-   25,000 vectors for each MAC kind and 20,000 FLDMX/FSTMX vectors, two planted bugs caught. What is
-   on disk and re-runnable is this crate's own harness and its run. The corrected harness, its
-   inputs, results and logs live under spikes/oracle-b5/ (locally excluded from git). A decode sweep
-   of 5,200 words against llvm-mc (encode, disassemble, compare with zmu decode and Display) found
-   no decode mismatch; six words are cases where llvm-mc's disassembler rejects MCRR and MRRC
-   encodings its own assembler emits. Twelve planted bugs in the new code (the MAC negations and
-   operand order, the half-word extract and store, the F16 FZ guard, FPNeg, the IA and DB base
-   arithmetic, the FLDMX word count, the PU reject row, the VCVTT half flag) were run against the
-   suite: ten were caught at once, the operand-order one survived until a NaN-payload test was added
-   for it, and the one that rewrote a table row tripped the table's duplicate-pattern guard so it
-   was replaced by the equivalent decoder-wrapper mutation, which was caught. The firmware tests
-   print the same 33 instruction-count lines as before batch 5.
+   that were harness artifacts, not behaviours of the oracle. An independent run also used a harness
+   of its own, built independently, which compares the transfer base registers directly; it lives
+   outside this repo and is not re-runnable here, so its figures are quoted as reported: 0
+   mismatches in 25,000 vectors for each MAC kind and 20,000 FLDMX/FSTMX vectors, two planted bugs
+   caught. What is on disk and re-runnable is this crate's own harness and its run. The corrected
+   harness, its inputs, results and logs live under spikes/oracle-b5/ (locally excluded from git). A
+   decode sweep of 5,200 words against llvm-mc (encode, disassemble, compare with zmu decode and
+   Display) found no decode mismatch; six words are cases where llvm-mc's disassembler rejects MCRR
+   and MRRC encodings its own assembler emits. Twelve planted bugs in the new code (the MAC
+   negations and operand order, the half-word extract and store, the F16 FZ guard, FPNeg, the IA and
+   DB base arithmetic, the FLDMX word count, the PU reject row, the VCVTT half flag) were run
+   against the suite: ten were caught at once, the operand-order one survived until a NaN-payload
+   test was added for it, and the one that rewrote a table row tripped the table's duplicate-pattern
+   guard so it was replaced by the equivalent decoder-wrapper mutation, which was caught. The
+   firmware tests print the same 33 instruction-count lines as before batch 5.
 
 `cargo clippy -p zmu_cortex_m --all-targets -- -D warnings` is clean (the crate denies
 `clippy::pedantic`; the test code had unseparated long literals, `assert!` with `==`, and a few

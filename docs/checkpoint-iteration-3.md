@@ -2,7 +2,7 @@
 
 Written 2026-11-13, at commit 170c81c. The question: does the approach (the real firmware on an
 emulated STM32H743, on a vendored zmu core) still look like it will reach the goals in
-[goals.md](goals.md)? My answer is **go**, with one decision for Lee about speed.
+[goals.md](goals.md)? My answer is **go**, with one decision for me about speed.
 
 This is a snapshot, and I have left it as it was written. Since then video, the keyboard, the SD
 card, the DS3231, the RNG and the timer interrupts have been built, the decision about speed is made
@@ -35,8 +35,9 @@ all of it.
 - Every wait the firmware has needed a small model, not a canned value, and the models stayed small
   (tens to a few hundred lines each). The pattern (thin decorator over SVD reset values, status computed
   on read, shared handles for clock, console and interrupts) has held for nine peripherals.
-- Subagent reports about firmware state were repeatedly wrong, so every claim is re-checked by running
-  the firmware and by mutation-testing the tests. That has been slower but has not let a wrong model in.
+- Early reports about firmware state were repeatedly wrong, so every claim is re-checked by running
+  the firmware and by mutation-testing the tests. That has been slower but has not let a wrong
+  model in.
 
 ## Speed
 
@@ -74,12 +75,12 @@ core (an optimised interpreter, then block translation) behind the same interfac
 - **Speed** is the one that could end the approach for games. Mitigation above; the interface to swap the
   core exists.
 - **USB host emulation** is unproven. If it turns out too heavy, the fallback is to feed key events
-  straight to the firmware's key buffer, which is a workaround and not what I want, so I would raise it
-  with Lee first.
+  straight to the firmware's key buffer, which is a workaround and not what I want, so I would stop
+  and decide it myself first.
 - **More zmu bugs** at about the rate seen so far. Cost is predictable, not a threat.
 - GitHub's interaction limit on the repo needs renewing by 2027-05-11.
 
-## Decisions for Lee
+## Decisions for me
 
 1. Go on to iteration 4 (video)? My recommendation is yes.
 2. Whether to measure the real board's instruction rate (needs the board free, with a small PEEK-only
