@@ -6,24 +6,27 @@ use std::path::{Path, PathBuf};
 
 use cmm2_core::{B5, Cpu, Firmware, Irqs, cmm2_memory};
 
-// A directory under the temp directory that is this test's own.
-pub(crate) fn scratch(name: &str) -> PathBuf {
+// A directory under the temp directory that is this test's own, removed when it is dropped, a
+// failed test too (a test that ends the process with `_exit`, as `in_own_process`'s child does,
+// removes its own).
+pub(crate) struct Scratch(PathBuf);
+
+pub(crate) fn scratch(name: &str) -> Scratch {
     let dir = std::env::temp_dir().join(format!("cmm2-main-{}-{name}", crate::run_id::run_id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir(&dir).unwrap();
-    dir
-}
-
-// A scratch directory (see `scratch`) that is removed when it is dropped, a failed test too.
-pub(crate) struct Scratch(PathBuf);
-
-pub(crate) fn scratch_dir(name: &str) -> Scratch {
-    Scratch(scratch(name))
+    Scratch(dir)
 }
 
 impl std::ops::Deref for Scratch {
     type Target = Path;
     fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
         &self.0
     }
 }
@@ -97,17 +100,6 @@ pub(crate) fn age(path: &Path, secs: u64) {
         )
     };
     assert_eq!(done, 0);
-}
-
-// The most memory this process has held at once, in KiB (Linux's peak resident set), for a test
-// that has to know whether a file was read whole.
-pub(crate) fn peak_rss_kib() -> u64 {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-    // SAFETY: getrusage is given a valid pointer to a struct of its own type, which it fills.
-    let ok = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-    assert_eq!(ok, 0, "getrusage failed");
-    // SAFETY: getrusage said it filled the struct.
-    unsafe { usage.assume_init() }.ru_maxrss as u64
 }
 
 // What the tests here that start a process or use a terminal rely on is Unix only (libc's

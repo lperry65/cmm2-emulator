@@ -114,7 +114,6 @@ fn only_a_pipe_or_the_slave_of_a_terminal_is_reopened() {
         libc::close(master);
         libc::close(slave);
     }
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -202,7 +201,6 @@ fn what_can_be_reopened_is_written_through_a_descriptor_of_its_own_and_in_big_ch
     assert!(!out.own);
     assert_eq!(out.fd, file.as_raw_fd());
     assert_eq!(out.chunk, BIG_CHUNK);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -211,5 +209,4 @@ fn a_trace_file_is_written_as_it_is_with_the_output_writer() {
     let mut out = Output::file(File::create(dir.join("t")).unwrap());
     out.write_all(&vec![b'x'; 200_000]).unwrap();
     assert_eq!(std::fs::read(dir.join("t")).unwrap().len(), 200_000);
-    std::fs::remove_dir_all(&dir).unwrap();
 }

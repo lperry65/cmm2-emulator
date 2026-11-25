@@ -49,17 +49,35 @@ pub(crate) enum RunError {
         backup: Option<String>,
     },
     /// A run that reads the raw layout was given a board's v2 file (issue 82): the file is
-    /// fine, the run is the wrong kind. `labelled_by` is the variable that put a board on the
-    /// raw layout, which is the one thing it can be told to undo.
+    /// fine, the run is the wrong kind.
     V2InRawRun {
         path: String,
-        labelled_by: Option<String>,
     },
     /// A migration refused because the name its copy of the old settings goes to is held by
     /// something that is not a plain file (issue 82): it is neither followed nor replaced.
     BackupNotAFile {
         path: String,
         backup: String,
+    },
+    /// A migration refused because every name for a copy of the old settings is taken, from
+    /// `first` to `last` (issue 82).
+    BackupsFull {
+        path: String,
+        first: String,
+        last: String,
+    },
+    /// A migration refused because the file system would not make the hard link that a copy of
+    /// the old settings is made with (issue 82). Nothing was written.
+    BackupNeedsLink {
+        path: String,
+        backup: String,
+        source: io::Error,
+    },
+    /// A migration refused because the new settings file it made did not read back (issue 82):
+    /// a fault of the encoder, found before any file was touched.
+    NotReadBack {
+        path: String,
+        reason: String,
     },
     /// The firmware has no settings layout, so a settings file for it would be wrong data. `path`
     /// is the file that asked for one.
@@ -97,6 +115,24 @@ pub(crate) enum RunError {
     Fault(String),
 }
 
+/// `text` as one word of a shell command: as it is when it holds only characters the shell leaves
+/// alone, and otherwise in single quotes (a quote inside is closed, escaped and opened again). A
+/// name that starts with a dash is a relative path, and gets `./` in front so that it is not
+/// taken for an option.
+fn shell_quoted(text: &str) -> String {
+    let text = &if text.starts_with('-') {
+        format!("./{text}")
+    } else {
+        text.to_string()
+    };
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_-./:@%+=,".contains(c);
+    if !text.is_empty() && text.chars().all(plain) {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
 impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -122,26 +158,41 @@ impl fmt::Display for RunError {
                 }
                 Ok(())
             }
-            RunError::V2InRawRun { path, labelled_by } => match labelled_by {
-                Some(variable) => write!(
+            RunError::V2InRawRun { path } => {
+                let quoted = shell_quoted(path);
+                write!(
                     f,
-                    "{path}: these settings were saved by the board of this emulator (format \
-                     v2), but this board reads the raw layout because {variable} names a layout \
-                     for a firmware I cannot recognise. Unset {variable} and burn a firmware I \
-                     know with: cmm2-emulator --burn <file>. To start fresh instead, move \
-                     {path} away and start the board again."
-                ),
-                None => write!(
-                    f,
-                    "{path}: these settings were saved by the board of this emulator (format \
-                     v2); this run reads the raw layout. Start the board itself, or point \
-                     --flash at a raw file."
-                ),
-            },
+                    "{path}: these settings were saved by the board of this emulator (format v2), \
+                 and this run reads the raw layout, which cannot hold them. Read them with the \
+                 board (cmm2-emulator --flash {quoted}, with no --firmware) once the firmware \
+                 they were made for is burned onto it, or point --flash at a raw file. To start \
+                 fresh, move {quoted} away."
+                )
+            }
             RunError::BackupNotAFile { path, backup } => write!(
                 f,
                 "{path}: not backing up the old settings to {backup}: that name is not a \
                  regular file. Move it out of the way and start again; no file was written."
+            ),
+            RunError::BackupsFull { path, first, last } => write!(
+                f,
+                "{path}: not backing up the old settings: the names from {first} to {last} are \
+                 all taken. Move some of them out of the way and start again; no file was written."
+            ),
+            RunError::BackupNeedsLink {
+                path,
+                backup,
+                source,
+            } => write!(
+                f,
+                "{path}: not backing up the old settings to {backup}: the copy is made with a \
+                 hard link, and this file system refused one ({source}). Nothing was written, \
+                 and {path} is untouched."
+            ),
+            RunError::NotReadBack { path, reason } => write!(
+                f,
+                "{path}: the new settings file made for the migration did not read back \
+                 ({reason}); nothing was written, and {path} is untouched."
             ),
             RunError::NoLayout { path, source } => write!(f, "{path}: {source}"),
             RunError::BoardNoLayout { path } => write!(

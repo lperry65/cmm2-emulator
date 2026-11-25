@@ -114,6 +114,14 @@ impl ImageRef {
     }
 }
 
+/// A length as the file stores it. Every length in a settings file is bounded by the 2 MiB of
+/// flash (an image, an entry, a count of rows), so this cannot fail; it says so, loudly, rather
+/// than truncating, if that ever stops being true. No test makes it fail: that would need a
+/// 4 GiB value.
+fn word(len: usize) -> u32 {
+    u32::try_from(len).expect("a length in a settings file is within the 2 MiB of flash")
+}
+
 /// The SHA-256 of an image, as the header stores it.
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
@@ -194,7 +202,7 @@ pub fn decode_v2(
     saved_hash.copy_from_slice(&bytes[12..44]);
     let saved_len = u32::from_le_bytes(bytes[8..12].try_into().expect("four bytes"));
     let running_hash = sha256(image);
-    let running_len = image.len() as u32;
+    let running_len = word(image.len());
     if saved_len != running_len || saved_hash != running_hash {
         // The hash gate, and only here (issue 82): nothing else of the file is trusted
         // enough to be worth reading, and nothing of it is applied.
@@ -212,7 +220,7 @@ pub fn decode_v2(
         });
     }
     let count = u32::from_le_bytes(bytes[44..48].try_into().expect("four bytes"));
-    let rows = (profile.flash_size() / ROW) as u32;
+    let rows = word(profile.flash_size() / ROW);
     if count > rows {
         // Checked before anything is reserved: a four-byte lie cannot ask for gigabytes.
         return Err(SettingsError::Corrupt(format!(
@@ -220,11 +228,9 @@ pub fn decode_v2(
         )));
     }
     if count > 0
-        // The table's own bytes, before any of them is read as an entry: a file that promises
-        // `count` of them owes an address and a length for each, and still has the tail's clock
-        // and the checksum to come. Without this the reader takes the clock for the first entry,
-        // and refuses an address the file never claimed. `count` is bounded just above, so the
-        // sum cannot wrap.
+        // The table's own bytes, checked before any is read as an entry: each of `count` entries
+        // owes an address and a length, and the clock and checksum still follow. `count` is
+        // bounded above, so the sum cannot wrap.
         && bytes.len() < HEADER_SIZE + count as usize * ENTRY_SIZE + CLOCK_SIZE + CRC_SIZE
     {
         return Err(SettingsError::Corrupt(
@@ -274,13 +280,13 @@ pub fn decode_v2(
                 "the entry at {addr:#010X} overlaps the one before it, or is out of order"
             )));
         }
-        let value_end = at + 8 + len as usize;
+        let value_end = at + ENTRY_SIZE + len as usize;
         if value_end > bytes.len() {
             return Err(SettingsError::Corrupt(format!(
                 "the file ends inside the entry at {addr:#010X}"
             )));
         }
-        entries.push((addr, bytes[at + 8..value_end].to_vec()));
+        entries.push((addr, bytes[at + ENTRY_SIZE..value_end].to_vec()));
         at = value_end;
         previous_end = Some(end);
     }
@@ -328,17 +334,17 @@ pub fn decode_v2(
 /// merged rows inside the profile's regions; the tests hand it wrong things on purpose,
 /// which is `decode_v2`'s business to refuse.
 pub fn encode(image: &[u8], image_hash: &[u8; 32], settings: &Settings) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(HEADER_SIZE + 12);
+    let mut bytes = Vec::with_capacity(HEADER_SIZE + CLOCK_SIZE + CRC_SIZE);
     bytes.extend(MAGIC);
     bytes.push(VERSION);
     bytes.push(0); // flags: a reader refuses non-zero, so a writer writes zero.
     bytes.extend([0u8; 2]); // reserved, the same.
-    bytes.extend((image.len() as u32).to_le_bytes());
+    bytes.extend(word(image.len()).to_le_bytes());
     bytes.extend(image_hash);
-    bytes.extend((settings.entries.len() as u32).to_le_bytes());
+    bytes.extend(word(settings.entries.len()).to_le_bytes());
     for (addr, value) in &settings.entries {
         bytes.extend(addr.to_le_bytes());
-        bytes.extend((value.len() as u32).to_le_bytes());
+        bytes.extend(word(value.len()).to_le_bytes());
         bytes.extend(value);
     }
     for word in settings.clock {

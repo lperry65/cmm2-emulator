@@ -147,7 +147,9 @@ on and exits with status 1. Only the lock is looked at, not the other process.
 
 `--flash <file>` without `--firmware` means this settings file instead of the board's own, for a
 separate set of settings; the board's firmware is still used, so that run still takes the
-board's lock.
+board's lock. It is a board run, so the file is read and written in the board's v2 format (see
+[the settings file](#the-settings-file---flash)): a raw file given this way is migrated in place,
+and its raw bytes are kept beside it as `<file>.v1`, or the next free `.v1.N` name.
 
 The card in the socket is remembered by `--sd <file>` without `--firmware`: its absolute path
 goes in `sd.path`, once the file has been read as a card, and the next start puts it in again.
@@ -358,20 +360,50 @@ cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --flash board.flas
 
 ### The shape of the file
 
-The board's file is format version 2: a header that names the firmware image it was made against
-(its length and SHA-256), then entries covering the 32-byte flash rows that differ from the burned
-image, contiguous rows stored together, then the clock and the DS3231's state when it has one, then
-a CRC-32. Only the changed rows go in the file; the rest reads back from the burned image, so the
-machine ends up exactly as the old full dump left it, from a file of a few KB instead of ~900. The
-contract is [the settings file format](settings-format.md). A scratch run (`--firmware` with
-`--flash`) still reads and writes the raw layout described below, and refuses a board's v2 file
-with a message that says which is which. A board start that finds the older raw file does not
-refuse it: it reads it as always and adopts it, migrating it as the next paragraph says.
+Which run writes which format:
 
-A board file written by an older emulator, from before the format, is loaded exactly as it
-always was, and then migrated: the original bytes are copied to `settings.flash.v1` beside the
-file, which the emulator never overwrites or deletes, and the live file is replaced with its
-v2 form only after that form has been read back and checked.
+- The board writes format version 2. That is a plain start, a start with `--burn` of a firmware
+  I recognise (the burn starts the board, so it writes a v2 settings file too), and a start with
+  `--flash <file>` and no `--firmware`.
+- A scratch run (any run with `--firmware`, with `--flash`) reads and writes the raw layout
+  described below ("v1"), whatever the firmware is. It refuses a board's v2 file with a message
+  that says which is which.
+
+The v2 file is a header that names the firmware image it was made against (its length and
+SHA-256), then entries covering the 32-byte flash rows that differ from the burned image,
+contiguous rows stored together, then the clock and the DS3231's state when it has one, then a
+CRC-32. Only the changed rows go in the file; the rest reads back from the burned image, so the
+machine ends up exactly as the old full dump left it, from a file of a few KB instead of ~900.
+The contract is [the settings file format](settings-format.md).
+
+A file larger than any settings file can be (1,146,990 bytes for the two firmwares I know) is
+refused on its size without being read, in every run, scratch runs included. A scratch run given
+such a file says the settings file is corrupt and that it is more than that many bytes, and not
+the older message about the size of the file.
+
+#### Migrating an older file
+
+A board start that finds the older raw file does not refuse it. It loads the file exactly as it
+always was, and then migrates it: the original bytes are copied beside the file, and the live
+file is replaced with its v2 form only after that form has been read back and checked.
+
+- The copy is `settings.flash.v1` (the file's own name with `.v1`). A copy that is already there
+  is an older one and is never overwritten: the new raw bytes go to the first free name from
+  `.v1.2` to `.v1.99`, so no raw bytes are ever lost. A name held by a link, a directory or a
+  device is refused, and so is the case where all 99 names are taken; either way nothing is
+  written. The emulator never deletes a copy.
+- A copy is written whole or not at all, and never over a name that is taken: if a file appears at
+  the chosen name before the write, the next free name is used. The live file is replaced only
+  after the copy is in place. If the replace then fails, the next start finds a copy with exactly
+  the same bytes, uses it, and writes no second one; a raw file with other bytes gets its own
+  copy. The copy is made with a hard link. A file system that refuses one stops the migration
+  with a message that says so; nothing is written, the live file is untouched, and no other way of
+  copying is tried.
+- **A symbolic link is replaced, not followed.** If `settings.flash` (or the file given with
+  `--flash` to the board) is a symlink, the migration and every later board save replace the
+  link itself with the v2 file, and what it pointed to is left as it was. Anyone who links the
+  board's settings file elsewhere will find the link gone after the first save. This is a change
+  from the raw layout, whose files a link still reaches (see "How a file is saved" below).
 
 The run saves when it ends by the quit key, the window closed, the `--run` limit, `--stop-at`, a
 fault, a SIGINT, SIGTERM or SIGHUP (Ctrl-C in a terminal that is not in raw mode, `kill`, the
@@ -487,14 +519,13 @@ For a scratch run with `--flash`, and for tests, the environment variable `CMM2_
 (`b5` or `rc6`) names a layout for an image that has none; what it names may be wrong for that
 image, and then the file is too. It is not used for the board: `--burn` of an unknown firmware
 is refused with or without it, and a bad value does nothing to a run with no `--flash`. A
-firmware I know keeps its own layout whatever it says. The board has its own twin,
-`CMM2_BOARD_LAYOUT_FOR_TESTS`, which exists for the tests that burn a program in place of a
-firmware: a start-up error that tells you to unset it only means it is set in your environment.
+firmware I know keeps its own layout whatever it says.
 
 A settings file is for the firmware that made it. A raw file made for another release is the
 wrong size, or, when it is the size of the other release's file, the error says it probably
 belongs to that release. A board's v2 file needs no size arithmetic: its header names the image
-it was made for, and a run whose image differs is refused by name and hash. After `--burn` of
+it was made for, and a run whose image differs is refused: the message shows the length and the
+first 12 hex digits of the SHA-256 of both images. After `--burn` of
 another release, delete `settings.flash` or give another `--flash` file. A plain start of a
 board whose firmware has no layout says so and names `firmware.bin`; burn a firmware I know
 again.

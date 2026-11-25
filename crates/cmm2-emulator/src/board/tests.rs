@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{files_in, scratch_dir, spawning};
+use crate::test_support::{files_in, scratch, spawning};
 use std::collections::HashMap;
 
 fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
@@ -89,7 +89,7 @@ fn with_nowhere_to_look_it_says_what_to_set() {
 
 #[test]
 fn nothing_burned_says_how_to_burn_and_where_the_board_is() {
-    let scratch = scratch_dir("board-nothing");
+    let scratch = scratch("board-nothing");
     for dir in [scratch.join("none"), scratch.to_path_buf()] {
         let err = Board::switch_on(dir.clone(), false).err().unwrap();
         let said = text(&err);
@@ -102,14 +102,14 @@ fn nothing_burned_says_how_to_burn_and_where_the_board_is() {
 
 #[test]
 fn burning_copies_the_image_into_the_board() {
-    let scratch = scratch_dir("board-flash");
+    let scratch = scratch("board-flash");
     let board = burned(&scratch);
     assert_eq!(std::fs::read(board.firmware_path()).unwrap(), image(1));
 }
 
 #[test]
 fn the_board_keeps_its_copy_when_the_source_changes() {
-    let scratch = scratch_dir("board-copy");
+    let scratch = scratch("board-copy");
     let source = firmware_file(&scratch, 1);
     let board = Board::switch_on(scratch.join("board"), true).unwrap();
     burn(&board, &source).unwrap();
@@ -119,7 +119,7 @@ fn the_board_keeps_its_copy_when_the_source_changes() {
 
 #[test]
 fn a_second_firmware_replaces_the_first() {
-    let scratch = scratch_dir("board-replace");
+    let scratch = scratch("board-replace");
     let board = burned(&scratch);
     burn(&board, &firmware_file(&scratch, 2)).unwrap();
     assert_eq!(std::fs::read(board.firmware_path()).unwrap(), image(2));
@@ -127,7 +127,7 @@ fn a_second_firmware_replaces_the_first() {
 
 #[test]
 fn burning_leaves_no_temporary_file() {
-    let scratch = scratch_dir("board-temp");
+    let scratch = scratch("board-temp");
     let board = burned(&scratch);
     drop(board);
     let mut names = files_in(&scratch.join("board"));
@@ -137,7 +137,7 @@ fn burning_leaves_no_temporary_file() {
 
 #[test]
 fn an_image_larger_than_the_flash_is_refused_and_the_old_firmware_stays() {
-    let scratch = scratch_dir("board-large");
+    let scratch = scratch("board-large");
     let board = burned(&scratch);
     let large = scratch.join("large.bin");
     let mut bytes = image(3);
@@ -155,7 +155,7 @@ fn an_image_larger_than_the_flash_is_refused_and_the_old_firmware_stays() {
 
 #[test]
 fn an_image_that_is_not_firmware_is_refused_and_the_old_firmware_stays() {
-    let scratch = scratch_dir("board-bad");
+    let scratch = scratch("board-bad");
     let board = burned(&scratch);
     let bad = scratch.join("bad.bin");
     std::fs::write(&bad, [1, 2, 3]).unwrap();
@@ -166,7 +166,7 @@ fn an_image_that_is_not_firmware_is_refused_and_the_old_firmware_stays() {
 
 #[test]
 fn the_settings_are_kept_across_a_re_burn() {
-    let scratch = scratch_dir("board-settings");
+    let scratch = scratch("board-settings");
     let board = burned(&scratch);
     std::fs::write(board.settings_path(), b"my settings").unwrap();
     burn(&board, &firmware_file(&scratch, 2)).unwrap();
@@ -181,7 +181,7 @@ fn the_settings_are_kept_across_a_re_burn() {
 fn a_burned_board_switches_on_again_without_the_source() {
     // The lock is let go of and taken again here, so no process may be started meanwhile.
     let _alone = spawning();
-    let scratch = scratch_dir("board-again");
+    let scratch = scratch("board-again");
     drop(burned(&scratch));
     let again = Board::switch_on(scratch.join("board"), false).unwrap();
     assert_eq!(std::fs::read(again.firmware_path()).unwrap(), image(1));
@@ -191,7 +191,7 @@ fn a_burned_board_switches_on_again_without_the_source() {
 fn a_board_that_is_on_cannot_be_switched_on_again() {
     // The lock is let go of and taken again here, so no process may be started meanwhile.
     let _alone = spawning();
-    let scratch = scratch_dir("board-lock");
+    let scratch = scratch("board-lock");
     let board = burned(&scratch);
     for burning in [false, true] {
         let err = Board::switch_on(scratch.join("board"), burning)
@@ -212,7 +212,7 @@ fn a_board_that_is_on_cannot_be_switched_on_again() {
 fn a_stale_temporary_file_of_a_cut_short_burn_is_cleared_on_switch_on() {
     // The lock is let go of and taken again here, so no process may be started meanwhile.
     let _alone = spawning();
-    let scratch = scratch_dir("board-stale");
+    let scratch = scratch("board-stale");
     drop(burned(&scratch));
     let stale = scratch.join("board/.cmm2.1.2.tmp");
     std::fs::write(&stale, b"x").unwrap();
@@ -223,14 +223,14 @@ fn a_stale_temporary_file_of_a_cut_short_burn_is_cleared_on_switch_on() {
 
 #[test]
 fn no_card_is_remembered_at_first() {
-    let scratch = scratch_dir("board-no-card");
+    let scratch = scratch("board-no-card");
     let board = burned(&scratch);
     assert_eq!(board.remembered_card().unwrap(), None);
 }
 
 #[test]
 fn the_card_is_remembered_by_its_absolute_path() {
-    let scratch = scratch_dir("board-card");
+    let scratch = scratch("board-card");
     let board = burned(&scratch);
     board.remember_card("/cards/one.img").unwrap();
     assert_eq!(
@@ -247,7 +247,7 @@ fn the_card_is_remembered_by_its_absolute_path() {
 
 #[test]
 fn a_new_card_replaces_the_remembered_one() {
-    let scratch = scratch_dir("board-card-replace");
+    let scratch = scratch("board-card-replace");
     let board = burned(&scratch);
     board.remember_card("/cards/one.img").unwrap();
     board.remember_card("/cards/two.img").unwrap();
@@ -261,7 +261,7 @@ fn a_new_card_replaces_the_remembered_one() {
 fn the_card_is_remembered_by_the_next_switch_on() {
     // The lock is let go of and taken again here, so no process may be started meanwhile.
     let _alone = spawning();
-    let scratch = scratch_dir("board-card-next");
+    let scratch = scratch("board-card-next");
     let board = burned(&scratch);
     board.remember_card("/cards/one.img").unwrap();
     drop(board);
@@ -274,7 +274,7 @@ fn the_card_is_remembered_by_the_next_switch_on() {
 
 #[test]
 fn taking_the_card_out_forgets_it_and_nothing_to_take_out_is_fine() {
-    let scratch = scratch_dir("board-card-out");
+    let scratch = scratch("board-card-out");
     let board = burned(&scratch);
     board.forget_card().unwrap();
     board.remember_card("/cards/one.img").unwrap();
@@ -284,7 +284,7 @@ fn taking_the_card_out_forgets_it_and_nothing_to_take_out_is_fine() {
 
 #[test]
 fn a_record_that_is_not_a_path_is_refused_with_what_to_do() {
-    let scratch = scratch_dir("board-card-bad");
+    let scratch = scratch("board-card-bad");
     let board = burned(&scratch);
     for bad in ["", "relative.img"] {
         std::fs::write(scratch.join("board/sd.path"), bad).unwrap();
@@ -316,7 +316,7 @@ fn an_error_that_is_not_about_the_card_is_left_as_it_is() {
 
 #[test]
 fn a_hand_written_record_may_end_in_a_line_end() {
-    let scratch = scratch_dir("board-card-newline");
+    let scratch = scratch("board-card-newline");
     let board = burned(&scratch);
     for (text, want) in [
         ("/cards/one.img\n", "/cards/one.img"),
@@ -334,7 +334,7 @@ fn a_hand_written_record_may_end_in_a_line_end() {
 
 #[test]
 fn a_record_that_is_not_utf8_gets_the_advice_too() {
-    let scratch = scratch_dir("board-card-bytes");
+    let scratch = scratch("board-card-bytes");
     let board = burned(&scratch);
     std::fs::write(scratch.join("board/sd.path"), [b'/', 0xFF, 0xFE]).unwrap();
     let said = text(board.remembered_card().unwrap_err());
@@ -347,7 +347,7 @@ fn a_record_that_is_not_utf8_gets_the_advice_too() {
 
 #[test]
 fn a_link_in_the_place_of_the_firmware_is_replaced_and_what_it_points_to_is_not_written() {
-    let scratch = scratch_dir("board-link");
+    let scratch = scratch("board-link");
     let board = burned(&scratch);
     let vendor = scratch.join("vendor.bin");
     std::fs::write(&vendor, b"vendor image").unwrap();
@@ -367,7 +367,7 @@ fn a_link_in_the_place_of_the_firmware_is_replaced_and_what_it_points_to_is_not_
 
 #[test]
 fn a_link_in_the_place_of_the_card_record_is_replaced_too() {
-    let scratch = scratch_dir("board-link-card");
+    let scratch = scratch("board-link-card");
     let board = burned(&scratch);
     let other = scratch.join("other");
     std::fs::write(&other, b"keep").unwrap();
@@ -417,7 +417,7 @@ fn the_no_home_message_names_every_variable_that_was_looked_at() {
 #[test]
 fn the_directory_is_private_to_the_user_and_so_are_the_parents_made_with_it() {
     use std::os::unix::fs::PermissionsExt;
-    let scratch = scratch_dir("board-mode");
+    let scratch = scratch("board-mode");
     let dir = scratch.join("share/cmm2-emulator");
     drop(Board::switch_on(dir.clone(), true).unwrap());
     for made in [dir.clone(), dir.parent().unwrap().to_path_buf()] {
@@ -432,7 +432,7 @@ fn a_directory_that_cannot_be_written_still_switches_on_with_its_lock_file_there
         return;
     }
     let _alone = spawning();
-    let scratch = scratch_dir("board-read-only");
+    let scratch = scratch("board-read-only");
     drop(burned(&scratch));
     // The lock file is read-only too (a board that was copied, or made read-only on purpose).
     crate::test_support::mode(&scratch.join("board/board.lock"), 0o444);
@@ -445,7 +445,7 @@ fn a_directory_that_cannot_be_written_still_switches_on_with_its_lock_file_there
 
 #[test]
 fn a_record_may_end_in_several_line_ends_but_not_in_blanks_that_are_the_names() {
-    let scratch = scratch_dir("board-card-blank");
+    let scratch = scratch("board-card-blank");
     let board = burned(&scratch);
     std::fs::write(scratch.join("board/sd.path"), "/cards/one.img\n\n\r\n").unwrap();
     assert_eq!(
@@ -462,7 +462,7 @@ fn a_record_may_end_in_several_line_ends_but_not_in_blanks_that_are_the_names() 
 
 #[test]
 fn a_card_name_that_ends_in_a_line_end_is_refused_when_it_is_given() {
-    let scratch = scratch_dir("board-card-eol");
+    let scratch = scratch("board-card-eol");
     let board = burned(&scratch);
     for name in ["/cards/one\n", "/cards/one\r"] {
         let said = text(board.remember_card(name).unwrap_err());
@@ -473,7 +473,7 @@ fn a_card_name_that_ends_in_a_line_end_is_refused_when_it_is_given() {
 
 #[test]
 fn a_record_that_is_a_directory_gets_the_advice_and_can_be_replaced_or_removed() {
-    let scratch = scratch_dir("board-card-dir");
+    let scratch = scratch("board-card-dir");
     let board = burned(&scratch);
     let record = scratch.join("board/sd.path");
     std::fs::create_dir(&record).unwrap();
@@ -496,7 +496,7 @@ fn a_record_that_is_a_directory_gets_the_advice_and_can_be_replaced_or_removed()
 
 #[test]
 fn a_record_that_is_a_directory_with_something_in_it_is_not_deleted() {
-    let scratch = scratch_dir("board-card-full-dir");
+    let scratch = scratch("board-card-full-dir");
     let board = burned(&scratch);
     let record = scratch.join("board/sd.path");
     std::fs::create_dir(&record).unwrap();
@@ -508,7 +508,7 @@ fn a_record_that_is_a_directory_with_something_in_it_is_not_deleted() {
 
 #[test]
 fn a_link_to_a_directory_or_a_file_that_cannot_be_read_is_replaced_by_a_burn() {
-    let scratch = scratch_dir("board-link-odd");
+    let scratch = scratch("board-link-odd");
     let board = burned(&scratch);
     let unreadable = scratch.join("secret.bin");
     std::fs::write(&unreadable, b"secret").unwrap();
@@ -531,7 +531,7 @@ fn the_lock_file_is_opened_to_write_when_it_can_be_and_to_read_when_that_is_refu
     if crate::test_support::root() {
         return;
     }
-    let scratch = scratch_dir("board-open-lock");
+    let scratch = scratch("board-open-lock");
     let lock = scratch.join("board.lock");
     // Not there: made, and opened to write.
     assert!(!open_lock(&lock).unwrap().1);
@@ -580,7 +580,7 @@ fn the_no_lock_message_says_which_way_the_lock_file_was_opened() {
 #[test]
 fn the_cleanup_of_stale_temporary_files_stays_in_the_board_when_firmware_is_a_link() {
     let _alone = spawning();
-    let scratch = scratch_dir("board-stale-link");
+    let scratch = scratch("board-stale-link");
     drop(burned(&scratch));
     let vendor = scratch.join("vendor");
     std::fs::create_dir(&vendor).unwrap();
@@ -602,7 +602,7 @@ fn the_cleanup_of_stale_temporary_files_stays_in_the_board_when_firmware_is_a_li
 
 #[test]
 fn a_plain_start_on_a_directory_with_no_firmware_makes_nothing_in_it() {
-    let scratch = scratch_dir("board-nothing-in-it");
+    let scratch = scratch("board-nothing-in-it");
     let err = Board::switch_on(scratch.to_path_buf(), false)
         .err()
         .unwrap();
@@ -613,7 +613,7 @@ fn a_plain_start_on_a_directory_with_no_firmware_makes_nothing_in_it() {
 #[test]
 fn a_link_put_in_the_board_directory_does_not_lead_the_cleanup_out_of_it() {
     let _alone = spawning();
-    let scratch = scratch_dir("board-stale-clean-link");
+    let scratch = scratch("board-stale-clean-link");
     drop(burned(&scratch));
     let elsewhere = scratch.join("elsewhere");
     std::fs::create_dir(&elsewhere).unwrap();

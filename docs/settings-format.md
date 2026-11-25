@@ -12,11 +12,19 @@ a board refuses a file that starts with the v2 magic but does not read as v2.
 
 ## Which file a run uses
 
-Only the board of a firmware that `Profile::identify` recognised from its bytes uses v2. A
-recognised firmware is one whose length and hash match a known image; a layout named by
-`CMM2_SETTINGS_LAYOUT` or `CMM2_BOARD_LAYOUT_FOR_TESTS` is an assumption about an image I do not
-know, and an assumption has no place in a header that states the image as fact. Everything else
-- every scratch run, and a board of a labelled layout - keeps the raw file of before.
+Which run writes which file:
+
+- The board writes v2. That is a plain start, a start with `--burn` of a firmware I recognise
+  (the burn starts the board, and writes its settings file in v2), and a start with `--flash
+  <file>` and no `--firmware`, which is the board with another settings file.
+- A scratch run, which is any run with `--firmware`, reads and writes the raw layout ("v1"),
+  whatever the firmware is, a recognised one included. It never writes v2.
+
+The board's firmware is always one that `Profile::identify` recognised from its bytes (a length
+and a hash that match a known image): `--burn` of any other is refused, and so is a start whose
+`firmware.bin` is not one I know. A layout named by `CMM2_SETTINGS_LAYOUT` for an image I do not
+know is an assumption, and an assumption has no place in a header that states the image as fact,
+so that variable is for scratch runs only and they keep the raw file.
 
 A v2 file is refused, never guessed at, when it is newer than this emulator, when it carries
 flags or reserved bits I do not know, when its header does not name the image I am running, or
@@ -36,7 +44,8 @@ when it fails any check below. Nothing of a refused file is loaded, and it is le
 ```
 
 Why a hash of the image and no profile name: the running image identifies itself. If the hash
-matches a profile I know I name it in messages; if not, the message names both hashes. A name
+matches a profile I know I name it in messages. The refusal for a different image shows the length
+of both images and the first 12 hex digits (6 bytes) of each SHA-256, not the whole hash. A name
 field could only lie, and so could `image_len` on its own, which is why a refusal names a release
 only where the length and the hash together are one I know. `entry_count` is checked against the
 number of 32-byte rows the firmware's regions hold before anything of the table is read, so a
@@ -49,7 +58,9 @@ tail and the checksum; entries neither overlap nor cross a region, so the rows t
 never more than the regions and there are never more entries than rows. The longest file either
 format can be, over both releases, is therefore fixed: 1,146,990 bytes. A file larger than that
 is refused on its size before a byte of it is read, so a stranger's 1 GiB file costs nothing
-but a `stat`.
+but a `stat`. Every run checks this, scratch runs too: a scratch run given a larger file says
+"corrupt (it is N bytes, more than the 1146990 bytes any settings file of the firmwares I know
+can be)", and not the older message about the file's size.
 
 ## Entries (entry_count of them)
 
@@ -98,7 +109,7 @@ A check that fails stops the read; there is no fall-through to another kind of f
 3. Bytes starting with the magic: version above 2 is refused as newer; version below 2 or a
    header that ends short is corrupt; non-zero flags or reserved bits are refused as belonging
    to a newer emulator; an `image_len` and hash that differ from the running image are refused
-   as saved for a different firmware.
+   as saved for a different firmware (the message shows 12 hex digits of each hash).
 4. Then the entries: entry count, row multiples, alignment, region containment (with checked
    bounds), order and overlap, and the file reaching past each entry are all checked. A table the
    file does not hold is said as the file ending inside the entry table, never as an entry at an
@@ -116,15 +127,38 @@ A check that fails stops the read; there is no fall-through to another kind of f
 
 ## Migrating a v1 file
 
-On the board's first read of a raw file of this profile: it is loaded exactly as before, the
-machine is encoded back as v2 against the running image and read back to check it, the original
-bytes are copied to `settings.flash.v1` beside it - never overwriting a backup that is already
-there, which is the older copy - and only then is the live file replaced, through the same
+On the board's first read of a raw file of this profile (the board's own `settings.flash`, or
+the file that `--flash` names for the board): it is loaded exactly as before, the machine is
+encoded back as v2 against the running image and read back to check it, the original bytes are
+copied to a backup beside it, and only then is the live file replaced, through the same
 temporary file and rename as every other write. A crash between any two steps leaves the old
-file or the new one, never half of either. The emulator never deletes the backup. That copy is
-made as the live file is made - replaced, never followed - and a name there that a symbolic link
-or a directory holds is refused rather than written through, so the old bytes land beside the
-live file or nowhere.
+file or the new one, never half of either.
+
+No raw bytes are ever lost. The backup is `settings.flash.v1` (the name of the file, with `.v1`
+on the end). If a plain file is already there, it is an older copy and is left alone, and the new
+raw bytes go to the first free name after it: `.v1.2`, `.v1.3`, and so on up to `.v1.99`. Each
+name is looked at without following links. A name that is free is used. A plain file there means
+try the next name. Anything else there (a symbolic link, a directory, a device, or a name that
+cannot be looked at) is refused, and nothing is written, so the old bytes land beside the live
+file or nowhere. When all of the names from `.v1` to `.v1.99` are taken, the migration is
+refused with a message that says so, and nothing is written. The emulator never deletes a backup.
+
+A backup is written whole or not at all (to a temporary file, then hard-linked to its name), and
+never over a name that is taken: if something appears at the chosen name before the write, the
+names are looked at again. A plain file at a name whose bytes are exactly the raw bytes being
+migrated is that backup already made, by a migration that was cut short before the live file was
+replaced; it is used and nothing more is written, so a failing replace does not fill up the names
+with identical copies. The check reads such a file only when it is as long as the raw file.
+
+The copy is made with a hard link, and a file system that refuses one (EPERM or EOPNOTSUPP) stops
+the migration with a message that names the hard link and says that nothing was written and the
+live file is untouched. There is no fallback to a plain copy, which could be replaced under the
+emulator: a refused migration loses no bytes. If the new v2 file does not read back, the
+message says that, and that nothing was written; it offers no restore, as the live file is still
+the raw file.
+
+The live file is replaced as the board's own files are: a symbolic link at its name is replaced
+by the new file, never followed. This is the same for every later save of the board's file.
 
 ## Versioning story
 

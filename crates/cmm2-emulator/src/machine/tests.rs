@@ -24,7 +24,6 @@ fn the_ds3231_is_fitted_and_shows_the_hosts_time() {
     // The chip's own default clock stands at the year 2000, until the host's is attached.
     let shown = machine.cpu.memory().ds3231().time();
     assert_ne!(shown.year, 2000);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 // A program that turns the RNG's clocks on, enables it, waits for DRDY and reads the first word
@@ -67,9 +66,7 @@ fn first_rng_word(name: &str, seed: Option<u64>) -> u32 {
     let mut machine =
         build_machine(firmware.to_str().unwrap(), &options, LAYOUT_VARIABLE, false).unwrap();
     machine.cpu.run(20_000);
-    let word = machine.cpu.reg(4);
-    std::fs::remove_dir_all(&dir).unwrap();
-    word
+    machine.cpu.reg(4)
 }
 
 #[test]

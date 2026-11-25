@@ -1,7 +1,9 @@
 //! The `--flash` and `--sd` files: read into the machine at the start and written back at the end.
 
 use crate::args::RunOptions;
-use crate::atomic_write::{remove_stale_temps, replace_atomically, write_atomically};
+use crate::atomic_write::{
+    create_new_atomically, remove_stale_temps, replace_atomically, write_atomically,
+};
 use crate::error::{RunError, say};
 use crate::saveable::{access, check_regular, why_not_saveable};
 use cmm2_core::{
@@ -11,16 +13,10 @@ use cmm2_core::{
 use std::io;
 use std::path::Path;
 
-/// Loads the saved flash and clock from the `--flash` file. A file that is not there yet is the first run:
-/// the flash stays as the firmware leaves it. The options have to be saved at the end, so a
-/// file that could not be is refused now and not after a long run. `labelled_by` is the variable
-/// that named a layout for a firmware I cannot recognise, given only for the board, whose only
-/// reason to be reading the raw layout is that variable.
-pub(crate) fn load_flash(
-    cpu: &mut Cpu,
-    path: &str,
-    labelled_by: Option<&str>,
-) -> Result<(), RunError> {
+/// Loads the saved flash and clock from the `--flash` file. A file that is not there yet is the
+/// first run: the flash stays as the firmware leaves it. The options have to be saved at the end,
+/// so a file that could not be is refused now and not after a long run.
+pub(crate) fn load_flash(cpu: &mut Cpu, path: &str) -> Result<(), RunError> {
     let flash_error = |source| RunError::Flash {
         path: path.to_string(),
         source,
@@ -42,23 +38,21 @@ pub(crate) fn load_flash(
     }
     remove_stale_temps(path);
     // A file is measured before it is read, because the bound is the format's and not the
-    // file's: nothing larger than the longest file either format can be could be a settings
-    // file at all, and reading one whole is what a stranger should not cost. What is wrong with
-    // a file that cannot be measured is left for the read to say, as it always was.
+    // file's: nothing larger than the longest file either format can be is a settings file, and
+    // a stranger's huge file should cost a `stat`. A file that cannot be measured is left for
+    // the read to say.
     let largest = Profile::largest_settings_file() as u64;
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.len() > largest => {
-            return Err(settings_error(
-                path,
-                SettingsError::Corrupt(format!(
-                    "it is {} bytes, more than the {largest} bytes any settings file of the \
-                     firmwares I know can be",
-                    meta.len()
-                )),
-            ));
-        }
-        // Everything else, a file that cannot be measured with it, is for the read to say.
-        _ => {}
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > largest
+    {
+        return Err(settings_error(
+            path,
+            SettingsError::Corrupt(format!(
+                "it is {} bytes, more than the {largest} bytes any settings file of the \
+                 firmwares I know can be",
+                meta.len()
+            )),
+        ));
     }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -68,13 +62,11 @@ pub(crate) fn load_flash(
     if cpu.settings_v2() {
         return load_v2(cpu, path, &bytes);
     }
-    // The raw layout, read as always. One thing is new: a file that starts with the v2 magic
-    // is a board's own file, and raw bytes are exactly what it is not. Nothing of it is
-    // read, and nothing is written; the message names the two ways round it.
+    // The raw layout, read as always, except that a file with the v2 magic is not raw: nothing
+    // of it is read or written, and the message names the ways round it.
     if bytes.starts_with(&MAGIC) {
         return Err(RunError::V2InRawRun {
             path: path.to_string(),
-            labelled_by: labelled_by.map(str::to_string),
         });
     }
     cpu.load_persistent(&bytes)
@@ -85,8 +77,7 @@ pub(crate) fn load_flash(
 }
 
 /// The v2 load order, and the only order it is read in, so that "corrupt" fires only once
-/// every legitimate kind of file has been ruled out (docs/settings-format.md, rule 7 of the
-/// reading rules).
+/// every legitimate kind of file has been ruled out (docs/settings-format.md, reading rule 7).
 fn load_v2(cpu: &mut Cpu, path: &str, bytes: &[u8]) -> Result<(), RunError> {
     let profile = cpu.profile().expect("load_flash checked for a profile");
     match classify(bytes, profile) {
@@ -100,8 +91,7 @@ fn load_v2(cpu: &mut Cpu, path: &str, bytes: &[u8]) -> Result<(), RunError> {
                 })
         }
         Ok(FileKind::V1) => {
-            // A v1 file of this profile: applied by today's reader unchanged, then migrated
-            // to v2 (the machine first, the files after, in `migrate`).
+            // A v1 file of this profile: applied by the raw reader, then migrated to v2.
             cpu.load_persistent(bytes)
                 .map_err(|source| RunError::FlashSize {
                     path: path.to_string(),
@@ -111,8 +101,8 @@ fn load_v2(cpu: &mut Cpu, path: &str, bytes: &[u8]) -> Result<(), RunError> {
         }
         Ok(FileKind::OtherRelease(_)) => Err(RunError::FlashSize {
             path: path.to_string(),
-            // The shipped message, from the same error the raw reader makes for this file:
-            // it names the other release and never says corrupt.
+            // The raw reader's own message for this file: it names the other release and
+            // never says corrupt.
             source: PersistentError::Size(PersistentSizeError {
                 got: bytes.len(),
                 profile,
@@ -122,71 +112,175 @@ fn load_v2(cpu: &mut Cpu, path: &str, bytes: &[u8]) -> Result<(), RunError> {
     }
 }
 
-/// A migration's or a refusal's error, naming the copy of the old settings that can be restored:
-/// the clause is only true, and only worth saying, when that file is there. It is named as it is
-/// named, which is the `--flash` path with `.v1` on the end, whatever that path was called.
+/// A refusal's error. A corrupt file also names the copy of the old settings that can be
+/// restored, when that copy is there: the first backup name, the `--flash` path with `.v1` on
+/// the end, whatever that path was called.
 fn settings_error(path: &str, source: SettingsError) -> RunError {
-    let backup = backup_path(path);
-    let worth_naming = matches!(source, SettingsError::Corrupt(_)) && backup.exists();
+    let backup = backup_name(path, 1);
+    let worth_naming = matches!(source, SettingsError::Corrupt(_)) && Path::new(&backup).exists();
     RunError::Settings {
         path: path.to_string(),
         source: Box::new(source),
-        backup: worth_naming.then(|| backup.to_string_lossy().into_owned()),
+        backup: worth_naming.then_some(backup),
     }
 }
 
-/// The file a migrated v1 is kept in: beside the live one, under a name that says so.
-fn backup_path(path: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("{path}.v1"))
+/// The most copies of old settings that are kept beside one file: `.v1`, then `.v1.2` to `.v1.99`.
+const MAX_BACKUPS: usize = 99;
+
+/// The name of the `n`th copy of the settings that a migration replaced.
+fn backup_name(path: &str, n: usize) -> String {
+    match n {
+        1 => format!("{path}.v1"),
+        n => format!("{path}.v1.{n}"),
+    }
 }
 
-/// Replaces the v1 file with its v2 form, in the order that can never destroy the last
-/// good copy (the plan's M2): every check first, then the complete-or-absent backup, then
-/// the live file. A crash between any two leaves the old file or the new one, never half
-/// of either; a run that restarts before step 3 just takes step 2's skipped path.
+/// A whole file, by its name.
+fn read_file(path: &str) -> io::Result<Vec<u8>> {
+    std::fs::read(path)
+}
+
+/// Where the raw bytes of a file being migrated are kept.
+enum Backup {
+    /// A plain file with exactly these bytes is already there: a migration that was cut short
+    /// after its backup made it, so it is used and nothing is written.
+    Kept,
+    /// Nothing holds this name.
+    Free(String),
+}
+
+/// The backup for `original`: a copy of it that is already there, or else the first name that
+/// nothing holds. A plain file with other bytes is an older copy, and is left alone. Anything else
+/// at a name - a link, a directory, a device - is refused, and so is a name that cannot be looked
+/// at: it is not this board's to write through or over.
+fn find_backup(
+    path: &str,
+    original: &[u8],
+    read: &impl Fn(&str) -> io::Result<Vec<u8>>,
+) -> Result<Backup, RunError> {
+    for n in 1..=MAX_BACKUPS {
+        let backup = backup_name(path, n);
+        match std::fs::symlink_metadata(&backup) {
+            // The length is compared first, so a file is read only if it could be the same, and
+            // that is never more than the file being migrated (itself at most the largest size).
+            Ok(held) if held.file_type().is_file() => {
+                if held.len() == original.len() as u64
+                    && read(&backup).is_ok_and(|bytes| bytes == original)
+                {
+                    return Ok(Backup::Kept);
+                }
+            }
+            Ok(_) => {
+                return Err(RunError::BackupNotAFile {
+                    path: path.to_string(),
+                    backup,
+                });
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(Backup::Free(backup));
+            }
+            Err(source) => {
+                return Err(RunError::Flash {
+                    path: backup,
+                    source,
+                });
+            }
+        }
+    }
+    Err(RunError::BackupsFull {
+        path: path.to_string(),
+        first: backup_name(path, 1),
+        last: backup_name(path, MAX_BACKUPS),
+    })
+}
+
+/// Makes sure the raw bytes are kept beside the live file, so that none are ever lost. A name
+/// that is taken between looking and writing is not replaced: the names are looked at again.
+fn keep_backup(
+    path: &str,
+    original: &[u8],
+    mut write_backup: impl FnMut(&str, &[u8]) -> io::Result<()>,
+    read_backup: impl Fn(&str) -> io::Result<Vec<u8>>,
+) -> Result<(), RunError> {
+    for _ in 0..MAX_BACKUPS {
+        let backup = match find_backup(path, original, &read_backup)? {
+            Backup::Kept => return Ok(()),
+            Backup::Free(backup) => backup,
+        };
+        match write_backup(&backup, original) {
+            Ok(()) => return Ok(()),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) if source.kind() == io::ErrorKind::Unsupported => {
+                return Err(RunError::BackupNeedsLink {
+                    path: path.to_string(),
+                    backup,
+                    source,
+                });
+            }
+            Err(source) => {
+                return Err(RunError::Flash {
+                    path: backup,
+                    source,
+                });
+            }
+        }
+    }
+    Err(RunError::BackupsFull {
+        path: path.to_string(),
+        first: backup_name(path, 1),
+        last: backup_name(path, MAX_BACKUPS),
+    })
+}
+
+/// Replaces the v1 file with its v2 form, in the order that can never destroy the last good
+/// copy: every check first, then the backup, then the live file. A crash between two steps leaves
+/// the old file or the new one, never half of either.
 fn migrate(cpu: &mut Cpu, path: &str, original: &[u8]) -> Result<(), RunError> {
-    // Step 1: encode from the machine that already has the file applied, and read the
-    // bytes back, all before any file is touched.
-    let v2 = cpu.save_settings().map_err(|source| RunError::NoLayout {
+    migrate_with(
+        cpu,
+        path,
+        original,
+        Cpu::save_settings,
+        create_new_atomically,
+        read_file,
+        replace_atomically,
+    )
+}
+
+/// `migrate`, with the encoder and the two writers given, so that a test can hand it an encoder
+/// that writes a bad file, or a write that fails. `write_backup` must never replace a name that
+/// is taken, and `read_backup` reads a copy that is already there; `write_live` replaces the live
+/// file.
+fn migrate_with(
+    cpu: &mut Cpu,
+    path: &str,
+    original: &[u8],
+    encode: impl FnOnce(&mut Cpu) -> Result<Vec<u8>, NoLayout>,
+    write_backup: impl FnMut(&str, &[u8]) -> io::Result<()>,
+    read_backup: impl Fn(&str) -> io::Result<Vec<u8>>,
+    write_live: impl FnOnce(&str, &[u8]) -> io::Result<()>,
+) -> Result<(), RunError> {
+    // Step 1: encode from the machine that already has the file applied, and read the bytes
+    // back, before any file is touched.
+    let v2 = encode(cpu).map_err(|source| RunError::NoLayout {
         path: path.to_string(),
         source,
     })?;
     let profile = cpu.profile().expect("load_flash checked for a profile");
-    decode_v2(&v2, cpu.image(), profile).map_err(|source| settings_error(path, source))?;
-    // Step 2: the backup, replaced rather than followed as the live file is, so that it lands
-    // beside the live file and not wherever a link points. If a plain file is already there, it
-    // came from an earlier migration of this board's history: leave it alone, it is the older
-    // copy. Anything else at that name - a link, a directory, a device - is refused rather than
-    // followed or replaced, because it is not this board's to write through.
-    let backup = backup_path(path);
-    let backup = backup.to_string_lossy().into_owned();
-    let an_older_backup_is_there = match std::fs::symlink_metadata(&backup) {
-        Ok(held) if held.file_type().is_file() => true,
-        Ok(_) => {
-            return Err(RunError::BackupNotAFile {
-                path: path.to_string(),
-                backup,
-            });
-        }
-        // Nothing at the name: the first migration of this file, which is the only case that
-        // writes one.
-        Err(source) if source.kind() == io::ErrorKind::NotFound => false,
-        Err(source) => {
-            return Err(RunError::Flash {
-                path: backup,
-                source,
-            });
-        }
-    };
-    if !an_older_backup_is_there {
-        replace_atomically(&backup, original).map_err(|source| RunError::Flash {
-            path: backup.clone(),
-            source,
-        })?;
-    }
-    // Step 3: replace the live file, as the board's own files are replaced: a symlink at
-    // that name is the board's, and is replaced rather than followed.
-    replace_atomically(path, &v2).map_err(|source| RunError::Flash {
+    decode_v2(&v2, cpu.image(), profile).map_err(|source| RunError::NotReadBack {
+        path: path.to_string(),
+        reason: match source {
+            SettingsError::Corrupt(reason) => reason,
+            other => other.to_string(),
+        },
+    })?;
+    // Step 2: the raw bytes are kept first, in a copy that is made whole and never replaces a
+    // name, and never lands where a link points.
+    keep_backup(path, original, write_backup, read_backup)?;
+    // Step 3: only now the live file, as the board's own files are replaced: a symlink at that
+    // name is the board's, and is replaced rather than followed.
+    write_live(path, &v2).map_err(|source| RunError::Flash {
         path: path.to_string(),
         source,
     })

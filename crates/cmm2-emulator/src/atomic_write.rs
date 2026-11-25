@@ -43,7 +43,7 @@ const MAX_LINKS: usize = 40;
 /// file's name, and so that two emulators on one file, or a temporary file that an earlier
 /// crash left under a repeated process id (in a container), do not get in the way.
 pub(crate) fn write_atomically(path: &str, bytes: &[u8]) -> io::Result<()> {
-    write_over(path, resolve(Path::new(path))?, bytes)
+    write_over(path, resolve(Path::new(path))?, bytes, rename_over)
 }
 
 /// `write_atomically`, but a symbolic link at `path` is replaced by the new file and not followed:
@@ -51,10 +51,42 @@ pub(crate) fn write_atomically(path: &str, bytes: &[u8]) -> io::Result<()> {
 /// file in its place in one step. This is for the board's own files, which are the board's
 /// and not the user's to link elsewhere.
 pub(crate) fn replace_atomically(path: &str, bytes: &[u8]) -> io::Result<()> {
-    write_over(path, PathBuf::from(path), bytes)
+    write_over(path, PathBuf::from(path), bytes, rename_over)
 }
 
-fn write_over(path: &str, target: PathBuf, bytes: &[u8]) -> io::Result<()> {
+/// Makes a new file at `path` that appears whole or not at all, and never replaces a name that is
+/// taken: the bytes are written to a temporary file as for `write_atomically`, which is then
+/// hard-linked to the name (the link fails with `AlreadyExists` if anything is there, a link
+/// included, which is not followed) and removed. For the copies of old settings.
+pub(crate) fn create_new_atomically(path: &str, bytes: &[u8]) -> io::Result<()> {
+    write_over(path, PathBuf::from(path), bytes, link_to)
+}
+
+/// Puts the finished temporary file at the target's name as a second name for it, which fails if
+/// the name is taken. A file system that has no hard links says EPERM or EOPNOTSUPP (the same number as ENOTSUP on
+/// Linux; no other system's names are handled); that
+/// is told apart from the other errors of the write (a directory that cannot be written is EACCES,
+/// and so is a failed temporary file) by making it `ErrorKind::Unsupported`.
+fn link_to(temp: &Path, target: &Path) -> io::Result<()> {
+    std::fs::hard_link(temp, target).map_err(|err| match err.raw_os_error() {
+        Some(libc::EPERM | libc::EOPNOTSUPP) => {
+            io::Error::new(io::ErrorKind::Unsupported, err.to_string())
+        }
+        _ => err,
+    })
+}
+
+/// Puts the finished temporary file at the target's name: a rename, which replaces the name.
+fn rename_over(temp: &Path, target: &Path) -> io::Result<()> {
+    std::fs::rename(temp, target)
+}
+
+fn write_over(
+    path: &str,
+    target: PathBuf,
+    bytes: &[u8],
+    publish: fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
     let dir = match target.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -65,11 +97,9 @@ fn write_over(path: &str, target: PathBuf, bytes: &[u8]) -> io::Result<()> {
     let temp = dir.join(format!(".cmm2.{}.{nanos}.tmp", std::process::id()));
 
     let mut file = create_locked(&temp)?;
-    let written =
-        write_synced(&mut file, &target, bytes).and_then(|()| std::fs::rename(&temp, &target));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
+    let written = write_synced(&mut file, &target, bytes).and_then(|()| publish(&temp, &target));
+    // A rename has used the temporary file up (this finds nothing); a link has not.
+    let _ = std::fs::remove_file(&temp);
     written?;
     // The file is in its place by now, so a directory that cannot be synced (one that cannot be
     // read, or a file system that has no such thing) is something to say and not a failed save.

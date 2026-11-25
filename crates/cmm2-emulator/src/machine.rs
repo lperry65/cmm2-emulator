@@ -90,12 +90,7 @@ pub(crate) fn build_machine(
         cpu.use_settings_v2();
     }
     if let Some(path) = &options.flash {
-        // A board reads the raw layout for one reason only: a variable named a layout for a
-        // firmware I cannot recognise, since an image I know puts it on v2 and a scratch run is
-        // raw whatever a variable says. `load_flash` refuses a firmware with no layout at all
-        // before it says anything about a file, so naming the variable here is never a guess.
-        let labelled_by = on_board.then_some(variable);
-        load_flash(&mut cpu, path, labelled_by)?;
+        load_flash(&mut cpu, path)?;
     }
     if let Some(path) = &options.sd {
         load_sd(&sd, path)?;

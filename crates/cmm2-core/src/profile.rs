@@ -2,7 +2,7 @@
 //! exactly that and nothing of the firmware's code. See issue 82.
 
 use crate::ds3231::STATE_SIZE;
-use crate::settings::{CRC_SIZE, HEADER_SIZE, ROW};
+use crate::settings::{CRC_SIZE, ENTRY_SIZE, HEADER_SIZE, ROW};
 
 /// A run of flash that the firmware writes and the user's settings file must keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,8 +163,7 @@ impl Profile {
                 let rows = flash / ROW;
                 let tail = CLOCK_SIZE + STATE_SIZE;
                 let v1 = flash + tail;
-                // 8 bytes of address and length per entry.
-                let v2 = HEADER_SIZE + rows * 8 + flash + tail + CRC_SIZE;
+                let v2 = HEADER_SIZE + rows * ENTRY_SIZE + flash + tail + CRC_SIZE;
                 v1.max(v2)
             })
             .max()

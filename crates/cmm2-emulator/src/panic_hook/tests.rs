@@ -75,7 +75,6 @@ fn a_panic_message_that_was_held_back_is_said_after_the_files_are_saved() {
     assert!(last.1.contains("a bug in the emulator"), "{last:?}");
     assert!(HELD_PANICS.lock().unwrap().is_empty());
     assert!(!HOLDING.load(std::sync::atomic::Ordering::Acquire));
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -178,7 +177,6 @@ fn the_installed_hook_holds_a_panic_of_the_run_and_it_is_said_after_the_save() {
     assert!(HELD_PANICS.lock().unwrap().is_empty());
     // A panic after the run is the default hook's again, and the thread can hold again.
     assert!(!PANIC_SEEN.with(std::cell::Cell::get));
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

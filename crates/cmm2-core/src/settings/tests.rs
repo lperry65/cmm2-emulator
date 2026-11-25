@@ -98,8 +98,8 @@ fn tails() -> [(&'static str, Vec<u8>); 3] {
     [("clock", clock), ("offset", offset), ("ds3231", state)]
 }
 
-/// The forms a v1 file of `profile` comes in, as `regions_for` counts them today: nine for
-/// b5's two region sets, three for RC6's one.
+/// The forms a v1 file of `profile` comes in, as `regions_for` counts them today: six for b5
+/// (two region sets, three tails each) and three for RC6 (one region set), nine in all.
 fn v1_forms(profile: &'static Profile) -> Vec<(String, &'static [Region], Vec<u8>)> {
     tails()
         .into_iter()
@@ -227,6 +227,69 @@ fn a_round_trip_keeps_entries_clock_and_ds3231() {
         let bytes = encode(&image, &sha256(&image), &settings);
         assert_eq!(decode_v2(&bytes, &image, &B5).unwrap(), settings);
     }
+}
+
+// A v2 file written out byte by byte, so that the layout in docs/settings-format.md is pinned by
+// something other than this crate's own encoder. Every field was worked out by hand from that
+// page; the SHA-256 and the CRC-32 came from Python (`hashlib.sha256` and `zlib.crc32`), not from
+// this crate. The image is the 15 bytes of b"golden image 01".
+const GOLDEN_IMAGE: &[u8] = b"golden image 01";
+
+fn golden_file() -> Vec<u8> {
+    [
+        // Header, 48 bytes: the magic, version 2, flags 0, reserved 0 0.
+        &[0x43, 0x4d, 0x4d, 0x32, 0x02, 0x00, 0x00, 0x00][..],
+        // image_len = 15, little-endian.
+        &[0x0f, 0x00, 0x00, 0x00],
+        // image_hash = hashlib.sha256(GOLDEN_IMAGE).digest().
+        &[
+            0xfd, 0x0b, 0xa8, 0xb9, 0x24, 0xf2, 0x83, 0x95, 0x56, 0x55, 0x32, 0xd2, 0x6d, 0x80,
+            0x01, 0xe1, 0x3a, 0xa4, 0x31, 0x27, 0x68, 0x4e, 0x4e, 0x7f, 0x50, 0x99, 0x21, 0x81,
+            0x2d, 0x67, 0x58, 0x02,
+        ],
+        // entry_count = 2.
+        &[0x02, 0x00, 0x00, 0x00],
+        // Entry 1: addr 0x080F8540 (the b5 block), len 32, then 32 bytes of 0xA5.
+        &[0x40, 0x85, 0x0f, 0x08, 0x20, 0x00, 0x00, 0x00],
+        &[0xa5; 32],
+        // Entry 2: addr 0x08120020 (the row after the first of the user flash), len 64, then the
+        // bytes 0x40 to 0x7F.
+        &[0x20, 0x00, 0x12, 0x08, 0x40, 0x00, 0x00, 0x00],
+        &[
+            0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d,
+            0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b,
+            0x5c, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+            0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77,
+            0x78, 0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f,
+        ],
+        // Clock: TR 0x00123045, then DR 0x00269112, a little-endian word each.
+        &[0x45, 0x30, 0x12, 0x00, 0x12, 0x91, 0x26, 0x00],
+        // The DS3231's state, 10 bytes: 1 to 10.
+        &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a],
+        // CRC-32 of the 178 bytes above (zlib.crc32 = 0xE30C7CB7), little-endian.
+        &[0xb7, 0x7c, 0x0c, 0xe3],
+    ]
+    .concat()
+}
+
+#[test]
+fn a_golden_v2_file_reads_and_is_written_back_byte_for_byte() {
+    let file = golden_file();
+    assert_eq!(
+        file.len(),
+        HEADER_SIZE + (8 + 32) + (8 + 64) + 8 + STATE_SIZE + CRC_SIZE
+    );
+    let want = Settings {
+        entries: vec![
+            (0x080F_8540, vec![0xA5; 32]),
+            (0x0812_0020, (0x40..0x80).collect()),
+        ],
+        clock: [0x0012_3045, 0x0026_9112],
+        ds3231: Some([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+    };
+
+    assert_eq!(decode_v2(&file, GOLDEN_IMAGE, &B5).unwrap(), want);
+    assert_eq!(encode(GOLDEN_IMAGE, &sha256(GOLDEN_IMAGE), &want), file);
 }
 
 #[test]
@@ -483,14 +546,31 @@ fn a_saved_release_is_named_when_its_length_and_hash_are_both_its_own() {
 #[test]
 fn an_absurd_entry_count_is_corrupt_before_anything_is_reserved() {
     let image = synthetic_image(1 << 16);
-    let one_row_too_many = (USER_FLASH / ROW as u32 + BLOCK_SIZE as u32 / ROW as u32 + 1) + 8;
-    for count in [0xFFFF_FFFFu32, one_row_too_many] {
-        let err = decode_v2(&tamper(&image, 44, &count.to_le_bytes()), &image, &B5).unwrap_err();
-        assert!(
-            matches!(&err, SettingsError::Corrupt(r) if r.contains("entry count")),
-            "count {count:#x}: {err}"
-        );
-    }
+    let err = decode_v2(&tamper(&image, 44, &u32::MAX.to_le_bytes()), &image, &B5).unwrap_err();
+    assert!(
+        matches!(&err, SettingsError::Corrupt(r) if r.contains("entry count")),
+        "{err}"
+    );
+}
+
+// The count is bounded by the rows the profile's regions hold: that many is a count the file can
+// still fail on (it has no table), and one more is refused as a count.
+#[test]
+fn exactly_one_entry_more_than_the_rows_is_refused_as_a_count() {
+    let image = synthetic_image(1 << 16);
+    let rows = (B5.flash_size() / ROW) as u32;
+    assert_eq!(rows, (USER_FLASH + BLOCK_SIZE as u32) / ROW as u32);
+
+    let err = decode_v2(&no_table_file(&image, rows), &image, &B5).unwrap_err();
+    assert!(
+        matches!(&err, SettingsError::Corrupt(r) if r == "the file ends inside the entry table"),
+        "as many entries as rows is within the bound: {err}"
+    );
+    let err = decode_v2(&no_table_file(&image, rows + 1), &image, &B5).unwrap_err();
+    assert!(
+        matches!(&err, SettingsError::Corrupt(r) if r.contains("entry count")),
+        "one more than the rows: {err}"
+    );
 }
 
 /// The same file, refused by the chip's own range instead of by the format: the entries and the
@@ -699,9 +779,8 @@ fn only_the_two_tails_today_are_read() {
 
 #[test]
 fn a_v1_file_that_happens_to_start_with_the_magic_is_refused_and_left_alone() {
-    // NOTE 2 of the plan: four bytes of "CMM2" at the head of a region dump. classify sees
-    // the magic first, so the file is refused and never read as v1 or migrated. Nothing is
-    // written, so the bytes underneath stay intact wherever they came from.
+    // Four bytes of "CMM2" at the head of a region dump: `classify` sees the magic first, so
+    // the file is refused and never read as v1 or migrated.
     let image = synthetic_image(1 << 16);
     let mut bytes = v1_file(&B5, &image, B5.regions, &clock_tail(), &[]);
     bytes[..4].copy_from_slice(b"CMM2");
@@ -725,12 +804,12 @@ fn the_corrupt_message_is_the_one_the_user_sees() {
     );
 }
 
-// The equivalence suite: the file changes, the flash does not (the plan's M3).
+// The equivalence suite: the file changes, the flash does not.
 
 #[test]
 fn b5_at_its_real_length_migrates_word_for_word() {
-    // The case my board is in today: the image ends 216 bytes below 0x08120000, so every
-    // row of the user flash region reads FF, inside the file or out of it.
+    // The real b5 length: the image ends 216 bytes below 0x08120000, so every row of the user
+    // flash region reads FF, inside the file or out of it.
     let image = synthetic_image(1_179_432);
     let v1 = v1_file(&B5, &image, B5.regions, &clock_tail(), &[]);
     let settings = assert_migrates_word_for_word(&image, &B5, &v1);
@@ -981,7 +1060,7 @@ fn save_settings_twice_gives_the_same_bytes() {
 #[test]
 fn a_raw_file_of_the_other_release_size_is_the_other_release_not_corrupt() {
     // "Corrupt" may only fire after every legitimate branch is excluded (docs/settings-format.md,
-    // rule 7 of the reading rules).
+    // reading rule 7).
     let rc6_size = RC6.flash_size() + CLOCK_SIZE;
     assert!(
         matches!(

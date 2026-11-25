@@ -27,7 +27,6 @@ fn the_files_are_saved_when_the_run_returns() {
     assert_eq!(answer, 7);
     saved.unwrap();
     assert!(file.exists());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -57,7 +56,6 @@ fn the_files_are_saved_when_the_run_panics_and_the_panic_carries_on() {
     let panic = panicked.expect_err("the panic is not swallowed");
     assert_eq!(panic.downcast_ref::<&str>(), Some(&"a bug in the emulator"));
     assert_eq!(std::fs::read(&file).unwrap().len(), B5.persistent_size());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

@@ -17,7 +17,6 @@ fn a_flash_link_is_judged_by_the_directory_of_the_file_it_points_to() {
 
     mode(&dir.join("locked"), 0o755);
     assert_eq!(why.as_deref(), Some("its directory is not writable"));
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -27,7 +26,6 @@ fn a_link_to_a_regular_file_is_one() {
     symlink("real", dir.join("link")).unwrap();
     assert!(check_regular(dir.join("link").to_str().unwrap()).is_ok());
     assert!(check_regular(dir.join("missing").to_str().unwrap()).is_ok());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -53,7 +51,6 @@ fn an_ordinary_file_is_not_immutable_and_an_unreadable_flag_is_not_a_reason() {
     assert_eq!(FS_IMMUTABLE_OR_APPEND, 0x30);
     // A file system that does not know the ioctl leaves the flags 0.
     assert!(!is_immutable(&File::open("/dev/null").unwrap()));
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -85,7 +82,6 @@ fn searching_a_directory_and_writing_to_it_are_said_apart() {
     );
     mode(&dir, 0o755);
     assert_eq!(why_not_saveable(path), None);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -95,5 +91,4 @@ fn an_ordinary_directory_is_not_append_only() {
     let dir = scratch("dir-flags");
     assert!(!is_immutable(&File::open(&dir).unwrap()));
     assert_eq!(why_not_saveable(dir.join("flash").to_str().unwrap()), None);
-    std::fs::remove_dir_all(&dir).unwrap();
 }

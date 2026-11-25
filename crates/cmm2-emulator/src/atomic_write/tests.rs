@@ -1,12 +1,12 @@
 use super::*;
-use crate::test_support::{age, files_in, mode, root, scratch_dir, spawning};
+use crate::test_support::{age, files_in, mode, root, scratch, spawning};
 use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 #[test]
 fn a_file_is_written_whole_and_replaced_whole() {
-    let dir = scratch_dir("atomic-plain");
+    let dir = scratch("atomic-plain");
     let file = dir.join("a.img");
     write_atomically(file.to_str().unwrap(), b"first").unwrap();
     assert_eq!(std::fs::read(&file).unwrap(), b"first");
@@ -18,7 +18,7 @@ fn a_file_is_written_whole_and_replaced_whole() {
 
 #[test]
 fn a_symlink_is_written_through_and_stays_a_symlink() {
-    let dir = scratch_dir("atomic-link");
+    let dir = scratch("atomic-link");
     let real = dir.join("real.img");
     let link = dir.join("link.img");
     std::fs::write(&real, b"old").unwrap();
@@ -33,7 +33,7 @@ fn a_symlink_is_written_through_and_stays_a_symlink() {
 
 #[test]
 fn a_symlink_to_another_directory_is_written_there() {
-    let dir = scratch_dir("atomic-link-dir");
+    let dir = scratch("atomic-link-dir");
     let elsewhere = dir.join("elsewhere");
     std::fs::create_dir(&elsewhere).unwrap();
     std::fs::write(elsewhere.join("real.img"), b"old").unwrap();
@@ -49,7 +49,7 @@ fn a_symlink_to_another_directory_is_written_there() {
 
 #[test]
 fn the_permissions_of_the_old_file_are_kept() {
-    let dir = scratch_dir("atomic-mode");
+    let dir = scratch("atomic-mode");
     let file = dir.join("a.img");
     std::fs::write(&file, b"old").unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
@@ -61,7 +61,7 @@ fn the_permissions_of_the_old_file_are_kept() {
 
 #[test]
 fn the_temporary_file_is_never_taken_over_and_a_stale_one_does_not_block_the_save() {
-    let dir = scratch_dir("atomic-unique");
+    let dir = scratch("atomic-unique");
     let file = dir.join("a.img");
     // Somebody else's file with the name another process would use, and one that an
     // earlier crash left under this very process id (a container starts at the same one).
@@ -80,7 +80,7 @@ fn the_temporary_file_is_never_taken_over_and_a_stale_one_does_not_block_the_sav
 
 #[test]
 fn a_dangling_symlink_is_written_through_and_the_target_is_made() {
-    let dir = scratch_dir("atomic-dangling");
+    let dir = scratch("atomic-dangling");
     let link = dir.join("link.img");
     symlink("real.img", &link).unwrap();
 
@@ -93,7 +93,7 @@ fn a_dangling_symlink_is_written_through_and_the_target_is_made() {
 
 #[test]
 fn a_chain_of_links_to_a_target_that_is_not_there_is_followed_to_its_end() {
-    let dir = scratch_dir("atomic-chain");
+    let dir = scratch("atomic-chain");
     std::fs::create_dir(dir.join("sub")).unwrap();
     symlink("sub/second", dir.join("first")).unwrap();
     // Relative to the directory of the link that holds it, which is sub.
@@ -116,7 +116,7 @@ fn a_chain_of_links_to_a_target_that_is_not_there_is_followed_to_its_end() {
 
 #[test]
 fn a_loop_of_links_is_an_error() {
-    let dir = scratch_dir("atomic-loop");
+    let dir = scratch("atomic-loop");
     symlink("b", dir.join("a")).unwrap();
     symlink("a", dir.join("b")).unwrap();
 
@@ -128,7 +128,7 @@ fn a_loop_of_links_is_an_error() {
 
 #[test]
 fn a_failed_write_leaves_the_old_file_and_no_temporary_file() {
-    let dir = scratch_dir("atomic-fail");
+    let dir = scratch("atomic-fail");
     // The rename onto a directory fails, after the temporary file is made.
     let target = dir.join("a");
     std::fs::create_dir(&target).unwrap();
@@ -149,7 +149,7 @@ fn a_name_with_no_directory_is_written_in_the_current_one() {
 
 #[test]
 fn an_old_temporary_file_that_nobody_holds_is_removed_and_the_others_are_kept() {
-    let dir = scratch_dir("stale-temps");
+    let dir = scratch("stale-temps");
     let held = dir.join(".cmm2.4242.9.tmp");
     let unheld = dir.join(".cmm2.4242.1.tmp");
     let fresh = dir.join(".cmm2.4242.2.tmp");
@@ -198,7 +198,7 @@ fn an_old_temporary_file_that_nobody_holds_is_removed_and_the_others_are_kept() 
 
 #[test]
 fn what_is_not_a_regular_file_is_never_opened_by_the_cleanup() {
-    let dir = scratch_dir("stale-odd");
+    let dir = scratch("stale-odd");
     // A FIFO would block an open for reading until someone writes, and a link to a device
     // would be opened as the device. Both are named like a temporary file and are old.
     let fifo = dir.join(".cmm2.4242.1.tmp");
@@ -225,7 +225,7 @@ fn a_left_over_file_that_cannot_be_read_is_removed_through_a_write_open() {
     if root() {
         return;
     }
-    let dir = scratch_dir("stale-wo");
+    let dir = scratch("stale-wo");
     let write_only = dir.join(".cmm2.4242.1.tmp");
     let nothing = dir.join(".cmm2.4242.2.tmp");
     std::fs::write(&write_only, b"x").unwrap();
@@ -246,7 +246,7 @@ fn a_left_over_file_that_cannot_be_read_is_removed_through_a_write_open() {
 
 #[test]
 fn the_temporary_file_of_a_save_is_locked_while_it_is_open() {
-    let dir = scratch_dir("locked-temp");
+    let dir = scratch("locked-temp");
     let _alone = spawning();
     let temp = dir.join(".cmm2.4242.1.tmp");
     let file = create_locked(&temp).unwrap();
@@ -278,4 +278,48 @@ fn only_digits_make_a_temporary_files_name() {
     ] {
         assert!(!is_temp_name(name), "{name}");
     }
+}
+
+#[test]
+fn a_new_file_is_made_and_a_name_that_is_taken_is_never_replaced() {
+    let dir = scratch("atomic-create-new");
+    let target = dir.join("a");
+    let path = target.to_str().unwrap();
+
+    create_new_atomically(path, b"first").unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"first");
+    assert_eq!(files_in(&dir), ["a"], "no temporary file is left");
+
+    let err = create_new_atomically(path, b"second").unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&target).unwrap(), b"first");
+    assert_eq!(
+        files_in(&dir),
+        ["a"],
+        "a refusal leaves no temporary file either"
+    );
+
+    // A link at the name is a name that is taken, and what it leads to is left alone.
+    let victim = dir.join("victim");
+    std::fs::write(&victim, b"theirs").unwrap();
+    symlink(&victim, dir.join("link")).unwrap();
+    let err = create_new_atomically(dir.join("link").to_str().unwrap(), b"x").unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&victim).unwrap(), b"theirs");
+}
+
+// The error of a hard link that a file system refuses is told apart from the rest. Linux says
+// EPERM for the link of a directory, as it does for a file system with no hard links.
+#[test]
+fn a_hard_link_that_is_refused_is_unsupported_and_a_name_that_is_taken_is_not() {
+    let dir = scratch("atomic-link-refused");
+    std::fs::create_dir(dir.join("a-directory")).unwrap();
+    std::fs::write(dir.join("taken"), b"x").unwrap();
+    std::fs::write(dir.join("plain"), b"y").unwrap();
+
+    let refused = link_to(&dir.join("a-directory"), &dir.join("new")).unwrap_err();
+    let taken = link_to(&dir.join("plain"), &dir.join("taken")).unwrap_err();
+
+    assert_eq!(refused.kind(), io::ErrorKind::Unsupported);
+    assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
 }

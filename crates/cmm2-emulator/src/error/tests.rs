@@ -162,3 +162,28 @@ fn a_write_cut_short_leaves_nothing_known() {
     // It was used up.
     assert_eq!(take_cursor(), CLEAN);
 }
+
+// The advice to run `--flash {path}` is a command, so a path that the shell would split or
+// expand is quoted, and one that it would not is left as it is.
+#[test]
+fn the_v2_in_raw_run_advice_quotes_a_path_that_needs_it() {
+    let said = |path: &str| {
+        RunError::V2InRawRun {
+            path: path.to_string(),
+        }
+        .to_string()
+    };
+
+    assert!(said("/tmp/board/mine.flash").contains("--flash /tmp/board/mine.flash, with"));
+    assert!(said("/tmp/my board/a.flash").contains("--flash '/tmp/my board/a.flash', with"));
+    assert!(said("/tmp/it's.flash").contains(r"--flash '/tmp/it'\''s.flash', with"));
+    assert!(said("/tmp/a$b.flash").contains("--flash '/tmp/a$b.flash', with"));
+    // The advice to move the file is a command too.
+    assert!(said("/tmp/my board/a.flash").ends_with("move '/tmp/my board/a.flash' away."));
+    assert!(said("/tmp/board/mine.flash").ends_with("move /tmp/board/mine.flash away."));
+    // A relative path that starts with a dash would be taken for an option.
+    let dash = said("-x.flash");
+    assert!(dash.contains("--flash ./-x.flash, with"), "{dash}");
+    assert!(dash.ends_with("move ./-x.flash away."), "{dash}");
+    assert!(said("-a b.flash").ends_with("move './-a b.flash' away."));
+}
