@@ -246,9 +246,17 @@ fn real_firmware_first_boot_is_remembered_and_the_next_plain_start_reaches_the_p
     assert!(first.status.success(), "{}", stderr(&first));
     assert!(first_text.contains("Keyboard type"), "{first_text}");
     let settings = std::fs::read(home.file("settings.flash")).unwrap();
-    assert_eq!(settings.len(), FLASH_FILE_SIZE);
+    // A board of a firmware I know writes the v2 file (docs/settings-format.md): a header,
+    // and an entry for every 32-byte row that differs from the burned image. The options
+    // sector is at 0x081E0000, past the image's end, so a byte in it is not FF only because
+    // the firmware wrote it: the same fact the raw dump showed, now inside an entry.
+    let entries = v2_entries(&settings);
+    let (at, value) = entries
+        .iter()
+        .find(|(at, value)| *at <= 0x081E_0000 && 0x081E_0000 < *at + value.len() as u32)
+        .expect("no entry covers the options sector");
     assert!(
-        settings[OPTIONS_AT..OPTIONS_AT + 0x2_0000]
+        value[(0x081E_0000 - at) as usize..]
             .iter()
             .any(|&byte| byte != 0xFF),
         "the options sector is still erased"
@@ -270,6 +278,187 @@ fn real_firmware_first_boot_is_remembered_and_the_next_plain_start_reaches_the_p
     assert!(second.status.success(), "{}", stderr(&second));
     assert!(!second_text.contains("Keyboard type"), "{second_text}");
     assert!(second_text.contains("PRINT 6*7\r\n 42"), "{second_text}");
+}
+
+// The migration of a v1 file (issue 82): the board of a known firmware takes the old file on
+// its first start, keeps the old bytes aside, and reads v2 from then on.
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test --release -- --ignored"]
+fn a_v1_settings_file_migrates_on_the_first_board_start_and_keeps_a_backup() {
+    let home = Home::new("board-migrate");
+    let copy = Tmp::file("board-migrate", "bin");
+    std::fs::copy(real_firmware(), &copy.0).unwrap();
+    let burn = quit_run(&home, &["--burn", copy.arg(), "--console", "--run", "1000"]);
+    assert!(burn.status.success(), "{}", stderr(&burn));
+    drop(copy);
+    // Seed the v1 file the migration reads: the regions erased and the clock of nothing,
+    // the plainest content a v1 file can hold.
+    std::fs::remove_file(home.file("settings.flash")).unwrap();
+    let mut seed = vec![0xFFu8; FLASH_FILE_SIZE];
+    seed[FLASH_FILE_SIZE - 8..].fill(0);
+    std::fs::write(home.file("settings.flash"), &seed).unwrap();
+
+    let first = run_to_end(&home, &["--console", "--run", "100000000"]);
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(
+        std::fs::read(home.file("settings.flash.v1")).unwrap(),
+        seed,
+        "the backup holds the old bytes, byte for byte"
+    );
+    let entries = v2_entries(&std::fs::read(home.file("settings.flash")).unwrap());
+
+    let second = run_to_end(&home, &["--console", "--run", "100000000"]);
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert_eq!(
+        v2_entries(&std::fs::read(home.file("settings.flash")).unwrap()),
+        entries,
+        "run 2 read and saved the same entries; only the clock tail may move"
+    );
+    assert_eq!(
+        std::fs::read(home.file("settings.flash.v1")).unwrap(),
+        seed,
+        "the migration of run 2 did not overwrite the backup with its own file"
+    );
+}
+
+// m2: the board's file is v2 after the first save and still v2 after the second.
+#[test]
+#[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test --release -- --ignored"]
+fn real_b5_settings_are_the_v2_format_after_two_saves() {
+    let home = Home::new("board-v2-b5");
+    let copy = Tmp::file("board-v2-b5", "bin");
+    std::fs::copy(real_firmware(), &copy.0).unwrap();
+    let first = run_to_end(
+        &home,
+        &[
+            "--burn",
+            copy.arg(),
+            "--console",
+            "--run",
+            "700000000",
+            "--on",
+            "Keyboard type",
+            "1",
+            "--on",
+            "HH:MM:SS",
+            "12:00:00\\r",
+            "--on",
+            "DD/MM/YY",
+            "12/11/26\\r",
+        ],
+    );
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert!(stdout(&first).contains("Keyboard type"), "no first boot");
+    // The magic and version 2: v2_entries asserts both, or panics.
+    v2_entries(&std::fs::read(home.file("settings.flash")).unwrap());
+    drop(copy);
+
+    let second = run_to_end(
+        &home,
+        &[
+            "--console",
+            "--run",
+            "700000000",
+            "--on",
+            "Allardice\r\n\r\n>",
+            "PRINT 6*7\\r",
+        ],
+    );
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert!(
+        stdout(&second).contains("PRINT 6*7\r\n 42"),
+        "the second start did not reach the prompt"
+    );
+    v2_entries(&std::fs::read(home.file("settings.flash")).unwrap());
+}
+
+#[test]
+#[ignore = "needs the RC6 firmware: CMM2_FIRMWARE_RC6=<path> cargo test --release -- --ignored"]
+fn real_rc6_settings_are_the_v2_format_after_two_saves() {
+    let home = Home::new("board-v2-rc6");
+    let copy = Tmp::file("board-v2-rc6", "bin");
+    std::fs::copy(rc6_firmware(), &copy.0).unwrap();
+    let first = run_to_end(
+        &home,
+        &[
+            "--burn",
+            copy.arg(),
+            "--console",
+            "--run",
+            "700000000",
+            "--on",
+            "Keyboard type",
+            "1",
+            "--on",
+            "HH:MM:SS",
+            "12:00:00\\r",
+            "--on",
+            "DD/MM/YY",
+            "12/11/26\\r",
+        ],
+    );
+    assert!(first.status.success(), "{}", stderr(&first));
+    v2_entries(&std::fs::read(home.file("settings.flash")).unwrap());
+    drop(copy);
+
+    let second = run_to_end(
+        &home,
+        &[
+            "--console",
+            "--run",
+            "700000000",
+            "--on",
+            "Allardice\r\n\r\n>",
+            "PRINT 6*7\\r",
+        ],
+    );
+    assert!(second.status.success(), "{}", stderr(&second));
+    v2_entries(&std::fs::read(home.file("settings.flash")).unwrap());
+}
+
+// The hash gate: burn one release over the settings of another, and the board names both
+// firmwares by hash and leaves the file alone.
+#[test]
+#[ignore = "needs both firmwares: CMM2_FIRMWARE=<path> CMM2_FIRMWARE_RC6=<path> cargo test --release -- --ignored"]
+fn a_board_burned_with_another_release_names_both_hashes_and_refuses_the_settings() {
+    let home = Home::new("board-mismatch");
+    let b5 = Tmp::file("board-mismatch-b5", "bin");
+    std::fs::copy(real_firmware(), &b5.0).unwrap();
+    let burn = quit_run(
+        &home,
+        &["--burn", b5.arg(), "--console", "--run", "5000000"],
+    );
+    assert!(burn.status.success(), "{}", stderr(&burn));
+    drop(b5);
+    let saved = std::fs::read(home.file("settings.flash")).unwrap();
+    v2_entries(&saved);
+
+    let rc6 = Tmp::file("board-mismatch-rc6", "bin");
+    std::fs::copy(rc6_firmware(), &rc6.0).unwrap();
+    let mut command = on(&home);
+    let output = command
+        .args(["--burn", rc6.arg(), "--console", "--run", "10"])
+        .output()
+        .expect("failed to run cmm2-emulator");
+    drop(rc6);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let said = stderr(&output);
+    assert!(said.contains("saved for a different firmware"), "{said}");
+    assert!(said.contains("7.00.00b5"), "{said}");
+    assert!(said.contains("7.00.00RC6"), "{said}");
+    // The two hashes the settings name: the local images' own first 12 hex.
+    assert!(said.contains("sha256 6dbbdd03d2dd"), "{said}");
+    assert!(said.contains("sha256 f4aa9c6038b4"), "{said}");
+    assert!(
+        said.contains("Burn the firmware they were made for"),
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read(home.file("settings.flash")).unwrap(),
+        saved,
+        "the refusal left the settings file byte-identical"
+    );
 }
 
 #[test]

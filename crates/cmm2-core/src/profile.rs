@@ -2,6 +2,7 @@
 //! exactly that and nothing of the firmware's code. See issue 82.
 
 use crate::ds3231::STATE_SIZE;
+use crate::settings::{CRC_SIZE, HEADER_SIZE, ROW};
 
 /// A run of flash that the firmware writes and the user's settings file must keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +23,10 @@ pub struct Profile {
     pub first_is_new: bool,
     image_len: usize,
     image_hash: u64,
+    /// The SHA-256 of that same image. FNV-1a is enough to tell an image in front of me from
+    /// any other; a settings header's length and hash are the only evidence about an image that
+    /// is not here, and a release is named only when both agree with these bytes.
+    image_sha256: [u8; 32],
 }
 
 // Each firmware keeps a 32-byte block inside its own image. At boot it reads 8 bytes of it, and if
@@ -36,6 +41,18 @@ const RC6_BLOCK: Region = Region {
     addr: 0x080F_6F00,
     len: 0x20,
 };
+
+// The SHA-256 of the release images these profiles describe: `CMM2_MMBasic_7.00.00b5.bin` and
+// `CMM2_MMBasic_7.00.00RC6.bin`, as they ship. A settings header carries the hash of the image
+// it was written against, so this is what says which firmware a saved file was made for.
+pub(crate) const B5_IMAGE_SHA256: [u8; 32] = [
+    0x6d, 0xbb, 0xdd, 0x03, 0xd2, 0xdd, 0x8a, 0x53, 0xb6, 0xf9, 0x68, 0xd8, 0xb1, 0xa2, 0x5a, 0x67,
+    0x5b, 0xc0, 0xbc, 0xe0, 0x4a, 0x68, 0x69, 0x8c, 0xa0, 0x51, 0x61, 0x1b, 0x5f, 0x80, 0x64, 0x64,
+];
+const RC6_IMAGE_SHA256: [u8; 32] = [
+    0xf4, 0xaa, 0x9c, 0x60, 0x38, 0xb4, 0xfd, 0x8f, 0x12, 0x09, 0xe9, 0xf1, 0xf9, 0x4e, 0x66, 0xce,
+    0xe6, 0xaf, 0xe9, 0x65, 0x06, 0xbf, 0x39, 0x28, 0x4c, 0xc7, 0xfb, 0xa1, 0x9e, 0x60, 0x9b, 0x32,
+];
 
 /// What 7.00.00b5 keeps: the 32-byte block, then the stored program and saved options, which are
 /// the last 896 KB of flash.
@@ -52,6 +69,7 @@ pub static B5: Profile = Profile {
     first_is_new: true,
     image_len: 1_179_432,
     image_hash: 0x132b_0092_b085_69f9,
+    image_sha256: B5_IMAGE_SHA256,
 };
 
 /// The options of 7.00.00RC6 are the first 4 KB of the sector at 0x0814_0000, which is inside its
@@ -75,6 +93,7 @@ pub static RC6: Profile = Profile {
     first_is_new: false,
     image_len: 1_409_568,
     image_hash: 0x5bfb_cced_328c_674e,
+    image_sha256: RC6_IMAGE_SHA256,
 };
 
 /// The clock's time and date in a settings file: TR and DR, a word each, which a real board's
@@ -91,9 +110,11 @@ pub(crate) const VERSION_1_SIZE: usize = CLOCK_SIZE + 8;
 
 static KNOWN: [&Profile; 2] = [&B5, &RC6];
 
-/// FNV-1a over the bytes. It is only to tell my two images from any other, not to guard against
-/// anyone: no crate for SHA-256 is in the build, and the length with this hash of every byte is
-/// as good for that.
+/// FNV-1a over the bytes. It is only to tell my two images from any other, not to guard
+/// against anyone: the length with this hash of every byte is enough for that when a
+/// firmware is loaded. The settings file header carries a SHA-256 of the image instead
+/// (`settings::sha256`, docs/settings-format.md), which is the one that answers "were these
+/// settings made for this exact image".
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
@@ -111,6 +132,43 @@ impl Profile {
     /// The profile with this name (`b5` or `rc6`, in any case), if I know it.
     pub fn named(name: &str) -> Option<&'static Profile> {
         KNOWN.into_iter().find(|p| p.key.eq_ignore_ascii_case(name))
+    }
+
+    /// The release a settings header was made for, named only when its length AND its SHA-256
+    /// are both one I know. Either alone is worth nothing on its own: the length is a claim the
+    /// writer makes about an image that is not in front of me, and a stranger's hash could be
+    /// any 32 bytes.
+    pub fn named_release(len: u32, sha256: &[u8; 32]) -> Option<&'static str> {
+        KNOWN
+            .into_iter()
+            .find(|p| p.image_len == len as usize && &p.image_sha256 == sha256)
+            .map(|p| p.name)
+    }
+
+    /// The largest file a settings load can be given: the longest file of either format, over
+    /// every release I know - a board may be handed the other release's file, and `classify`
+    /// names that release rather than refusing it. Nothing larger is a settings file of any
+    /// kind, so a file above it is refused before it is read.
+    ///
+    /// A v1 file is the regions and a tail. A v2 file is the header, an address and a length
+    /// for every entry, the rows, a tail, and the checksum; entries cannot overlap and must
+    /// lie whole inside one region, so the rows together are never more than the regions and
+    /// there are never more entries than there are rows. The longest tail is the clock's 8
+    /// bytes with the DS3231's 10 after them.
+    pub fn largest_settings_file() -> usize {
+        KNOWN
+            .iter()
+            .map(|profile| {
+                let flash = profile.flash_size();
+                let rows = flash / ROW;
+                let tail = CLOCK_SIZE + STATE_SIZE;
+                let v1 = flash + tail;
+                // 8 bytes of address and length per entry.
+                let v2 = HEADER_SIZE + rows * 8 + flash + tail + CRC_SIZE;
+                v1.max(v2)
+            })
+            .max()
+            .expect("there is a release I know")
     }
 
     /// The bytes the regions hold together.

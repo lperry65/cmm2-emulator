@@ -79,7 +79,8 @@ cmm2-emulator                                      # from then on: as it was lef
   [docs/usage.md](docs/usage.md#the-sd-card---sd).
 - The board is a directory: `cmm2-emulator` in `$XDG_DATA_HOME` (a relative one is ignored), or
   `~/.local/share/cmm2-emulator` when that is not set. It holds `firmware.bin`, `settings.flash`
-  (the stored program, options and clock), `sd.path` and `board.lock`. `CMM2_EMULATOR_HOME` names
+  (the stored program, options and clock, in a file that names the firmware it was made for),
+  `sd.path` and `board.lock`. `CMM2_EMULATOR_HOME` names
   another directory, which is another board.
 - `--firmware <file>` runs an image as a scratch machine, with no board directory. On its own it
   only prints the vector table. To run it add `--console`, `--window`, `--run <count>` or

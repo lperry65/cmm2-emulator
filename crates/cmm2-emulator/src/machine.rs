@@ -58,11 +58,13 @@ pub(crate) fn with_layout(
 
 /// Builds the machine for the firmware at `path`. `variable` is the one that may name a layout for
 /// it, which only matters when there are settings to keep: with no `--flash` a bad value is
-/// nothing.
+/// nothing. `on_board` says this is the board starting (not a `--firmware` scratch run), which
+/// with an identified firmware is what opens the v2 settings format (the gate, issue 82).
 pub(crate) fn build_machine(
     path: &str,
     options: &RunOptions,
     variable: &str,
+    on_board: bool,
 ) -> Result<Machine, RunError> {
     let mut firmware = Firmware::load(path)?;
     if options.flash.is_some() {
@@ -80,8 +82,20 @@ pub(crate) fn build_machine(
     // The board's DS3231 is always fitted, and keeps the host's time.
     memory.ds3231().set_host_clock(Box::new(LocalClock));
     let mut cpu = Cpu::new(&firmware, memory, irqs)?;
+    // The gate, once here at the start and never at a save: v2 only for a board boot whose
+    // firmware `Profile::identify` recognised. A scratch run, and a board whose layout came
+    // from a variable, keep the raw file: a named layout is an assumption about an image I
+    // do not know, and the v2 header states the image as fact.
+    if on_board && firmware.identified() {
+        cpu.use_settings_v2();
+    }
     if let Some(path) = &options.flash {
-        load_flash(&mut cpu, path)?;
+        // A board reads the raw layout for one reason only: a variable named a layout for a
+        // firmware I cannot recognise, since an image I know puts it on v2 and a scratch run is
+        // raw whatever a variable says. `load_flash` refuses a firmware with no layout at all
+        // before it says anything about a file, so naming the variable here is never a guess.
+        let labelled_by = on_board.then_some(variable);
+        load_flash(&mut cpu, path, labelled_by)?;
     }
     if let Some(path) = &options.sd {
         load_sd(&sd, path)?;

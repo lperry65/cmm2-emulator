@@ -25,7 +25,7 @@ enum Card {
 pub(crate) fn run(start: Start, options: RunOptions) -> Result<bool, RunError> {
     match start {
         Start::File(path) => {
-            let machine = build_machine(&path, &options, LAYOUT_VARIABLE)?;
+            let machine = build_machine(&path, &options, LAYOUT_VARIABLE, false)?;
             go(machine, options)
         }
         Start::Board => on_the_board(options),
@@ -96,14 +96,15 @@ fn on_the_board(mut options: RunOptions) -> Result<bool, RunError> {
         Card::Empty
     };
     let firmware = board.firmware_path();
-    let machine = build_machine(&firmware, &options, BOARD_LAYOUT_VARIABLE).map_err(|err| {
-        match (err, &card) {
-            // The settings file is not at fault, the firmware is.
-            (RunError::NoLayout { .. }, _) => RunError::BoardNoLayout { path: firmware },
-            (err, Card::Remembered) => about_the_remembered_card(err),
-            (err, _) => err,
-        }
-    })?;
+    let machine =
+        build_machine(&firmware, &options, BOARD_LAYOUT_VARIABLE, true).map_err(|err| {
+            match (err, &card) {
+                // The settings file is not at fault, the firmware is.
+                (RunError::NoLayout { .. }, _) => RunError::BoardNoLayout { path: firmware },
+                (err, Card::Remembered) => about_the_remembered_card(err),
+                (err, _) => err,
+            }
+        })?;
     if let Card::Given(path) = &card {
         board.remember_card(path)?;
     }

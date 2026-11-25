@@ -30,18 +30,27 @@ cargo test
 Building needs the SDL2 development files (`libsdl2-dev` on Debian and Ubuntu).
 
 Nearly all the ignored tests run the real firmware: they need your copy of the `.bin` and take a
-while. `cargo test --workspace -- --ignored --list` counts 74 of them (counted on 2026-11-20 at
-208c7fb by counting `#[ignore` lines; listing needs no firmware): 46 in `cmm2-core` (45 in the
-ten files of `crates/cmm2-core/tests/`, and a display speed test in `display/tests.rs`), 27 in
-`cmm2-emulator` (6 in `tests/real_firmware.rs`, 1 in `tests/board_burn.rs` and 20 in the tests
-of `keys.rs` and `usb_keys.rs`), and one in `zmu_cortex_m`. Two of the 74 do not use the
+while. `cargo test --workspace -- --ignored --list` counts 78 of them (counted on 2026-11-25 the
+same way, by counting `#[ignore` lines; the listing needs no firmware): 46 in `cmm2-core` (45 in
+the ten files of `crates/cmm2-core/tests/`, and a display speed test in `display/tests.rs`), 31
+in `cmm2-emulator` (6 in `tests/real_firmware.rs`, 5 in `tests/board_burn.rs` and 20 in the
+tests of `keys.rs` and `usb_keys.rs`), and one in `zmu_cortex_m`. Two of the 78 do not use the
 firmware: the display speed test, which times the compositing, and the `zmu_cortex_m` one, a
 decode dump run by hand with `ZMU_DUMP_IMAGE` and `ZMU_DUMP_OUT`.
 
 To run the others, point `CMM2_FIRMWARE` at the 7.00.00b5 `.bin` and `CMM2_FIRMWARE_RC6` at the
-7.00.00RC6 `.bin`. Both have to be set: two of the tests (one in `crates/cmm2-core/tests/boot.rs`
-and one in `crates/cmm2-emulator/tests/real_firmware.rs`) need the RC6 image and panic without
-it. A release build is a good deal faster:
+7.00.00RC6 `.bin`. Both have to be set, because four of them read the RC6 image and panic
+without it:
+
+- `real_firmware_rc6_is_a_known_profile` in `crates/cmm2-core/tests/boot.rs`
+- `real_firmware_rc6_keeps_its_settings_in_the_flash_file` in
+  `crates/cmm2-emulator/tests/real_firmware.rs`
+- `real_rc6_settings_are_the_v2_format_after_two_saves` in
+  `crates/cmm2-emulator/tests/board_burn.rs`
+- `a_board_burned_with_another_release_names_both_hashes_and_refuses_the_settings` in the
+  same file, the one that wants both images
+
+A release build is a good deal faster:
 
 ```
 CMM2_FIRMWARE=/path/to/CMM2_MMBasic_7.00.00b5.bin \
@@ -68,7 +77,8 @@ the usual board. The directory name has to be UTF-8. It holds:
 
 - `firmware.bin`: my copy of the image.
 - `settings.flash`: the `--flash` file (see below): the stored program, the saved options and the
-  clock.
+  clock. The board's file names the firmware its layout belongs to, so the directory
+  deliberately holds no separate layout file.
 - `sd.path`: the card in the socket.
 - `board.lock`.
 
@@ -98,8 +108,8 @@ image).
   to is not written; the cleanup of old temporary files looks only in the board directory.
 - Burning keeps the settings: the file holds only what the firmware keeps in flash and never its
   code (see [the settings file](#the-settings-file---flash)). A burn of another release leaves a
-  file that is the wrong size for it, and the run says so; then I delete `settings.flash` by
-  hand, as the emulator never deletes it.
+  file that names the firmware it was saved for, and the start refuses it and says which that
+  is; then I delete `settings.flash` by hand, as the emulator never deletes it.
 - A firmware that the emulator has no settings layout for is refused by the burn, before
   anything is made.
 - The board then starts: the first run, with nothing in the directory yet, makes the directory
@@ -346,6 +356,23 @@ prompt with no setup questions and no reset:
 cmm2-emulator --firmware CMM2_MMBasic_7.00.00b5.bin --console --flash board.flash
 ```
 
+### The shape of the file
+
+The board's file is format version 2: a header that names the firmware image it was made against
+(its length and SHA-256), then entries covering the 32-byte flash rows that differ from the burned
+image, contiguous rows stored together, then the clock and the DS3231's state when it has one, then
+a CRC-32. Only the changed rows go in the file; the rest reads back from the burned image, so the
+machine ends up exactly as the old full dump left it, from a file of a few KB instead of ~900. The
+contract is [the settings file format](settings-format.md). A scratch run (`--firmware` with
+`--flash`) still reads and writes the raw layout described below, and refuses a board's v2 file
+with a message that says which is which. A board start that finds the older raw file does not
+refuse it: it reads it as always and adopts it, migrating it as the next paragraph says.
+
+A board file written by an older emulator, from before the format, is loaded exactly as it
+always was, and then migrated: the original bytes are copied to `settings.flash.v1` beside the
+file, which the emulator never overwrites or deletes, and the live file is replaced with its
+v2 form only after that form has been read back and checked.
+
 The run saves when it ends by the quit key, the window closed, the `--run` limit, `--stop-at`, a
 fault, a SIGINT, SIGTERM or SIGHUP (Ctrl-C in a terminal that is not in raw mode, `kill`, the
 terminal being closed), and a panic in the emulator, which is saved from and then goes on as a
@@ -379,7 +406,9 @@ held and the new message are written at once, so that they are not lost with it.
 - The files that are looked at are only regular files (a FIFO, or a link, with such a name is
   left alone). The name has to be digits only, with a process id above 0, to count.
 - A symlink is followed, even a dangling one (the first save creates what it points to), so the
-  file it points to is the one replaced and the link stays.
+  file it points to is the one replaced and the link stays. The board's v2 file is the
+  exception: it is the board's own file, and it is replaced rather than followed, as
+  `firmware.bin` is.
 - The file keeps its permissions. It does not keep its owner, which only a privileged process
   can set, and a hard link to the old file stops seeing the contents, as the file is replaced
   and not written in place.
@@ -415,7 +444,7 @@ goes away, a security module (SELinux, AppArmor) that says no.
 
 The file holds only what the firmware keeps in flash, never the firmware's code. What that is
 depends on the firmware, so the emulator knows it for the images it recognises (by their length
-and a hash of every byte, as no SHA-256 crate is in the build) and for no other. I know two:
+and a hash of every byte) and for no other. I know two:
 7.00.00b5 and 7.00.00RC6. The file holds the regions of flash that the firmware keeps, in this
 order, and then the clock's time and date (8 bytes), which a real board's battery keeps:
 
@@ -432,7 +461,9 @@ machine's clock, so it is slower than the wall clock when the host is slow, and 
 while the emulator is off. That makes the file 917,544 bytes for b5 and 659,496 for RC6, and the
 run stops with an error, leaving the file alone, if it is any other size than these plain sizes,
 the sizes with the clock chip's state added ([the DS3231 clock](#the-ds3231-clock): 917,554 for
-b5 and 659,506 for RC6) and the old b5 sizes below.
+b5 and 659,506 for RC6) and the old b5 sizes below. Those are the raw file's sizes: a board's
+v2 file is as long as its entries, header, tail and checksum, and says which firmware it was
+made for whatever its length.
 
 The 32-byte block matters. At boot the firmware reads 8 bytes of it. If they are FF, which is
 what they are in the image, it takes its first-start path: it wipes the function key strings and
@@ -456,13 +487,17 @@ For a scratch run with `--flash`, and for tests, the environment variable `CMM2_
 (`b5` or `rc6`) names a layout for an image that has none; what it names may be wrong for that
 image, and then the file is too. It is not used for the board: `--burn` of an unknown firmware
 is refused with or without it, and a bad value does nothing to a run with no `--flash`. A
-firmware I know keeps its own layout whatever it says.
+firmware I know keeps its own layout whatever it says. The board has its own twin,
+`CMM2_BOARD_LAYOUT_FOR_TESTS`, which exists for the tests that burn a program in place of a
+firmware: a start-up error that tells you to unset it only means it is set in your environment.
 
-A settings file is for the firmware that made it: one made for another release is the wrong
-size, or, when it is the size of the other release's file, the error says it probably belongs to
-another release. After `--burn` of another release, delete `settings.flash` or give another
-`--flash` file. A plain start of a board whose firmware has no layout says so and names
-`firmware.bin`; burn a firmware I know again.
+A settings file is for the firmware that made it. A raw file made for another release is the
+wrong size, or, when it is the size of the other release's file, the error says it probably
+belongs to that release. A board's v2 file needs no size arithmetic: its header names the image
+it was made for, and a run whose image differs is refused by name and hash. After `--burn` of
+another release, delete `settings.flash` or give another `--flash` file. A plain start of a
+board whose firmware has no layout says so and names `firmware.bin`; burn a firmware I know
+again.
 
 ## The DS3231 clock
 

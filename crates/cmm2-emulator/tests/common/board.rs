@@ -253,6 +253,24 @@ pub fn burned_line(size: usize) -> String {
     )
 }
 
+// The entries of a v2 settings file (docs/settings-format.md): a board of a firmware I know
+// writes one, and the tests that read a board's settings after the v2 work go through this. It
+// asserts the magic and the version, then walks the entry table the header counts.
+pub fn v2_entries(bytes: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    assert_eq!(&bytes[..4], b"CMM2", "not a v2 settings file");
+    assert_eq!(bytes[4], 2, "not settings format version 2");
+    let count = u32::from_le_bytes(bytes[44..48].try_into().unwrap()) as usize;
+    let mut at = 48;
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        let addr = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        entries.push((addr, bytes[at + 8..at + 8 + len].to_vec()));
+        at += 8 + len;
+    }
+    entries
+}
+
 pub fn counter(home: &Home) -> u32 {
     options_word(&std::fs::read(home.file("settings.flash")).unwrap())
 }

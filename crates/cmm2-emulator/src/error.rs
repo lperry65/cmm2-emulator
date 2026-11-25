@@ -5,7 +5,7 @@ use crate::output::Output;
 use crate::window::WindowError;
 use cmm2_core::{
     CpuError, FirmwareError, FrameError, ImageSizeError, MIN_IMAGE_SIZE, MemoryError, NoLayout,
-    PersistentError,
+    PersistentError, SettingsError,
 };
 use std::fmt;
 use std::io;
@@ -39,6 +39,27 @@ pub(crate) enum RunError {
     FlashSize {
         path: String,
         source: PersistentError,
+    },
+    /// The settings file was refused as v2 (issue 82): too new, saved for another firmware,
+    /// larger than any settings file is, or corrupt. `backup` names the copy of the old file
+    /// that sits beside it, which is worth saying only when it is there to restore.
+    Settings {
+        path: String,
+        source: Box<SettingsError>,
+        backup: Option<String>,
+    },
+    /// A run that reads the raw layout was given a board's v2 file (issue 82): the file is
+    /// fine, the run is the wrong kind. `labelled_by` is the variable that put a board on the
+    /// raw layout, which is the one thing it can be told to undo.
+    V2InRawRun {
+        path: String,
+        labelled_by: Option<String>,
+    },
+    /// A migration refused because the name its copy of the old settings goes to is held by
+    /// something that is not a plain file (issue 82): it is neither followed nor replaced.
+    BackupNotAFile {
+        path: String,
+        backup: String,
     },
     /// The firmware has no settings layout, so a settings file for it would be wrong data. `path`
     /// is the file that asked for one.
@@ -90,6 +111,38 @@ impl fmt::Display for RunError {
             RunError::Screenshot { path, source } => write!(f, "{path}: {source}"),
             RunError::Flash { path, source } => write!(f, "{path}: {source}"),
             RunError::FlashSize { path, source } => write!(f, "{path}: {source}"),
+            RunError::Settings {
+                path,
+                source,
+                backup,
+            } => {
+                write!(f, "{path}: {source}")?;
+                if let Some(backup) = backup {
+                    write!(f, " Restore {backup} or start fresh by deleting them.")?;
+                }
+                Ok(())
+            }
+            RunError::V2InRawRun { path, labelled_by } => match labelled_by {
+                Some(variable) => write!(
+                    f,
+                    "{path}: these settings were saved by the board of this emulator (format \
+                     v2), but this board reads the raw layout because {variable} names a layout \
+                     for a firmware I cannot recognise. Unset {variable} and burn a firmware I \
+                     know with: cmm2-emulator --burn <file>. To start fresh instead, move \
+                     {path} away and start the board again."
+                ),
+                None => write!(
+                    f,
+                    "{path}: these settings were saved by the board of this emulator (format \
+                     v2); this run reads the raw layout. Start the board itself, or point \
+                     --flash at a raw file."
+                ),
+            },
+            RunError::BackupNotAFile { path, backup } => write!(
+                f,
+                "{path}: not backing up the old settings to {backup}: that name is not a \
+                 regular file. Move it out of the way and start again; no file was written."
+            ),
             RunError::NoLayout { path, source } => write!(f, "{path}: {source}"),
             RunError::BoardNoLayout { path } => write!(
                 f,

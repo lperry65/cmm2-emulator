@@ -99,6 +99,17 @@ pub(crate) fn age(path: &Path, secs: u64) {
     assert_eq!(done, 0);
 }
 
+// The most memory this process has held at once, in KiB (Linux's peak resident set), for a test
+// that has to know whether a file was read whole.
+pub(crate) fn peak_rss_kib() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage is given a valid pointer to a struct of its own type, which it fills.
+    let ok = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    assert_eq!(ok, 0, "getrusage failed");
+    // SAFETY: getrusage said it filled the struct.
+    unsafe { usage.assume_init() }.ru_maxrss as u64
+}
+
 // What the tests here that start a process or use a terminal rely on is Unix only (libc's
 // `openpty` and `tcgetattr`, `_exit`, `fcntl`, `ExitStatusExt::signal`, and `fork` and
 // `close_range` in panic_hook's tests; signals.rs is Unix only as a whole).

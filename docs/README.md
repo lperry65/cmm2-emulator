@@ -3,6 +3,8 @@
 Project documentation lives here as markdown.
 
 - [usage.md](usage.md): every option, the board, the settings file, the SD card, how a run ends.
+- [settings-format.md](settings-format.md): the board's settings file, format v2: the header,
+  the diff entries, the migration from the old raw file, and the versioning rules.
 - [status.md](status.md): the detailed status: what works, the CPU core, speed and known gaps.
 - [goals.md](goals.md): what the emulator is for and what follows from that.
 - [hardware-map.md](hardware-map.md): the CMM2 Gen 2 hardware as measured and documented.

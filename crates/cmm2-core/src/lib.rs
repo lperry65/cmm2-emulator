@@ -23,6 +23,7 @@ mod rng;
 mod rtc;
 mod sd;
 mod sd_slot;
+mod settings;
 mod svd;
 mod timer;
 mod usart;
@@ -54,6 +55,9 @@ pub use rng::{RNG_BASE, RNG_SIZE, Rng, RngRegisters};
 pub use rtc::{RTC_BASE, RTC_SIZE, Rtc, RtcRegisters};
 pub use sd::{BLOCK, ImageSizeError, MIN_IMAGE_SIZE};
 pub use sd_slot::SdSlot;
+pub use settings::{
+    FileKind, MAGIC, Settings, SettingsError, VERSION, classify, crc32, decode_v2, encode, sha256,
+};
 pub use svd::{Field, Lookup, Svd, SvdError};
 pub use timer::{TIM5_BASE, TIM16_BASE, TIMER_SIZE, Timer, TimerRegisters};
 pub use usart::{USART_SIZE, USART1_BASE, Usart, UsartRegisters};

@@ -17,6 +17,7 @@ fn the_ds3231_is_fitted_and_shows_the_hosts_time() {
         firmware.to_str().unwrap(),
         &RunOptions::default(),
         LAYOUT_VARIABLE,
+        false,
     )
     .unwrap();
 
@@ -63,7 +64,8 @@ fn first_rng_word(name: &str, seed: Option<u64>) -> u32 {
         rng_seed: seed,
         ..RunOptions::default()
     };
-    let mut machine = build_machine(firmware.to_str().unwrap(), &options, LAYOUT_VARIABLE).unwrap();
+    let mut machine =
+        build_machine(firmware.to_str().unwrap(), &options, LAYOUT_VARIABLE, false).unwrap();
     machine.cpu.run(20_000);
     let word = machine.cpu.reg(4);
     std::fs::remove_dir_all(&dir).unwrap();

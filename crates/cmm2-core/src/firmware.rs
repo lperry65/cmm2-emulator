@@ -23,6 +23,12 @@ pub struct Firmware {
     image: Vec<u8>,
     vectors: VectorTable,
     profile: Option<&'static Profile>,
+    /// True when `Profile::identify` matched the bytes, false when `with_profile` was told
+    /// the layout. The settings mode depends on the difference: a layout I was told is an
+    /// assumption, a layout I recognised from the bytes is the firmware's own.
+    identified: bool,
+    /// The SHA-256 of the image, once, for the settings header and the hash gate.
+    sha256: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -70,10 +76,14 @@ impl Firmware {
             return Err(FirmwareError::ResetOutsideImage(reset));
         }
         let profile = Profile::identify(&image);
+        let identified = profile.is_some();
+        let sha256 = crate::settings::sha256(&image);
         Ok(Firmware {
             image,
             vectors,
             profile,
+            identified,
+            sha256,
         })
     }
 
@@ -106,10 +116,23 @@ impl Firmware {
         self.profile
     }
 
+    /// Whether the profile came from the bytes themselves (`Profile::identify`) or from
+    /// `with_profile`. Only an identified firmware may use the v2 settings file: a layout
+    /// named by a variable is a guess about an image I do not know.
+    pub fn identified(&self) -> bool {
+        self.identified
+    }
+
+    /// The SHA-256 of the image, which the v2 header records.
+    pub fn sha256(&self) -> &[u8; 32] {
+        &self.sha256
+    }
+
     /// This firmware with the given profile, for an image I do not know (a test image, or one
     /// whose layout the caller has been told).
     pub fn with_profile(mut self, profile: &'static Profile) -> Firmware {
         self.profile = Some(profile);
+        self.identified = false;
         self
     }
 }

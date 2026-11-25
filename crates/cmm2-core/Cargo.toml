@@ -7,4 +7,5 @@ repository.workspace = true
 
 [dependencies]
 roxmltree = "0.21.2"
+sha2 = { version = "0.11.1", default-features = false }
 zmu_cortex_m = { path = "../zmu_cortex_m" }

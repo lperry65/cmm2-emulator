@@ -44,6 +44,50 @@ fn rc6_does_not_keep_the_firmware_code_between_its_options_and_its_program() {
 }
 
 #[test]
+fn a_release_is_named_only_when_its_length_and_hash_both_agree() {
+    assert_eq!(
+        Profile::named_release(1_179_432, &B5_IMAGE_SHA256),
+        Some("7.00.00b5")
+    );
+    assert_eq!(
+        Profile::named_release(1_409_568, &RC6_IMAGE_SHA256),
+        Some("7.00.00RC6")
+    );
+    // Either half on its own names nothing: the length is a claim, and so is a stranger's hash.
+    assert_eq!(Profile::named_release(1_409_568, &B5_IMAGE_SHA256), None);
+    assert_eq!(Profile::named_release(1_179_432, &RC6_IMAGE_SHA256), None);
+    assert_eq!(Profile::named_release(1_179_432, &[0u8; 32]), None);
+    assert_eq!(Profile::named_release(0, &B5_IMAGE_SHA256), None);
+    assert_eq!(Profile::named_release(0xFFFF_FFFF, &[0u8; 32]), None);
+}
+
+// The bound a settings file is refused against before it is read. The numbers repeat the
+// table's on purpose, as everywhere else in these tests.
+#[test]
+fn the_largest_settings_file_is_one_no_legitimate_file_exceeds() {
+    // b5 with every row of its regions changed: the header, an entry of 8 bytes for each of
+    // its 28,673 rows, those rows' 917,536 bytes, the longest tail (the clock's 8 bytes and
+    // the DS3231's 10) and the checksum.
+    assert_eq!(
+        Profile::largest_settings_file(),
+        48 + 28_673 * 8 + 917_536 + 18 + 4
+    );
+    assert_eq!(Profile::largest_settings_file(), 1_146_990);
+    // No raw file either release ever wrote, with any of its tails, is above it: the other
+    // release's file has to be read to be named.
+    for profile in [&B5, &RC6] {
+        for tail in [CLOCK_SIZE, VERSION_1_SIZE, WITH_DS3231_SIZE] {
+            let v1 = profile.flash_size() + tail;
+            assert!(
+                profile.regions_for(v1).is_some() && v1 <= Profile::largest_settings_file(),
+                "{v1} is a file {} writes",
+                profile.name
+            );
+        }
+    }
+}
+
+#[test]
 fn only_b5_has_settings_files_from_before_its_block_was_kept() {
     assert_eq!(B5.old_regions().unwrap(), &B5.regions[1..]);
     assert_eq!(RC6.old_regions(), None);

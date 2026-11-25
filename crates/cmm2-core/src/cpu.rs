@@ -24,6 +24,7 @@ use crate::irq::Irqs;
 use crate::memory::MemoryMap;
 use crate::peripheral::ResetCause;
 use crate::profile::{CLOCK_SIZE, Profile, Region, VERSION_1_SIZE, WITH_DS3231_SIZE, regions_size};
+use crate::settings::{self, Settings};
 
 /// Cortex-M7 r1p1.
 const CPUID: u32 = 0x411F_C271;
@@ -230,6 +231,12 @@ pub struct Cpu {
     clock: Clock,
     resets: u32,
     profile: Option<&'static Profile>,
+    /// The burned image, the baseline a v2 diff is taken against.
+    image: Vec<u8>,
+    image_hash: [u8; 32],
+    /// Set once per run, by the front end's gate: only a board boot of an identified
+    /// firmware gets it (issue 82).
+    settings_v2: bool,
 }
 
 impl Cpu {
@@ -265,6 +272,9 @@ impl Cpu {
             clock,
             resets: 0,
             profile: firmware.profile(),
+            image: firmware.image().to_vec(),
+            image_hash: *firmware.sha256(),
+            settings_v2: false,
         })
     }
 
@@ -440,6 +450,118 @@ impl Cpu {
     /// What the firmware in this machine keeps in flash, if it is one I know.
     pub fn profile(&self) -> Option<&'static Profile> {
         self.profile
+    }
+
+    /// The burned image, the baseline of every v2 diff and the thing the header's hash is
+    /// of. The machine's flash reads this, then FF, until the guest or a settings file
+    /// changes a row.
+    pub fn image(&self) -> &[u8] {
+        &self.image
+    }
+
+    /// Whether this machine saves and loads the v2 settings format. The front end's gate
+    /// sets it (`use_settings_v2`); everything else keeps the raw layout of before.
+    pub fn settings_v2(&self) -> bool {
+        self.settings_v2
+    }
+
+    /// Switches this machine to the v2 settings format, for a board boot of a firmware
+    /// `Profile::identify` recognised: the front end's gate (`machine.rs`) is its only
+    /// caller. A firmware with no profile can have no v2 file, which a debug build asserts.
+    pub fn use_settings_v2(&mut self) {
+        debug_assert!(self.profile.is_some(), "only a profiled firmware runs v2");
+        self.settings_v2 = true;
+    }
+
+    /// The machine's persistent state as a v2 file: the profile's regions walked row by row,
+    /// with only the rows that differ from the baseline (the image, then FF past its end)
+    /// written as entries, then the clock and the DS3231's tail and the CRC-32. Refused for
+    /// a firmware with no profile.
+    pub fn save_settings(&mut self) -> Result<Vec<u8>, NoLayout> {
+        let profile = self.profile.ok_or(NoLayout)?;
+        let entries = self.diff_entries(profile);
+        let (clock, ds3231) = {
+            let memory = self.memory.borrow();
+            (memory.rtc().calendar(), memory.ds3231().saved())
+        };
+        Ok(settings::encode(
+            &self.image,
+            &self.image_hash,
+            &Settings {
+                entries,
+                clock,
+                ds3231,
+            },
+        ))
+    }
+
+    /// Applies what `settings::decode_v2` read: the DS3231's state (a file without one leaves the
+    /// chip as it was made), the entries over the flash the image filled, and the clock. The
+    /// entries are whole rows inside the profile's regions, which the v2 load path only reaches
+    /// after `decode_v2` has checked them. The chip comes first because its range check is the
+    /// only step here that can refuse: a file refused has nothing applied, and the run that
+    /// refuses it saves nothing.
+    pub fn load_settings(&mut self, settings: &Settings) -> Result<(), OffsetError> {
+        // The chip's own check is taken before any write. `Ds3231Slot::load` checks the offset
+        // before it touches the chip, so a refusal leaves the chip as it was as well.
+        let chip = self.memory.borrow().ds3231();
+        match settings.ds3231 {
+            None => chip.load_new(),
+            Some(state) => chip.load(state)?,
+        }
+        // Nothing after the refusal can fail: the rows lie inside the regions `decode_v2` has
+        // checked, and the clock is two words.
+        for (addr, bytes) in &settings.entries {
+            let (words, _) = bytes.as_chunks::<4>();
+            for (word, value) in words.iter().enumerate() {
+                self.processor
+                    .write32(addr + 4 * word as u32, u32::from_le_bytes(*value))
+                    .expect("a region is inside the core's flash");
+            }
+        }
+        self.memory.borrow().rtc().set_calendar(settings.clock);
+        Ok(())
+    }
+
+    /// The profile's regions as entries: every 32-byte row that differs from the baseline,
+    /// with contiguous changed rows merged into one entry.
+    fn diff_entries(&mut self, profile: &Profile) -> Vec<(u32, Vec<u8>)> {
+        let mut entries: Vec<(u32, Vec<u8>)> = Vec::new();
+        for &Region { addr, len } in profile.regions {
+            let mut run: Option<(u32, Vec<u8>)> = None;
+            for row in (addr..addr + len).step_by(settings::ROW) {
+                if self.row_differs(row) {
+                    match &mut run {
+                        Some((_, bytes)) => bytes.extend(self.row_bytes(row)),
+                        None => run = Some((row, self.row_bytes(row))),
+                    }
+                } else if let Some(entry) = run.take() {
+                    entries.push(entry);
+                }
+            }
+            if let Some(entry) = run {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    fn row_bytes(&mut self, addr: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(settings::ROW);
+        for at in (addr..addr + settings::ROW as u32).step_by(4) {
+            bytes.extend(self.read32(at).to_le_bytes());
+        }
+        bytes
+    }
+
+    fn row_differs(&mut self, addr: u32) -> bool {
+        for off in (0..settings::ROW as u32).step_by(4) {
+            let want = settings::baseline_word(&self.image, addr + off);
+            if self.read32(addr + off) != want {
+                return true;
+            }
+        }
+        false
     }
 
     /// What the machine keeps with the power off: the regions of flash that the firmware's

@@ -181,6 +181,13 @@ pub fn run_program(name: &str, code: &[u16], args: &[&str]) -> Output {
     output
 }
 
+// The path of the 7.00.00RC6 image: a second firmware I know, for the tests that need one
+// (outside the repo, never committed, like CMM2_FIRMWARE).
+pub fn rc6_firmware() -> String {
+    std::env::var("CMM2_FIRMWARE_RC6")
+        .expect("CMM2_FIRMWARE_RC6 must be set to the path of CMM2_MMBasic_7.00.00RC6.bin")
+}
+
 pub fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
