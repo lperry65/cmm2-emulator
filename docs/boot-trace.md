@@ -439,6 +439,16 @@ the other 18 `GPIOD_IDR` reads come from the handler at `0x0800D640` (`0x0800C29
 b5 `USART1_CR1` writes toggle `RXNEIE` (bit 5) in and out each iteration, as the expectation
 said.
 
+**No `WFI` or `WFE` anywhere in those 8 million** (measured 2026-11-26, issue 72). Counting
+executed instructions by decoded class over the whole boot, this window, one `PAUSE 1000` and a
+100 ms timed busy-wait: 815,010,000 instructions on b5 and 803,220,000 on RC6, zero `WFI` and zero
+`WFE` in either, so the loop's host time is the firmware's own polling and not a sleep the
+emulator fails to model. RC6 does hold four `WFI`/`WFE` encodings where an instruction boundary
+may be, and b5 none that the decoder can see. None of these phases reaches any of them, and which
+path, if any, does is not measured. A control shows the counter works: hand-written images that
+execute a `WFI` and a `WFE` are each counted once at the right address, and an image with neither
+stays at zero.
+
 `real_firmware_settles_in_the_idle_loop` in `crates/cmm2-core/tests/boot.rs` boots each image to
 the prompt, warms up a fixed 2,000,000 instructions - about 1.5 million past the measured entry -
 and then steps a 4,000-instruction window in which each of that image's two loop heads must

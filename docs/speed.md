@@ -345,9 +345,10 @@ heavy frames.
   per real second.
 - **WFI does nothing for time.** `exec_wfi` sets `sleeping`, but `Cpu::run_loop` always calls
   `Processor::step`, which keeps executing the next instruction, and no time is skipped to the next
-  wake. I did not find the firmware using WFI in the idle paths I profiled (`PAUSE` and the prompt
-  poll), so it costs nothing today, but a program or a firmware path that sleeps would burn host
-  time.
+  wake. Measured on 2026-11-26: neither image executes a `WFI` or a `WFE` in the boot, the idle
+  loop at the prompt, a `PAUSE 1000` or a 100 ms timed busy-wait - zero in 1,618,230,000
+  instructions (issue 72), so it costs nothing on those paths, but a program or a firmware path
+  that sleeps would still burn host time.
 - Interrupt entry costs no cycles, tail-chaining is missing (already listed in the decision record;
   both are counted now, see the top of this document).
 
@@ -432,7 +433,9 @@ come from `b5_px.bas` and my own programs, not the game.
 - An A or B prototype. The estimates for them are from the cost per instruction I measured (13 ns
   per instruction for cached flash code, about 60 host cycles) and from what such designs usually
   reach.
-- Whether the firmware uses WFI anywhere.
+- Whether any path reaches the `WFI`/`WFE` encodings. Four phases are measured on both images with
+  zero executed (issue 72); what is left is the four `WFI`/`WFE` encodings in RC6 that could be
+  instructions, and no path to them is traced. b5 has none the decoder can see.
 
 ## 9. How to repeat it
 
