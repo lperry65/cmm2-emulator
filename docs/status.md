@@ -204,16 +204,16 @@ Windows CI job are not done. The JIT design has to weigh portability for the sam
 
 ## Known gaps
 
-The open issues at 208c7fb, from `gh issue list --state open --limit 100`:
+The open issues, listed at 208c7fb and corrected since for the ones that have closed, from
+`gh issue list --state open --limit 100`:
 
 - Speed and timing: 74 (the JIT), 15 (the speed of the machine's bus path), 16 (zmu fidelity gaps
   found while integrating), 65 (memory wait states), 72 (WFI never sleeps), 76 (timer clocks do
   not follow the RCC).
-- The CPU core: 77 (the DSP extension and the missing base instructions: done, in five batches,
-  the last one the floating-point additions), 59 (zmu follow-ups after dec44de, to
-  check against the ARMv7-M manual), 17 (readable disassembly in the trace).
+- The CPU core: 59 (zmu follow-ups after dec44de, to check against the ARMv7-M manual), 17 (readable
+  disassembly in the trace).
 - Console and input: 66 (console input arrives faster than the baud rate), 48 (pasted lines are
-  joined), 47 (a hard fault on `ESC O D`, the SS3 left arrow), 62 (keyboard follow-ups), 53 (USB
+  joined), 47 (a hard fault on `ESC O D`, the SS3 left arrow), 53 (USB
   mouse), 54 (gamepad), 81 (the live-run end line: the cursor tracker cannot know where an escape
   moves the cursor, and the window-closed end has no end-to-end test).
 - Storage and the board's state: 63 (SPI3 for the SD card, `OPTION SD TIMING FAST`), 44 (a host
@@ -227,6 +227,12 @@ The open issues at 208c7fb, from `gh issue list --state open --limit 100`:
   with no fault, but the hash test is not done).
 - Not in an issue: sound (the DAC) and a GDB option (the vendored core has a GDB server, but the
   front end does not start it).
+
+Two more came out of the list today. **77**, the ARMv7E-M DSP extension and the base instructions
+that were missing, closed on 2026-11-25 with all five batches in; that work is recorded under the
+CPU core above, with its commit hashes and the independent emulator each batch was compared
+against. **62**, the keyboard follow-ups left by the review of the #61 fixes, closed on
+2026-11-26: all four items are fixed, each with a test that names the scenario it came from.
 
 Issue 25 (boot to the MMBasic idle loop) closed on 2026-11-26, and measuring it corrected this
 document and [boot-trace.md](boot-trace.md). The test is `real_firmware_settles_in_the_idle_loop`
