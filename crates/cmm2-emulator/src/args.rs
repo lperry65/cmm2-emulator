@@ -1,6 +1,7 @@
 //! The command line, parsed by hand: the options are few and fixed.
 
 use crate::error::shown;
+use std::borrow::Cow;
 use std::fmt;
 
 pub const USAGE: &str = "usage: cmm2-emulator [--firmware <file>] [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--console-keys] [--unpaced] [--flash <file>] [--sd <file> | --no-sd] [--burn <file>] [--rng-seed <number>] | --version | --lookup <address>";
@@ -99,21 +100,41 @@ pub enum ArgError {
     NothingToRun,
 }
 
+/// `text` as it reads inside the single quotes a message puts round it: `shown` once for the
+/// control characters, then every `'` doubled, so that a name carrying one cannot end the quoted
+/// name early and the last quote on the line is the one that ends it. Doubled, not backslashed:
+/// inside single quotes a backslash is a character of the name, so a backslashed quote would read
+/// as a name with a backslash in it. `command_quoted` is not reused because it makes the shape a
+/// shell needs — the quote closed, escaped and opened again, and `./` in front of a leading dash —
+/// and this is a line a person reads, not one a shell runs.
+///
+/// `shown` is not touched, and a name with no quote in it comes back exactly as `shown` made it.
+fn in_quotes(text: &str) -> Cow<'_, str> {
+    let escaped = shown(text);
+    if escaped.contains('\'') {
+        Cow::Owned(escaped.replace('\'', "''"))
+    } else {
+        escaped
+    }
+}
+
 impl fmt::Display for ArgError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // An argument echoed back is a name a person reads, not one offered as a command, so the
-        // arms that say one say it through `shown` (see the strategy there): escaped once, here,
-        // from what `parse` handed in raw. The arms that name an option say a word this file
-        // wrote itself, so they have nothing to escape.
+        // arms that say one say it through `in_quotes` (see the strategy there): escaped once and
+        // any quote doubled, here, from what `parse` handed in raw. The arms that name an option
+        // say a word this file wrote itself, so they have nothing to escape.
         match self {
             ArgError::Usage => {}
             ArgError::Unknown(arg) => {
-                writeln!(f, "cmm2-emulator: unknown argument '{}'", shown(arg))?
+                writeln!(f, "cmm2-emulator: unknown argument '{}'", in_quotes(arg))?
             }
-            ArgError::BadCount(arg) => writeln!(f, "cmm2-emulator: bad count '{}'", shown(arg))?,
-            ArgError::BadSeed(arg) => writeln!(f, "cmm2-emulator: bad seed '{}'", shown(arg))?,
+            ArgError::BadCount(arg) => {
+                writeln!(f, "cmm2-emulator: bad count '{}'", in_quotes(arg))?
+            }
+            ArgError::BadSeed(arg) => writeln!(f, "cmm2-emulator: bad seed '{}'", in_quotes(arg))?,
             ArgError::BadAddress(arg) => {
-                writeln!(f, "cmm2-emulator: bad address '{}'", shown(arg))?
+                writeln!(f, "cmm2-emulator: bad address '{}'", in_quotes(arg))?
             }
             ArgError::BoardOnly(option) => writeln!(
                 f,
@@ -136,7 +157,7 @@ impl fmt::Display for ArgError {
                 f,
                 "cmm2-emulator: --trace-from needs --trace or --trace-mmio"
             )?,
-            ArgError::BadKeys(arg) => writeln!(f, "cmm2-emulator: bad keys '{}'", shown(arg))?,
+            ArgError::BadKeys(arg) => writeln!(f, "cmm2-emulator: bad keys '{}'", in_quotes(arg))?,
             ArgError::EmptyName(option) => writeln!(
                 f,
                 "cmm2-emulator: {option} needs a file name, not an empty one"
@@ -351,32 +372,13 @@ mod tests {
     // An echoed argument is a name a person reads, so `Display` says it through `shown` once.
     // Before that was so it went to the terminal raw: measured as two escape bytes and a broken
     // line with the real binary (`a_bad_argument_is_echoed_escaped_and_on_one_line` in
-    // `tests/usage.rs`). This pins the echo of every arm that says an argument back.
+    // `tests/usage.rs`). Every arm that echoes one is driven with a hostile argument in
+    // `an_echoed_argument_puts_no_control_character_on_a_line` below; this keeps its two edges: an
+    // argument of one backslash, which is doubled once and not twice, and one that needs no escape,
+    // which is echoed as it was typed.
     #[test]
     fn an_echoed_argument_is_escaped_once() {
-        let hostile = "evil\n\u{1b}[31mRED\u{1b}[0m";
-        let safe = r"evil\n\x1B[31mRED\x1B[0m";
         let first_line = |err: ArgError| err.to_string().lines().next().unwrap().to_string();
-        assert_eq!(
-            first_line(ArgError::Unknown(hostile.into())),
-            format!("cmm2-emulator: unknown argument '{safe}'")
-        );
-        assert_eq!(
-            first_line(ArgError::BadCount(hostile.into())),
-            format!("cmm2-emulator: bad count '{safe}'")
-        );
-        assert_eq!(
-            first_line(ArgError::BadSeed(hostile.into())),
-            format!("cmm2-emulator: bad seed '{safe}'")
-        );
-        assert_eq!(
-            first_line(ArgError::BadAddress(hostile.into())),
-            format!("cmm2-emulator: bad address '{safe}'")
-        );
-        assert_eq!(
-            first_line(ArgError::BadKeys(hostile.into())),
-            format!("cmm2-emulator: bad keys '{safe}'")
-        );
         // A backslash is doubled once, never twice: `parse` hands an arm what argv held, so no
         // argument reaches these arms already escaped.
         assert_eq!(
@@ -384,6 +386,263 @@ mod tests {
             r"cmm2-emulator: unknown argument 'back\\slash'"
         );
         // A name that needs nothing is echoed exactly as it was typed.
+        assert_eq!(
+            first_line(ArgError::Unknown("--bogus".into())),
+            "cmm2-emulator: unknown argument '--bogus'"
+        );
+    }
+
+    // The fence over `ArgError`, the twin of the one over `RunError` in `error/tests.rs` and kept
+    // a copy rather than generalised, so that breaking either one on purpose is a small edit. It
+    // has the same three nets: a sample of every variant with a count pin, a classifier that is a
+    // match with no wildcard, and a hostile drive of every arm that says what a person typed. A
+    // new variant is a compile error in `says` until it is classified, and a red count until it has
+    // a sample in `every_variant`.
+    use crate::test_support::{HOSTILE_NAME, HOSTILE_SHOWN};
+
+    /// One sample of every variant of `ArgError`, and no variant may be missing from it.
+    const ARG_ERRORS: usize = 16;
+    /// The arms that echo an argument as it was typed.
+    const ECHOES_AN_ARGUMENT: usize = 5;
+    /// The arms that say an option's name, which is a word this file wrote.
+    const NAMES_AN_OPTION: usize = 5;
+    /// The arms that say nothing a caller can affect.
+    const SAYS_NOTHING: usize = 6;
+
+    /// What an arm of `ArgError` does with the text it carries.
+    #[derive(Debug, PartialEq)]
+    enum Says {
+        /// Says an argument as it was typed, which is what `Display` escapes once through `shown`.
+        AnArgument,
+        /// Says an option's name, a word this file wrote, and says it raw. `BoardOnly`,
+        /// `NeedsConsole`, `NeedsWindow` and `EmptyName` are handed a literal where they are
+        /// made (`EmptyName` through `file_name`, whose five callers all pass one). `Repeated`
+        /// is handed `arg`, and only the guard on its `match` arm makes that `"--burn"`. Safe
+        /// while both hold; a flagged item, not one this fence can secure.
+        AnOptionName,
+        /// Says nothing a caller can affect.
+        Nothing,
+    }
+
+    /// Which of the three an arm is, by a match with no wildcard: a variant added to `ArgError` is
+    /// a compile error here until it is classified.
+    fn says(err: &ArgError) -> Says {
+        match err {
+            ArgError::Unknown(_)
+            | ArgError::BadCount(_)
+            | ArgError::BadSeed(_)
+            | ArgError::BadAddress(_)
+            | ArgError::BadKeys(_) => Says::AnArgument,
+            ArgError::BoardOnly(_)
+            | ArgError::NeedsConsole(_)
+            | ArgError::NeedsWindow(_)
+            | ArgError::EmptyName(_)
+            | ArgError::Repeated(_) => Says::AnOptionName,
+            ArgError::Usage
+            | ArgError::BurnAndFirmware
+            | ArgError::ConsoleMmioNeedsFile
+            | ArgError::TraceFromNeedsTrace
+            | ArgError::SdAndNoSd
+            | ArgError::NothingToRun => Says::Nothing,
+        }
+    }
+
+    /// One sample of every variant, with `HOSTILE_NAME` in every slot that holds what a person
+    /// typed. The slots that hold an option's name hold the literal their call site passes, so
+    /// that a sample of an arm that says no name cannot carry one by accident.
+    fn every_variant() -> Vec<(&'static str, ArgError)> {
+        let typed = HOSTILE_NAME.to_string();
+        vec![
+            ("usage", ArgError::Usage),
+            ("unknown", ArgError::Unknown(typed.clone())),
+            ("bad count", ArgError::BadCount(typed.clone())),
+            ("bad seed", ArgError::BadSeed(typed.clone())),
+            ("bad address", ArgError::BadAddress(typed.clone())),
+            ("board only", ArgError::BoardOnly("--no-sd".to_string())),
+            ("burn and firmware", ArgError::BurnAndFirmware),
+            ("needs console", ArgError::NeedsConsole("--on".to_string())),
+            (
+                "needs window",
+                ArgError::NeedsWindow("--console-keys".to_string()),
+            ),
+            ("console mmio needs file", ArgError::ConsoleMmioNeedsFile),
+            ("trace from needs trace", ArgError::TraceFromNeedsTrace),
+            ("bad keys", ArgError::BadKeys(typed.clone())),
+            ("empty name", ArgError::EmptyName("--flash".to_string())),
+            ("sd and no sd", ArgError::SdAndNoSd),
+            ("repeated", ArgError::Repeated("--burn".to_string())),
+            ("nothing to run", ArgError::NothingToRun),
+        ]
+    }
+
+    /// What the process puts on standard error for `err`, which is the whole of `Display` said with
+    /// `eprintln` and so ending in a line feed of its own. That is what makes an arm that says a
+    /// message two lines: the message's, and the usage line's, with the line feed that ends the
+    /// last. `Display` alone ends the message line and puts none after the usage line.
+    fn as_printed(err: &ArgError) -> String {
+        format!("{err}\n")
+    }
+
+    #[test]
+    fn every_variant_of_an_argument_error_is_classified_and_counted() {
+        let all = every_variant();
+        assert_eq!(
+            all.len(),
+            ARG_ERRORS,
+            "one sample for each variant of ArgError, and this count with it"
+        );
+        let counted = |kind: Says| all.iter().filter(|(_, err)| says(err) == kind).count();
+        assert_eq!(
+            counted(Says::AnArgument),
+            ECHOES_AN_ARGUMENT,
+            "the arms that echo an argument, and this count with them"
+        );
+        assert_eq!(
+            counted(Says::AnOptionName),
+            NAMES_AN_OPTION,
+            "the arms that say an option's name, and this count with them"
+        );
+        assert_eq!(
+            counted(Says::Nothing),
+            SAYS_NOTHING,
+            "the arms that say nothing of a caller's, and this count with them"
+        );
+        // A sample of an arm that says nothing, and one of an arm that says an option's name,
+        // carries no name a caller typed, so the drive below cannot mistake one for an argument.
+        for (what, err) in &all {
+            let said = err.to_string();
+            match says(err) {
+                Says::Nothing => assert!(
+                    !said.contains(HOSTILE_NAME) && !said.contains(HOSTILE_SHOWN),
+                    "{what} is said to say nothing and says a name: {said:?}"
+                ),
+                Says::AnOptionName => {
+                    assert!(
+                        !said.contains(HOSTILE_NAME) && !said.contains(HOSTILE_SHOWN),
+                        "{what} is said to name an option and says a name a caller typed: {said:?}"
+                    )
+                }
+                Says::AnArgument => {}
+            }
+        }
+    }
+
+    /// The message line each echoing arm says of `HOSTILE_NAME`, written out here by hand and not
+    /// built with `shown`: an escaping helper that agreed with itself would pass otherwise. The
+    /// wildcard returns `None` for an arm that echoes nothing, and the test below fails an echoing
+    /// arm that answers `None`, so a new one cannot be driven without an expectation.
+    fn expected_line(err: &ArgError) -> Option<&'static str> {
+        Some(match err {
+            ArgError::Unknown(_) => r"cmm2-emulator: unknown argument 'evil\n\x1B[31mRED\x1B[0m'",
+            ArgError::BadCount(_) => r"cmm2-emulator: bad count 'evil\n\x1B[31mRED\x1B[0m'",
+            ArgError::BadSeed(_) => r"cmm2-emulator: bad seed 'evil\n\x1B[31mRED\x1B[0m'",
+            ArgError::BadAddress(_) => r"cmm2-emulator: bad address 'evil\n\x1B[31mRED\x1B[0m'",
+            ArgError::BadKeys(_) => r"cmm2-emulator: bad keys 'evil\n\x1B[31mRED\x1B[0m'",
+            _ => return None,
+        })
+    }
+
+    // The hostile drive: an argument carrying a colour change and a line feed, said by every arm
+    // that echoes one. What it must never do is put a control character on a line, and what it must
+    // say is the name escaped once, so that the reader can still see which argument was refused.
+    #[test]
+    fn an_echoed_argument_puts_no_control_character_on_a_line() {
+        for (what, err) in every_variant() {
+            // The classifier and the hand-written expectations cover the same arms, so neither one
+            // can quietly lose an arm the other keeps.
+            assert_eq!(
+                says(&err) == Says::AnArgument,
+                expected_line(&err).is_some(),
+                "{what} is classified as echoing an argument if and only if it has an expectation"
+            );
+            if says(&err) != Says::AnArgument {
+                continue;
+            }
+            let Some(line) = expected_line(&err) else {
+                unreachable!("the assertion above holds for every arm that echoes")
+            };
+            let said = err.to_string();
+            assert_eq!(said.lines().next(), Some(line), "{what}: {said:?}");
+            // One line feed ends the message line, and the usage line after it has none of its
+            // own; `as_printed` adds the second, and the real process is driven by
+            // `tests/argfence.rs`.
+            assert_eq!(said.matches('\n').count(), 1, "{what}: {said:?}");
+            assert_eq!(
+                as_printed(&err).matches('\n').count(),
+                2,
+                "{what}: {said:?}"
+            );
+            for rendered in said.lines() {
+                assert!(
+                    !rendered.chars().any(char::is_control),
+                    "{what} put a control character on a line: {said:?}"
+                );
+            }
+            // The name is still there to read, as one name: the escapes are visible text.
+            assert!(said.contains(HOSTILE_SHOWN), "{what}: {said:?}");
+        }
+    }
+
+    // A name inside the quotes a message puts round it must not read as ended early: a `'` in it is
+    // doubled, so the last quote on the line is the one that ends the name. Before that was so,
+    // `-x' --burn evil` was measured on the real binary as `unknown argument '-x' --burn evil'`,
+    // where a reader sees the name end at `-x` and the rest as the message's own words. Every
+    // expectation is written out here by hand, and every arm that echoes is covered by name, so a
+    // new one fails the list rather than going untested.
+    #[test]
+    fn an_echoed_argument_with_a_quote_in_it_is_quoted_so_that_it_cannot_end_early() {
+        let echoing: Vec<&str> = every_variant()
+            .into_iter()
+            .filter(|(_, err)| says(err) == Says::AnArgument)
+            .map(|(what, _)| what)
+            .collect();
+        assert_eq!(
+            echoing,
+            [
+                "unknown",
+                "bad count",
+                "bad seed",
+                "bad address",
+                "bad keys"
+            ],
+            "a case below for each arm that echoes an argument, and this list with it"
+        );
+        let first_line = |err: ArgError| err.to_string().lines().next().unwrap().to_string();
+        // The measured case.
+        assert_eq!(
+            first_line(ArgError::Unknown("-x' --burn evil".into())),
+            "cmm2-emulator: unknown argument '-x'' --burn evil'"
+        );
+        // One case for each of the other four arms. A name that ends in a quote is followed by
+        // three of them: the doubled one, and the one the message puts round the name.
+        assert_eq!(
+            first_line(ArgError::BadCount("1'000".into())),
+            "cmm2-emulator: bad count '1''000'"
+        );
+        assert_eq!(
+            first_line(ArgError::BadSeed("''".into())),
+            "cmm2-emulator: bad seed ''''''"
+        );
+        assert_eq!(
+            first_line(ArgError::BadAddress("0x1'".into())),
+            "cmm2-emulator: bad address '0x1'''"
+        );
+        assert_eq!(
+            first_line(ArgError::BadKeys("it's".into())),
+            "cmm2-emulator: bad keys 'it''s'"
+        );
+        // A control character and a quote together: escaped once, then doubled once, in that order.
+        let both = ArgError::BadAddress("evil\n\u{1b}[31m'".into());
+        let said = both.to_string();
+        assert_eq!(
+            said.lines().next().unwrap(),
+            r"cmm2-emulator: bad address 'evil\n\x1B[31m'''"
+        );
+        assert_eq!(said.matches('\n').count(), 1, "{said:?}");
+        for line in said.lines() {
+            assert!(!line.chars().any(char::is_control), "{said:?}");
+        }
+        // A name with no quote in it is not changed at all.
         assert_eq!(
             first_line(ArgError::Unknown("--bogus".into())),
             "cmm2-emulator: unknown argument '--bogus'"
