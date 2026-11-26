@@ -73,6 +73,35 @@ fn firmware_missing_file_fails() {
     );
 }
 
+// The firmware's name reaches the refusal through the core's own error, which the run hands over
+// whole. A name with an escape and a line feed in it is still one line, broken nowhere and nothing
+// a terminal acts on, and the name is still there to read.
+#[test]
+fn a_firmware_named_with_control_characters_is_refused_in_one_unbroken_line() {
+    let name = "/nonexistent/evil\n\x1b[31mRED\x1b[0m.bin";
+
+    let output = run(&["--firmware", name, "--run", "10"]);
+    let err = stderr(&output);
+
+    assert_eq!(output.status.code(), Some(1), "{err}");
+    assert!(output.stdout.is_empty());
+    assert_eq!(err.matches('\n').count(), 1, "{err:?}");
+    assert_eq!(err.lines().count(), 1, "{err:?}");
+    assert!(
+        !err.contains('\x1b'),
+        "the name recoloured the line: {err:?}"
+    );
+    assert!(err.starts_with("cmm2-emulator: "), "{err:?}");
+    assert!(
+        err.contains(r"/nonexistent/evil\n\x1B[31mRED\x1B[0m.bin"),
+        "the name is not said: {err}"
+    );
+    assert!(
+        err.contains("No such file"),
+        "the reason is not said: {err}"
+    );
+}
+
 #[test]
 fn firmware_implausible_file_fails() {
     let path = temp_firmware("bad-sp", 0x1234_5678, 0x0800_0021);

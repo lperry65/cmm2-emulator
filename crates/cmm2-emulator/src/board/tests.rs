@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{files_in, scratch, spawning};
+use crate::test_support::{HOSTILE_NAME, HOSTILE_SHOWN, files_in, scratch, spawning};
 use std::collections::HashMap;
 
 fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
@@ -298,14 +298,31 @@ fn a_record_that_is_not_a_path_is_refused_with_what_to_do() {
 
 #[test]
 fn a_card_that_has_gone_is_told_how_to_take_it_out_or_give_another() {
-    let gone = RunError::Sd {
-        path: "/cards/gone.img".into(),
-        source: io::Error::from(io::ErrorKind::NotFound),
-    };
-    let said = text(about_the_remembered_card(gone));
-    assert!(said.contains("/cards/gone.img"), "{said}");
-    assert!(said.contains("Give another with --sd <file>"), "{said}");
-    assert!(said.contains("take it out with --no-sd"), "{said}");
+    // The name is the one the owner gave with `--sd`, plain and hostile. This is the one place
+    // where the words of another error are handed to a board error to be said, and what is handed
+    // over must have been escaped exactly once, by the arm that holds the name: escaping it again
+    // here reads as two backslashes where the file has one.
+    for card in ["/cards/gone.img", HOSTILE_NAME] {
+        let gone = RunError::Sd {
+            path: card.into(),
+            source: io::Error::from(io::ErrorKind::NotFound),
+        };
+        let said = text(about_the_remembered_card(gone));
+        assert!(
+            said.contains(if card == HOSTILE_NAME {
+                HOSTILE_SHOWN
+            } else {
+                card
+            }),
+            "{said}"
+        );
+        assert!(said.contains("Give another with --sd <file>"), "{said}");
+        assert!(said.contains("take it out with --no-sd"), "{said}");
+        assert!(
+            !said.chars().any(char::is_control),
+            "the name broke the line or recoloured it: {said:?}"
+        );
+    }
 }
 
 #[test]

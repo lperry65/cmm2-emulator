@@ -5,7 +5,8 @@ use crate::atomic_write::{create_new_atomically, replace_atomically};
 use crate::error::RunError;
 use crate::saveable::{check_regular, why_not_saveable};
 use crate::test_support::{
-    age, files_in, idle_cpu, idle_cpu_with, in_own_process, mode, root, scratch,
+    HOSTILE_NAME, HOSTILE_SHOWN, age, files_in, idle_cpu, idle_cpu_with, in_own_process, mode,
+    root, scratch,
 };
 use cmm2_core::{B5, Firmware, Irqs, MIN_IMAGE_SIZE, RC6, STATE_SIZE, SdSlot, cmm2_memory};
 use std::io;
@@ -687,10 +688,12 @@ fn a_file_one_byte_over_the_largest_is_refused_on_its_size() {
 }
 
 // A file far larger than any is refused on its size without being read. Proved in a process of its
-// own whose address space is limited to a little more than it has now: reading this file whole
-// needs a gigabyte, so a read fails (`fs::read` reports it as out of memory) and the message would
-// be that error and not the size. The file is sparse, so it costs the disk nothing. (A file that
-// cannot be read is refused before the size is looked at, so a mode-000 file or a FIFO cannot
+// own whose address space is limited, just before the load, to a little more than the machines it
+// has built need: reading this file whole needs a gigabyte, so a read fails (`fs::read` reports it
+// as out of memory) and the message would be that error and not the size. The limit is set after
+// the two machines are built, so that it can only ever stop the thing under proof and not a build
+// that has grown since this was written. The file is sparse, so it costs the disk nothing. (A file
+// that cannot be read is refused before the size is looked at, so a mode-000 file or a FIFO cannot
 // make this proof.)
 #[test]
 fn a_file_bigger_than_any_settings_file_is_refused_before_it_is_read() {
@@ -708,7 +711,11 @@ fn a_file_bigger_than_any_settings_file_is_refused_before_it_is_read() {
         "",
         &[],
         |_| {
-            // The address space the process has now, plus 256 MiB: not room for the file.
+            let mut raw = idle_cpu();
+            let mut board = idle_cpu();
+            board.use_settings_v2();
+            // The address space this process has now, with the two machines in it, plus 256 MiB:
+            // still not room for the file.
             let status = std::fs::read_to_string("/proc/self/status").unwrap();
             let used_kib: u64 = status
                 .lines()
@@ -722,9 +729,6 @@ fn a_file_bigger_than_any_settings_file_is_refused_before_it_is_read() {
             };
             // SAFETY: setrlimit is given a pointer to a struct that lives through the call.
             assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limits) }, 0);
-            let mut raw = idle_cpu();
-            let mut board = idle_cpu();
-            board.use_settings_v2();
             for cpu in [&mut raw, &mut board] {
                 assert_refused_on_size(load_flash(cpu, &path).unwrap_err(), &path, TOO_BIG);
             }
@@ -1266,7 +1270,9 @@ fn only_a_backup_of_the_same_length_is_read_to_see_if_it_is_the_copy() {
 
 // Names that are taken again and again are looked at a bounded number of times: then the
 // migration is refused and nothing is written. The writer fails with another error if the bound
-// is ever lost, so that a loop that never ends does not hang the suite.
+// is ever lost, so that a loop that never ends does not hang the suite. This is a lost race and
+// not a full cascade: nothing is ever written at a name here, so the refusal must not say that
+// the 99 names are taken.
 #[test]
 fn a_backup_name_that_is_always_taken_before_the_write_ends_in_a_refusal() {
     let dir = scratch("backup-always-raced");
@@ -1300,15 +1306,26 @@ fn a_backup_name_that_is_always_taken_before_the_write_ends_in_a_refusal() {
     assert_eq!(
         err.to_string(),
         format!(
-            "{path}: not backing up the old settings: the names from {path}.v1 to {path}.v1.99 \
-             are all taken. Move some of them out of the way and start again; no file was \
-             written."
+            "{path}: not backing up the old settings: the name chosen for the copy was taken \
+             before the copy could be made, 99 times running. Something else is writing in this \
+             directory; nothing was written, and {path} is untouched."
         )
     );
-    assert_eq!(tries, 99, "one try for each name there is");
+    // The bound is 99 tries, and every one of them aims at `.v1`: nothing is written at a name, so
+    // the search starts again from the first name each time and finds the same one free.
+    assert_eq!(tries, 99);
+    assert!(
+        !said_that_all_the_names_are_taken(&err.to_string()),
+        "{err}"
+    );
     assert_eq!(std::fs::read(&file).unwrap(), original);
     assert_eq!(std::fs::metadata(&file).unwrap().ino(), before.ino());
     assert_eq!(files_in(&dir), ["settings.flash"]);
+}
+
+// The other refusal of a retry is a cascade with every name in it, and only that one may say so.
+fn said_that_all_the_names_are_taken(said: &str) -> bool {
+    said.contains("are all taken")
 }
 
 // A file that appears at the chosen backup name between the check and the write is never
@@ -1757,5 +1774,252 @@ fn a_backup_is_made_with_its_mode_narrowed_by_the_umask() {
                 ran.stderr
             );
         }
+    }
+}
+
+// A copy the board cannot read is left exactly where it is, and the skipping is said: the name
+// beside the file may hold somebody else's bytes, and the settings still need somewhere to go.
+// The migration is run in a process of its own only because what is said goes to standard error,
+// which a test process cannot take from itself.
+#[test]
+fn a_copy_that_cannot_be_read_is_skipped_with_a_line_saying_where_the_backup_went() {
+    if root() {
+        // As root a mode bit stops nothing, so the read succeeds and there is nothing to say.
+        return;
+    }
+    // Each case: the names that cannot be read, the names that hold the copy already (a migration
+    // of an earlier start that was cut short after its copy), the words that name the unreadable
+    // ones, and the name the copy is at. The index tells the cases apart to the child process.
+    for (n, &(blocked, identical, were, landed)) in [
+        (
+            &["settings.flash.v1"][..],
+            &[][..],
+            "the copy at",
+            "settings.flash.v1.2",
+        ),
+        (
+            &["settings.flash.v1", "settings.flash.v1.2"][..],
+            &[][..],
+            "the copies at",
+            "settings.flash.v1.3",
+        ),
+        // Nothing is written where the copy is there already, and the unreadable name is still
+        // said.
+        (
+            &["settings.flash.v1"][..],
+            &["settings.flash.v1.2"][..],
+            "the copy at",
+            "settings.flash.v1.2",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let dir = scratch("backup-unreadable");
+        let file = dir.join("settings.flash");
+        let ran = in_own_process(
+            concat!(
+                "storage::tests::a_copy_that_cannot_be_read_is_skipped_with_a_line_",
+                "saying_where_the_backup_went"
+            ),
+            &n.to_string(),
+            &[],
+            |_| {
+                let original = idle_cpu().persistent().unwrap();
+                std::fs::write(&file, &original).unwrap();
+                // Files as long as the live one, so their bytes are read to see whether one of them
+                // is the copy already, and none of them can be: these names the board may neither
+                // use nor write over.
+                for name in blocked {
+                    let held = dir.join(name);
+                    std::fs::write(&held, &original).unwrap();
+                    mode(&held, 0o000);
+                }
+                for name in identical {
+                    std::fs::write(dir.join(name), &original).unwrap();
+                }
+                let mut cpu = idle_cpu();
+                cpu.use_settings_v2();
+
+                load_flash(&mut cpu, file.to_str().unwrap()).unwrap();
+
+                // The raw bytes are kept at the name the line below says, byte for byte.
+                assert_eq!(std::fs::read(dir.join(landed)).unwrap(), original);
+                // The live file is the board's own format now, so the migration went through.
+                assert!(
+                    std::fs::read(&file).unwrap().starts_with(&MAGIC),
+                    "the live file migrated"
+                );
+                // The unreadable files are themselves still: not written to, and not removed.
+                for name in blocked {
+                    let held = std::fs::symlink_metadata(dir.join(name)).unwrap();
+                    assert_eq!(
+                        held.mode() & 0o7777,
+                        0o000,
+                        "{name}: its mode is as it was made"
+                    );
+                    assert_eq!(
+                        held.len(),
+                        original.len() as u64,
+                        "{name}: its length is as it was made"
+                    );
+                }
+                let mut want: Vec<String> = vec!["settings.flash".to_string(), landed.to_string()];
+                want.extend(blocked.iter().map(|name| name.to_string()));
+                want.extend(identical.iter().map(|name| name.to_string()));
+                want.sort();
+                want.dedup();
+                assert_eq!(files_in(&dir), want, "and nothing else in the directory");
+                // The child ends with `_exit`, so its own directory is removed here.
+                std::fs::remove_dir_all(&*dir).unwrap();
+            },
+        );
+        let Some(ran) = ran else { continue };
+        assert_eq!(
+            ran.ended,
+            crate::test_support::Ended::Exit(0),
+            "{}",
+            ran.stderr
+        );
+        let said = ran.stderr;
+        let warned: Vec<&str> = said
+            .lines()
+            .filter(|l| l.contains("cannot be read"))
+            .collect();
+        assert_eq!(warned.len(), 1, "one line about it, and no more: {said}");
+        // The child names the files in its own directory (a run id is per process), so the
+        // sentence, the names and the directory they share are what is checked here.
+        let (skipped, chosen) = warned[0]
+            .strip_prefix(&format!("cmm2-emulator: {were} "))
+            .and_then(|rest| rest.split_once(" cannot be read; the backup goes to "))
+            .unwrap_or_else(|| panic!("not the line this says: {}", warned[0]));
+        let names: Vec<&str> = skipped.split(", ").collect();
+        assert_eq!(
+            names.len(),
+            blocked.len(),
+            "every unreadable name is said: {skipped}"
+        );
+        for (name, was) in names.iter().zip(blocked) {
+            assert!(name.ends_with(was), "{name} is not {was}");
+            assert_eq!(
+                Path::new(name).parent(),
+                Path::new(chosen).parent(),
+                "both beside the live file: {skipped}"
+            );
+        }
+        assert!(chosen.ends_with(landed), "where the copy went: {chosen}");
+    }
+}
+
+// A card that cannot be written back has its write-protect switch on, and that is said. The name of
+// the file is the user's to give and may hold a line feed and a colour change, so the line it is
+// said on stays one line and holds nothing a terminal acts on. It is run in a process of its own
+// because what is said goes to standard error, which a test process cannot take from itself.
+#[test]
+fn a_card_that_cannot_be_written_back_is_said_in_one_unbroken_line() {
+    if root() {
+        // As root a mode bit stops nothing, so no card is write-protected and nothing is said.
+        return;
+    }
+    let ran = in_own_process(
+        "storage::tests::a_card_that_cannot_be_written_back_is_said_in_one_unbroken_line",
+        "",
+        &[],
+        |_| {
+            let dir = scratch("sd-said");
+            let card = dir.join(format!("{HOSTILE_NAME}.img"));
+            std::fs::write(&card, vec![0; MIN_IMAGE_SIZE]).unwrap();
+            mode(&card, 0o444);
+            load_sd(&SdSlot::new(), card.to_str().unwrap()).unwrap();
+            // The child ends with `_exit`, so its own directory is removed here.
+            std::fs::remove_dir_all(&*dir).unwrap();
+        },
+    );
+    let Some(ran) = ran else { return };
+    assert_eq!(
+        ran.ended,
+        crate::test_support::Ended::Exit(0),
+        "{}",
+        ran.stderr
+    );
+    let said = ran.stderr;
+    assert!(
+        !said.contains('\u{1b}'),
+        "the name recoloured the child's error: {said:?}"
+    );
+    let warned: Vec<&str> = said
+        .lines()
+        .filter(|line| line.contains("the card is write-protected because"))
+        .collect();
+    assert_eq!(warned.len(), 1, "one line about it, and no more: {said}");
+    let line = warned[0];
+    assert!(line.starts_with("cmm2-emulator: "), "{line:?}");
+    assert!(
+        line.ends_with(": the card is write-protected because the file is read-only"),
+        "{line:?}"
+    );
+    assert!(line.contains(HOSTILE_SHOWN), "the name is not said: {line}");
+}
+
+// The three refusals that cannot be staged from a shell, because they happen between two
+// syscalls: a copy whose name is taken every time it is tried, a file system that refuses the
+// hard link, and new settings that do not read back. They are driven through the migration
+// itself, with the writer and the encoder handed in, and with a file whose name holds a line
+// feed and a colour change. What is checked is the line each one ends up said on: one line, with
+// the name visible in it and nothing in it a terminal acts on.
+#[test]
+fn a_migration_refusal_named_with_control_characters_is_said_in_one_unbroken_line() {
+    // How the migration is stopped: by the copy's name, by the file system, or by the new bytes.
+    const STOP: [&str; 3] = ["the name is taken", "no hard links", "does not read back"];
+
+    for stop in STOP {
+        let dir = scratch("migrate-hostile");
+        let file = dir.join(format!("{HOSTILE_NAME}.flash"));
+        let mut cpu = idle_cpu();
+        let original = cpu.persistent().unwrap();
+        std::fs::write(&file, &original).unwrap();
+        cpu.use_settings_v2();
+        let path = file.to_str().unwrap();
+
+        let err = migrate_with(
+            &mut cpu,
+            path,
+            &original,
+            |cpu| {
+                let mut bytes = Cpu::save_settings(cpu)?;
+                if stop == "does not read back" {
+                    let last = bytes.len() - 1;
+                    bytes[last] ^= 0x80; // a checksum that does not fit the file
+                }
+                Ok(bytes)
+            },
+            |_, _| match stop {
+                "no hard links" => Err(io::Error::from(io::ErrorKind::Unsupported)),
+                _ => Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+            },
+            read_file,
+            replace_atomically,
+        )
+        .unwrap_err();
+
+        let said = err.to_string();
+        assert!(
+            !said.chars().any(char::is_control),
+            "{stop}: the name broke the line or recoloured it: {said:?}"
+        );
+        assert_eq!(said.matches('\n').count(), 0, "{stop}: {said}");
+        assert!(
+            said.contains(HOSTILE_SHOWN),
+            "{stop}: the name is not said: {said}"
+        );
+        // The words are the ones the migration says for that stop, and not a bare variant name,
+        // and every one of them ends by saying the live file is untouched.
+        let because = match stop {
+            "the name is taken" => "was taken before the copy could be made, 99 times running",
+            "no hard links" => "this file system refused one (unsupported)",
+            _ => "did not read back (the checksum does not match the file)",
+        };
+        assert!(said.contains(because), "{stop}: {said}");
+        assert!(said.ends_with("is untouched."), "{stop}: {said}");
     }
 }

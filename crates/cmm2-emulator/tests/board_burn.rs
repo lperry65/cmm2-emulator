@@ -27,6 +27,32 @@ fn a_plain_start_with_nothing_burned_says_how_to_burn_and_where_the_board_is() {
     }
 }
 
+// The board's directory reaches the refusal through the board's own error, which the run hands
+// over whole. A directory named with an escape and a line feed is still one line, broken nowhere
+// and nothing a terminal acts on, and the name is still there to read.
+#[test]
+fn a_board_directory_named_with_control_characters_is_refused_in_one_unbroken_line() {
+    let home = Home(temp_path("board-escape-names", "dir").join("evil\n\x1b[31mRED\x1b[0m"));
+
+    let output = quit_run(&home, &["--console", "--run", "10"]);
+    let err = stderr(&output);
+
+    assert_eq!(output.status.code(), Some(1), "{err}");
+    assert!(output.stdout.is_empty());
+    assert_eq!(err.matches('\n').count(), 1, "{err:?}");
+    assert_eq!(err.lines().count(), 1, "{err:?}");
+    assert!(
+        !err.contains('\x1b'),
+        "the name recoloured the line: {err:?}"
+    );
+    assert!(err.starts_with("cmm2-emulator: "), "{err:?}");
+    assert!(
+        err.contains(r"evil\n\x1B[31mRED\x1B[0m. Burn it once with"),
+        "the name is not said: {err}"
+    );
+    assert!(!home.0.exists(), "finding out made the directory");
+}
+
 #[test]
 fn burning_once_then_a_plain_start_boots_the_board_from_its_own_copy() {
     let home = Home::new("board-burn");
@@ -143,6 +169,28 @@ fn an_image_that_is_refused_makes_no_directory_and_no_lock_file() {
         assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
         assert!(!home.0.exists(), "{}", file.arg());
     }
+}
+
+// A burn reads the board's own layout variable, and the refusal of a bad value names the variable
+// it read. This is the one message that says that name at all; docs/settings-format.md says what
+// the variable is for.
+#[test]
+fn a_burn_with_a_bad_board_layout_name_is_refused_and_names_that_variable() {
+    let home = Home::new("board-bad-layout-name");
+    let program = Tmp::program("board-bad-layout-name", &THREE);
+    let mut command = on(&home);
+    let output = command
+        .env(BOARD_LAYOUT_VARIABLE, "8")
+        .args(["--burn", program.arg(), "--console", "--run", "1"])
+        .output()
+        .expect("failed to run cmm2-emulator");
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        "cmm2-emulator: CMM2_BOARD_LAYOUT_FOR_TESTS is \"8\", not b5 or rc6\n"
+    );
+    assert!(!home.0.exists(), "a refused burn makes no board directory");
 }
 
 // The script of the full-disk tests: burn a small image, make `firmware.bin` as the mode says,

@@ -2,7 +2,7 @@
 //! before the run, so that a long run is not lost to a path that could never be written.
 
 use crate::atomic_write::resolve;
-use crate::error::say;
+use crate::error::{say, shown};
 use std::ffi::CString;
 use std::fs::File;
 use std::io;
@@ -180,8 +180,12 @@ fn why_not_saveable_as(path: &str, follow: bool) -> Option<String> {
             return Some("its directory is append-only or immutable".to_string());
         }
         Ok(_) => {}
+        // Both names are escaped at the line they are said on: the words of the `io::Error` are its
+        // own and nothing escaped them before this (see `shown`).
         Err(err) => say(format!(
-            "{path}: its directory cannot be read ({err}), so whether it is append-only is not known"
+            "{}: its directory cannot be read ({}), so whether it is append-only is not known",
+            shown(path),
+            shown(&err.to_string())
         )),
     }
     // What is known of the file without opening it comes first, as a file that cannot be read

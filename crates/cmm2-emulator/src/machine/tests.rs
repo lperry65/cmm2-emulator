@@ -129,3 +129,22 @@ fn an_unknown_firmware_takes_the_layout_the_variable_names_and_a_bad_name_is_an_
         "CMM2_SETTINGS_LAYOUT is \"8\", not b5 or rc6"
     );
 }
+
+// The board's variable is the other one, and the refusal of a bad name says which variable it
+// read. docs/settings-format.md says what it is for; this and `tests/board_burn.rs` pin what it
+// says.
+#[test]
+fn a_bad_board_layout_name_is_refused_with_the_board_variables_own_name() {
+    let bad = with_layout(
+        firmware_with(None),
+        BOARD_LAYOUT_VARIABLE,
+        Some("8".to_string()),
+    );
+    assert_eq!(
+        bad.unwrap_err().to_string(),
+        "CMM2_BOARD_LAYOUT_FOR_TESTS is \"8\", not b5 or rc6"
+    );
+    // A firmware I know keeps its own, so the board variable is not looked at either.
+    let known = firmware_with(Some(&cmm2_core::B5));
+    assert!(with_layout(known, BOARD_LAYOUT_VARIABLE, Some("8".to_string())).is_ok());
+}

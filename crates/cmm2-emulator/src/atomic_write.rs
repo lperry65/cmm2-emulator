@@ -1,7 +1,7 @@
 //! Writing a file so that a crash leaves the old one or the new one and never half of each, and
 //! clearing up the temporary files that a save that was cut short leaves behind.
 
-use crate::error::say;
+use crate::error::{say, shown};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::Write;
@@ -109,8 +109,12 @@ fn write_over(
     // The file is in its place by now, so a directory that cannot be synced (one that cannot be
     // read, or a file system that has no such thing) is something to say and not a failed save.
     if let Err(err) = File::open(dir).and_then(|dir| dir.sync_all()) {
+        // Both names are escaped at the line they are said on: the words of the `io::Error` are its
+        // own and nothing escaped them before this (see `shown`).
         say(format!(
-            "{path}: written, but its directory could not be synced ({err})"
+            "{}: written, but its directory could not be synced ({})",
+            shown(path),
+            shown(&err.to_string())
         ));
     }
     Ok(())

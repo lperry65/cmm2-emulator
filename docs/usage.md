@@ -30,13 +30,14 @@ cargo test
 Building needs the SDL2 development files (`libsdl2-dev` on Debian and Ubuntu).
 
 Nearly all the ignored tests run the real firmware: they need your copy of the `.bin` and take a
-while. `cargo test --workspace -- --ignored --list` counts 78 of them (counted on 2026-11-25 the
-same way, by counting `#[ignore` lines; the listing needs no firmware): 46 in `cmm2-core` (45 in
-the ten files of `crates/cmm2-core/tests/`, and a display speed test in `display/tests.rs`), 31
-in `cmm2-emulator` (6 in `tests/real_firmware.rs`, 5 in `tests/board_burn.rs` and 20 in the
-tests of `keys.rs` and `usb_keys.rs`), and one in `zmu_cortex_m`. Two of the 78 do not use the
-firmware: the display speed test, which times the compositing, and the `zmu_cortex_m` one, a
-decode dump run by hand with `ZMU_DUMP_IMAGE` and `ZMU_DUMP_OUT`.
+while. `cargo test --workspace -- --ignored --list` counts 79 of them (counted on 2026-11-25 from
+that listing, which needs no firmware; counting `#[ignore` lines gives the same 79): 46 in
+`cmm2-core` (45 in the nine files of `crates/cmm2-core/tests/`, and a display speed test in
+`display/tests.rs`), 32 in `cmm2-emulator` (6 in `tests/real_firmware.rs`, 6 in
+`tests/board_burn.rs` and 20 in the tests of `keys.rs` and `usb_keys.rs`), and one in
+`zmu_cortex_m`. Two of the 79 do not use the firmware: the display speed test, which times the
+compositing, and the `zmu_cortex_m` one, a decode dump run by hand with `ZMU_DUMP_IMAGE` and
+`ZMU_DUMP_OUT`.
 
 To run the others, point `CMM2_FIRMWARE` at the 7.00.00b5 `.bin` and `CMM2_FIRMWARE_RC6` at the
 7.00.00RC6 `.bin`. Both have to be set, because four of them read the RC6 image and panic
@@ -389,9 +390,11 @@ file is replaced with its v2 form only after that form has been read back and ch
 
 - The copy is `settings.flash.v1` (the file's own name with `.v1`). A copy that is already there
   is an older one and is never overwritten: the new raw bytes go to the first free name from
-  `.v1.2` to `.v1.99`, so no raw bytes are ever lost. A name held by a link, a directory or a
-  device is refused, and so is the case where all 99 names are taken; either way nothing is
-  written. The emulator never deletes a copy.
+  `.v1.2` to `.v1.99`, so no raw bytes are ever lost. A copy whose bytes cannot be read is left
+  exactly as it is and the next name is used, and one line on standard error says which copy that
+  was and where the backup went. A name held by a link, a directory or a device is refused, and so
+  is the case where all 99 names are taken; either way nothing is written. The emulator never
+  deletes a copy.
 - A copy is written whole or not at all, and never over a name that is taken: if a file appears at
   the chosen name before the write, the next free name is used. The live file is replaced only
   after the copy is in place. If the replace then fails, the next start finds a copy with exactly

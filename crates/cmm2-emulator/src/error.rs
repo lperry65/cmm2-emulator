@@ -7,9 +7,11 @@ use cmm2_core::{
     CpuError, FirmwareError, FrameError, ImageSizeError, MIN_IMAGE_SIZE, MemoryError, NoLayout,
     PersistentError, SettingsError,
 };
+use std::borrow::Cow;
 use std::fmt;
 use std::io;
 use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Debug)]
@@ -66,6 +68,13 @@ pub(crate) enum RunError {
         first: String,
         last: String,
     },
+    /// A migration refused because the name it chose for a copy of the old settings was taken
+    /// again after every try, `tries` of them (issue 82). None of the names need be taken: this is
+    /// a race lost over and over, and it says so rather than that the cascade is full.
+    BackupRaceLost {
+        path: String,
+        tries: usize,
+    },
     /// A migration refused because the file system would not make the hard link that a copy of
     /// the old settings is made with (issue 82). Nothing was written.
     BackupNeedsLink {
@@ -115,6 +124,52 @@ pub(crate) enum RunError {
     Fault(String),
 }
 
+/// How a name gets into a message, in one sentence: a name is escaped for display exactly once, by
+/// the `Display` or `say` that puts it in words, and a name offered as a command goes through
+/// `command_quoted` instead: a string is either what a human reads or what the shell is handed,
+/// never both.
+///
+/// Three follow from that. A message built out of another message in this crate escapes only what
+/// it adds itself, because the inner one escaped what it added (`BoardError::Card` holds words
+/// escaped once already). The words of an `io::Error` and of another crate's error are never
+/// escaped where they are made — a syscall's own message, or a path `saveable` put in a reason —
+/// so the arm that says them escapes them. And a line said to a terminal carries no control
+/// character, so a command quoting a name that holds one quotes the escaped form, which has to be
+/// retyped either way; an ordinary name, a backslash included, is quoted as it is so that the
+/// command names the file that exists.
+///
+/// `text` as it is safe to put in a message: every control character is written out where it
+/// stands, `\n`, `\r` and `\t` by name and the rest by their byte (`\x1B`), and a backslash as two
+/// so that a name cannot imitate one of those. Text that needs nothing is returned as it is. A
+/// file may be called anything its file system takes, and a message that said those bytes raw
+/// would let the name recolour the terminal the message is read in, or break the line it is on and
+/// forge one of its own behind the program's name.
+pub(crate) fn shown(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(|c| c.is_control() || c == '\\') {
+        return Cow::Borrowed(text);
+    }
+    let mut safe = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match c {
+            '\\' => safe.push_str(r"\\"),
+            '\n' => safe.push_str(r"\n"),
+            '\r' => safe.push_str(r"\r"),
+            '\t' => safe.push_str(r"\t"),
+            // `is_control` is the C0 and C1 ranges and DEL, every one of them at or below 0x9F, so
+            // two hex digits say any of them.
+            c if c.is_control() => safe.push_str(&format!("\\x{:02X}", c as u32)),
+            c => safe.push(c),
+        }
+    }
+    Cow::Owned(safe)
+}
+
+/// A path as it is safe to put in a message: `shown` of what a path's own `Display` makes of it,
+/// which stands in a byte it cannot read with U+FFFD.
+pub(crate) fn shown_path(path: &Path) -> String {
+    shown(&path.display().to_string()).into_owned()
+}
+
 /// `text` as one word of a shell command: as it is when it holds only characters the shell leaves
 /// alone, and otherwise in single quotes (a quote inside is closed, escaped and opened again). A
 /// name that starts with a dash is a relative path, and gets `./` in front so that it is not
@@ -133,40 +188,83 @@ fn shell_quoted(text: &str) -> String {
     }
 }
 
+/// `text` as one word of a command the reader can paste: `shell_quoted` of the name as it is, so
+/// that a name holding a backslash names the file that exists. Only a name with a control
+/// character in it is quoted around `shown` instead, because a line said to a terminal carries no
+/// control character — such a name has to be retyped either way. A string is never both what a
+/// human reads and what the shell is handed.
+fn command_quoted(text: &str) -> String {
+    if text.chars().any(char::is_control) {
+        shell_quoted(&shown(text))
+    } else {
+        shell_quoted(text)
+    }
+}
+
 impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Every path is said through `shown`, and so is every borrowed word, whoever wrote it, so
+        // that no arm has to judge which words could name a file. What this does not allow is the
+        // same text escaped twice: see `shown`, and `BoardError::Card`, which holds words its own
+        // arm escaped already.
         match self {
-            RunError::Firmware(err) => err.fmt(f),
-            RunError::Memory(err) => err.fmt(f),
-            RunError::Cpu(err) => err.fmt(f),
-            RunError::Trace { path, source } => write!(f, "{path}: {source}"),
-            RunError::Write(err) => write!(f, "writing the trace: {err}"),
-            RunError::Console(err) => write!(f, "writing the console output: {err}"),
-            RunError::Window(err) => err.fmt(f),
-            RunError::Frame(err) => write!(f, "no screenshot: {err}"),
-            RunError::Screenshot { path, source } => write!(f, "{path}: {source}"),
-            RunError::Flash { path, source } => write!(f, "{path}: {source}"),
-            RunError::FlashSize { path, source } => write!(f, "{path}: {source}"),
+            // Shown as a whole, because the core's message for a firmware it could not read names
+            // the file in its words.
+            RunError::Firmware(err) => write!(f, "{}", shown(&err.to_string())),
+            RunError::Memory(err) => write!(f, "{}", shown(&err.to_string())),
+            RunError::Cpu(err) => write!(f, "{}", shown(&err.to_string())),
+            RunError::Trace { path, source } => {
+                write!(f, "{}: {}", shown(path), shown(&source.to_string()))
+            }
+            RunError::Write(err) => write!(f, "writing the trace: {}", shown(&err.to_string())),
+            RunError::Console(err) => {
+                write!(f, "writing the console output: {}", shown(&err.to_string()))
+            }
+            RunError::Window(err) => write!(f, "{}", shown(&err.to_string())),
+            RunError::Frame(err) => write!(f, "no screenshot: {}", shown(&err.to_string())),
+            RunError::Screenshot { path, source } => {
+                write!(f, "{}: {}", shown(path), shown(&source.to_string()))
+            }
+            // The words of `source` name a path too when `saveable` made them (its reason for a
+            // `--flash` file that could not be saved), and an `io::Error`'s words are never escaped
+            // where they are made, so this arm escapes them (see the strategy on `shown`).
+            RunError::Flash { path, source } => {
+                write!(f, "{}: {}", shown(path), shown(&source.to_string()))
+            }
+            RunError::FlashSize { path, source } => {
+                write!(f, "{}: {}", shown(path), shown(&source.to_string()))
+            }
             RunError::Settings {
                 path,
                 source,
                 backups,
             } => {
-                write!(f, "{path}: {source}")?;
+                // The clause that ends the message offers to delete the file, so it is a command
+                // and quotes the raw name (see `command_quoted`); the display is escaped.
+                let quoted = command_quoted(path);
+                let path = shown(path);
+                write!(f, "{path}: {}", shown(&source.to_string()))?;
                 if !backups.is_empty() {
+                    let copies: Vec<String> = backups
+                        .iter()
+                        .map(|copy| shown(copy).into_owned())
+                        .collect();
                     write!(
                         f,
                         " Older settings are kept beside it: {}. Restoring one of them gives back \
                          the settings of the time it was made, and everything saved since is \
                          lost; which one holds the settings you want is for you to say. Or start \
-                         fresh by deleting {path}.",
-                        backups.join(", ")
+                         fresh by deleting {quoted}.",
+                        copies.join(", ")
                     )?;
                 }
                 Ok(())
             }
             RunError::V2InRawRun { path } => {
-                let quoted = shell_quoted(path);
+                // The advice is a command, so it quotes the raw name (see `command_quoted`); the
+                // display is escaped, and the two differ whenever the name holds a backslash.
+                let quoted = command_quoted(path);
+                let path = shown(path);
                 write!(
                     f,
                     "{path}: these settings were saved by the board of this emulator (format v2), \
@@ -178,13 +276,26 @@ impl fmt::Display for RunError {
             }
             RunError::BackupNotAFile { path, backup } => write!(
                 f,
-                "{path}: not backing up the old settings to {backup}: that name is not a \
-                 regular file. Move it out of the way and start again; no file was written."
+                "{}: not backing up the old settings to {}: that name is not a regular file. Move \
+                 it out of the way and start again; no file was written.",
+                shown(path),
+                shown(backup)
             ),
             RunError::BackupsFull { path, first, last } => write!(
                 f,
-                "{path}: not backing up the old settings: the names from {first} to {last} are \
-                 all taken. Move some of them out of the way and start again; no file was written."
+                "{}: not backing up the old settings: the names from {} to {} are all taken. Move \
+                 some of them out of the way and start again; no file was written.",
+                shown(path),
+                shown(first),
+                shown(last)
+            ),
+            RunError::BackupRaceLost { path, tries } => write!(
+                f,
+                "{}: not backing up the old settings: the name chosen for the copy was taken \
+                 before the copy could be made, {tries} times running. Something else is writing \
+                 in this directory; nothing was written, and {} is untouched.",
+                shown(path),
+                shown(path)
             ),
             RunError::BackupNeedsLink {
                 path,
@@ -192,33 +303,58 @@ impl fmt::Display for RunError {
                 source,
             } => write!(
                 f,
-                "{path}: not backing up the old settings to {backup}: the copy is made with a \
-                 hard link, and this file system refused one ({source}). Nothing was written, \
-                 and {path} is untouched."
+                "{}: not backing up the old settings to {}: the copy is made with a hard link, \
+                 and this file system refused one ({}). Nothing was written, and {} is untouched.",
+                shown(path),
+                shown(backup),
+                shown(&source.to_string()),
+                shown(path)
             ),
-            RunError::NotReadBack { path, reason } => write!(
-                f,
-                "{path}: the new settings file made for the migration did not read back \
-                 ({reason}); nothing was written, and {path} is untouched."
-            ),
-            RunError::NoLayout { path, source } => write!(f, "{path}: {source}"),
+            RunError::NotReadBack { path, reason } => {
+                let path = shown(path);
+                write!(
+                    f,
+                    "{path}: the new settings file made for the migration did not read back ({}); \
+                     nothing was written, and {path} is untouched.",
+                    shown(reason)
+                )
+            }
+            RunError::NoLayout { path, source } => {
+                write!(f, "{}: {}", shown(path), shown(&source.to_string()))
+            }
             RunError::BoardNoLayout { path } => write!(
                 f,
-                "{path}: the firmware burned onto the board has no settings layout yet (see issue \
-                 82), so the board cannot keep its settings. Burn a firmware I know with: \
-                 cmm2-emulator --burn <file>"
+                "{}: the firmware burned onto the board has no settings layout yet (see issue 82), \
+                 so the board cannot keep its settings. Burn a firmware I know with: \
+                 cmm2-emulator --burn <file>",
+                shown(path)
             ),
+            // The value comes from the environment and can hold anything a file name can, so it
+            // is escaped like every other user-supplied string. Said raw it broke the line and
+            // recoloured it: a value with a line feed and a colour change put two line feeds and
+            // two escape bytes on standard error.
             RunError::BadLayoutName { variable, name } => {
-                write!(f, "{variable} is \"{name}\", not b5 or rc6")
+                write!(f, "{variable} is \"{}\", not b5 or rc6", shown(name))
             }
-            RunError::Sd { path, source } => write!(f, "{path}: {source}"),
-            RunError::SdSize { path, source } => write!(f, "{path}: {source}"),
+            RunError::Sd { path, source } => {
+                write!(f, "{}: {}", shown(path), shown(&source.to_string()))
+            }
+            RunError::SdSize { path, source } => {
+                write!(f, "{}: {}", shown(path), shown(&source.to_string()))
+            }
             RunError::SdTooSmall { path, size } => write!(
                 f,
-                "{path}: {size} bytes is smaller than the {MIN_IMAGE_SIZE} bytes (512 KB) of the smallest card"
+                "{}: {size} bytes is smaller than the {MIN_IMAGE_SIZE} bytes (512 KB) of the \
+                 smallest card",
+                shown(path)
             ),
+            // Handed over as it is: an arm of the board's escapes the names in its own words (see
+            // the strategy on `shown`), and escaping the whole message again is what read as two
+            // backslashes where a name had one.
             RunError::Board(err) => err.fmt(f),
-            RunError::Fault(description) => f.write_str(description),
+            // The core's words about a guest fault, which name no file and are escaped anyway: the
+            // strategy does not ask an arm whether the words it says could hold a name.
+            RunError::Fault(description) => f.write_str(&shown(description)),
         }
     }
 }

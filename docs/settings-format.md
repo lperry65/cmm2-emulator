@@ -20,11 +20,18 @@ Which run writes which file:
 - A scratch run, which is any run with `--firmware`, reads and writes the raw layout ("v1"),
   whatever the firmware is, a recognised one included. It never writes v2.
 
-The board's firmware is always one that `Profile::identify` recognised from its bytes (a length
-and a hash that match a known image): `--burn` of any other is refused, and so is a start whose
-`firmware.bin` is not one I know. A layout named by `CMM2_SETTINGS_LAYOUT` for an image I do not
-know is an assumption, and an assumption has no place in a header that states the image as fact,
-so that variable is for scratch runs only and they keep the raw file.
+A board's firmware is one that `Profile::identify` recognised from its bytes (a length and a hash
+that match a known image), unless a layout has been named for it: `--burn` of an image I do not
+know is refused, and so is a start whose `firmware.bin` is not one I know. The variable that names
+a layout for the board is `CMM2_BOARD_LAYOUT_FOR_TESTS`, and it is the way past that refusal - but
+it does not open the v2 gate. A burn only asks for *a* layout, so a burn with a layout named for an
+image I cannot recognise succeeds; the gate asks whether the bytes identified themselves, and they
+did not, so that board keeps the raw file on a plain start as much as it did on the burn. The same
+applies to `CMM2_SETTINGS_LAYOUT`, which names a layout for a scratch run and is never read by the
+board: a named layout is an assumption, and an assumption has no place in a header that states the
+image as fact, so only a firmware I recognised from its own bytes writes v2. The board's variable
+is for the tests: it is not in the README, and the refusal of a bad value is the one message that
+says its name.
 
 A v2 file is refused, never guessed at, when it is newer than this emulator, when it carries
 flags or reserved bits I do not know, when its header does not name the image I am running, or
@@ -138,17 +145,23 @@ No raw bytes are ever lost. The backup is `settings.flash.v1` (the name of the f
 on the end). If a plain file is already there, it is an older copy and is left alone, and the new
 raw bytes go to the first free name after it: `.v1.2`, `.v1.3`, and so on up to `.v1.99`. Each
 name is looked at without following links. A name that is free is used. A plain file there means
-try the next name. Anything else there (a symbolic link, a directory, a device, or a name that
-cannot be looked at) is refused, and nothing is written, so the old bytes land beside the live
-file or nowhere. When all of the names from `.v1` to `.v1.99` are taken, the migration is
-refused with a message that says so, and nothing is written. The emulator never deletes a backup.
+try the next name. A plain file whose bytes cannot be read - its mode keeps them from you, or it
+is not yours - is left exactly as it is and the next name is used, and one line on standard error
+says which copy could not be read and where the backup went. Anything else there (a symbolic link,
+a directory, a device, or a name that cannot be looked at) is refused, and nothing is written, so
+the old bytes land beside the live file or nowhere. When all of the names from `.v1` to `.v1.99`
+are taken, the migration is refused with a message that says so, and nothing is written. The
+emulator never deletes a backup.
 
 A backup is written whole or not at all (to a temporary file, then hard-linked to its name), and
 never over a name that is taken: if something appears at the chosen name before the write, the
-names are looked at again. A plain file at a name whose bytes are exactly the raw bytes being
-migrated is that backup already made, by a migration that was cut short before the live file was
-replaced; it is used and nothing more is written, so a failing replace does not fill up the names
-with identical copies. The check reads such a file only when it is as long as the raw file.
+names are looked at again. A name that is taken before the write every time it is chosen ends in a
+refusal after 99 tries, saying the copy was taken before it could be made. That is a race lost, and
+the message does not say the names are all taken: nothing here need be at any of them. A plain file
+at a name whose bytes are exactly the raw bytes being migrated is that backup already made, by a
+migration that was cut short before the live file was replaced; it is used and nothing more is
+written, so a failing replace does not fill up the names with identical copies. The check reads such
+a file only when it is as long as the raw file.
 
 The backup gets the raw file's permission bits (the nine rwx bits of its metadata, read before
 the migration), narrowed by the umask; the setuid, setgid and sticky bits are not carried, and if

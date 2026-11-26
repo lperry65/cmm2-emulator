@@ -6,6 +6,14 @@ use std::path::{Path, PathBuf};
 
 use cmm2_core::{B5, Cpu, Firmware, Irqs, Profile, cmm2_memory};
 
+/// A name with a line feed and a colour change in it: a name a file system takes and a terminal
+/// must not act on. `crate::error::shown` is how a message says it, and `HOSTILE_SHOWN` is that.
+pub(crate) const HOSTILE_NAME: &str = "evil\n\x1b[31mRED\x1b[0m";
+
+/// `HOSTILE_NAME` as a message says it: one backslash where the file has one, and the line feed and
+/// the escape written out where they stand.
+pub(crate) const HOSTILE_SHOWN: &str = r"evil\n\x1B[31mRED\x1B[0m";
+
 // A directory under the temp directory that is this test's own, removed when it is dropped, a
 // failed test too (a test that ends the process with `_exit`, as `in_own_process`'s child does,
 // removes its own).

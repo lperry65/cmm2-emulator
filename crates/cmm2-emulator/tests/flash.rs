@@ -397,3 +397,61 @@ fn a_bad_layout_variable_does_not_stop_a_scratch_run_that_has_no_flash_file() {
     std::fs::remove_file(&program).unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
 }
+
+// A settings file may be called anything the file system takes, control characters included. The
+// refusal that names it is still one line and nothing a terminal acts on: an escape in the name
+// must not recolour it, and a newline in it must not break it or forge a line of its own. The size
+// refusal is driven here because it says the name three times: the file, the copy of the old
+// settings beside it, and the file to delete.
+#[test]
+fn a_settings_file_named_with_control_characters_is_refused_in_one_unbroken_line() {
+    const LARGEST_PLUS_ONE: u64 = 1_146_991;
+    let dir = temp_path("flash-escape-names", "dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let name = "evil\n\x1b[31mRED\x1b[0m.flash";
+    let flash = dir.join(name);
+    std::fs::File::create(&flash)
+        .unwrap()
+        .set_len(LARGEST_PLUS_ONE)
+        .unwrap();
+    std::fs::write(dir.join(format!("{name}.v1")), "the old settings").unwrap();
+    let program = temp_program("flash-escape-names", &THREE);
+
+    let output = run(&[
+        "--firmware",
+        program.to_str().unwrap(),
+        "--run",
+        "10",
+        "--flash",
+        flash.to_str().unwrap(),
+    ]);
+    std::fs::remove_file(&program).unwrap();
+
+    let err = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{err}");
+    // One line, ended by one line feed, with no escape in it for a terminal to act on.
+    assert_eq!(err.matches('\n').count(), 1, "{err:?}");
+    assert_eq!(err.lines().count(), 1, "{err:?}");
+    assert!(
+        !err.contains('\x1b'),
+        "the name recoloured the line: {err:?}"
+    );
+    assert!(err.starts_with("cmm2-emulator: "), "{err:?}");
+    // The clause that offers to delete the file is a command, so its name is quoted: the line
+    // ends with the closing quote before the full stop.
+    assert!(err.ends_with(".flash'.\n"), "{err:?}");
+    // The name is still said, in its visible form, as the file, as its copy, and as what to delete.
+    assert_eq!(
+        err.matches(r"evil\n\x1B[31mRED\x1B[0m").count(),
+        3,
+        "the three places the name is said: {err}"
+    );
+    assert!(err.contains(".v1"), "the copy beside it is listed: {err}");
+    assert_eq!(
+        std::fs::metadata(&flash).unwrap().len(),
+        LARGEST_PLUS_ONE,
+        "the refusal wrote nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

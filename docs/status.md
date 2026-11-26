@@ -4,13 +4,16 @@ The detailed status of the emulator: what works, what the CPU core has had done 
 figures and which of them are measured, and the open gaps. The short version is in the
 [README](../README.md).
 
-The status list below is current to commit 208c7fb (2026-11-20). The CPU, game-run and speed
-figures under it date from e3e8936 (2026-11-18) and have not been re-measured at 208c7fb.
+The status list below is current to 2026-11-25. The CPU list under it includes the fifth batch of
+the DSP work (`ed25797`, 2026-11-24), which came after 208c7fb; the game-run and speed figures date
+from e3e8936 (2026-11-18) and have not been re-measured since. The open-issue list under "Known
+gaps" is the one taken at 208c7fb (2026-11-20).
 
-As of commit 208c7fb (2026-11-20) the emulator boots the unmodified 7.00.00b5 firmware through its
-first-boot setup and a system reset to the `>` prompt and runs BASIC there. 7.00.00RC6 now boots
-with its own settings layout (issue 82, level 2). Progress is tracked in the GitHub issues and
-milestones.
+As of 2026-11-25 the emulator boots the unmodified 7.00.00b5 firmware through its first-boot setup
+and a system reset to the `>` prompt and runs BASIC there. 7.00.00RC6 now boots with its own
+settings layout (issue 82, level 2), and a board of either firmware keeps its settings in the new
+v2 file, which names the firmware it was written for by a hash of its bytes (issue 82, level 3,
+"Settings file v2" below). Progress is tracked in the GitHub issues and milestones.
 
 ## What works
 
@@ -33,6 +36,38 @@ milestones.
   name files of their own).
 - Real-time pacing at the machine's 480 MHz clock (built; it has no effect while the host is
   slower than the machine).
+
+## Settings file v2
+
+Issue 82 level 3 changed what a board writes into its settings file. The format, and every rule
+about what a reader accepts, are the contract in
+[settings-format.md](settings-format.md); this is the short account of what shipped and why.
+
+- **The format.** A fixed 48-byte header naming the firmware image the file was written for, then
+  only the 32-byte flash rows that differ from that image, then the clock and the DS3231's state,
+  then a CRC-32. A board's file is a few KB instead of the ~900 KB raw dump, and a load leaves the
+  machine as the raw dump left it.
+- **The gate is narrow.** A board writes v2 only when the firmware burned onto it is one that
+  `Profile::identify` recognised from its bytes. A scratch run (`--firmware`) keeps the raw layout,
+  and so does a board whose layout was named for an image I cannot recognise: a named layout is an
+  assumption, and the header states the image as fact.
+- **The hash is the gate.** The header holds the length of the image and its SHA-256. `sha2` is the
+  one dependency this added, and CI builds and tests with `--locked`, so `Cargo.lock` carries it. A
+  file whose header does not name the image running is refused, with the length of both images and
+  the first 12 hex digits of each hash, and a release is named only where the hash itself matches: a
+  file lying about its length cannot tell me which firmware to burn.
+- **The migration.** The first board start that finds an old raw file loads it as v1 and then writes
+  v2. The raw bytes are kept first, beside the file, at `<name>.v1` or the next free name of
+  `<name>.v1.2` to `<name>.v1.99`. A copy is written to a temporary file and hard-linked into place,
+  so a name that appears in the gap is never replaced; a name that holds a link, a directory or
+  anything else that is not a plain file is refused; a plain file whose bytes cannot be read is left
+  exactly as it is, the backup goes to the next name, and that is said on standard error; the copy
+  is made with the mode of the file it copies, narrowed by the umask, and without its setuid, setgid
+  or sticky bits; and a copy whose bytes are already there exactly is reused rather than written
+  again. A refusal writes nothing, and a copy that is kept is never deleted.
+- **The bound on size.** The longest file either format can be is a fact about the format, not about
+  the file: 1,146,990 bytes. Anything larger is refused on its size before a byte of it is read, in
+  every run, scratch runs included.
 
 ## The game run
 
@@ -151,8 +186,12 @@ prototypes; the working is in my local speed notes) cannot reach the board's spe
 The JIT study is done (2026-11-18): a design note and a spike exist locally and are not in the
 repository. Its recommendation is a hand-written x86-64 emitter behind a block IR that does not
 depend on the host, with the interpreter as the fallback; Cranelift stays an option for aarch64.
-The recommendation and nine open questions are on issue 74. The questions wait for me, and none of
-the JIT is built.
+The recommendation and the nine questions it left are on issue 74, and I answered all nine there on
+2026-11-25. The answers keep the hand-written emitter and narrow the host to Linux x86-64 for now,
+with nothing built now that rules out Windows x86-64 or an ARM host later. On floating point the
+answer goes against the study's recommendation: exact-but-slow is not good enough to ship, so
+native SSE2 floating point with Arm's exact results is part of milestone 4. None of the JIT is
+built; work starts with M0, the seam and the comparison harness.
 
 ## Windows
 

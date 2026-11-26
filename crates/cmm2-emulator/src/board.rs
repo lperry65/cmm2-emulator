@@ -4,7 +4,7 @@
 //! `CMM2_EMULATOR_HOME` is another board.
 
 use crate::atomic_write::{remove_stale_temps_in, replace_atomically, try_lock_exclusive};
-use crate::error::RunError;
+use crate::error::{RunError, shown, shown_path};
 use crate::saveable::{check_regular, why_not_replaceable};
 use cmm2_core::Firmware;
 use std::ffi::OsString;
@@ -57,6 +57,9 @@ pub(crate) enum BoardError {
 
 impl fmt::Display for BoardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Every arm here escapes the names it puts in its own words, and the words of an
+        // `io::Error` it says, as `shown`'s strategy has it: `RunError::Board` hands these over as
+        // they are, so nothing is escaped twice on its way to the line.
         match self {
             BoardError::NoHome => write!(
                 f,
@@ -68,7 +71,7 @@ impl fmt::Display for BoardError {
                 f,
                 "no firmware is burned onto the board in {}. Burn it once with: \
                  cmm2-emulator --burn <file>",
-                dir.display()
+                shown_path(dir)
             ),
             BoardError::EmptyHome => write!(
                 f,
@@ -78,37 +81,45 @@ impl fmt::Display for BoardError {
                 f,
                 "{}: the name of the board's directory is not valid UTF-8, which is not \
                  supported yet. Set {HOME_VARIABLE} to another directory",
-                dir.display()
+                shown_path(dir)
             ),
             BoardError::Busy(dir) => write!(
                 f,
                 "the board in {} is already switched on, by another cmm2-emulator. A board can \
                  only be switched on once: close that one first",
-                dir.display()
+                shown_path(dir)
             ),
-            BoardError::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            BoardError::Io { path, source } => {
+                write!(f, "{}: {}", shown_path(path), shown(&source.to_string()))
+            }
             BoardError::NoLock {
                 path,
                 source,
                 read_only,
             } => write!(
                 f,
-                "{}: the board cannot be locked, so two runs could not be kept off it ({source}; \
-                 the lock file was opened {})",
-                path.display(),
+                "{}: the board cannot be locked, so two runs could not be kept off it ({}; the \
+                 lock file was opened {})",
+                shown_path(path),
+                shown(&source.to_string()),
                 if *read_only { "to read" } else { "to write" }
             ),
             BoardError::CardRecord(path) => write!(
                 f,
                 "{}: it does not hold the path of a card (an absolute one, as UTF-8 text). Give a \
                  card with --sd <file>, or take it out with --no-sd",
-                path.display()
+                shown_path(path)
             ),
+            // Escaped once, here, by the arm that says the name: what the message is about is the
+            // line end at the end of it, so it has to read as `\n` and not as two backslashes.
             BoardError::CardName(name) => write!(
                 f,
-                "{name:?}: a card's name cannot end in a line end, which the board's record of \
-                 it could not keep"
+                "{}: a card's name cannot end in a line end, which the board's record of it could \
+                 not keep",
+                shown(name)
             ),
+            // `why` is another error's rendered words, escaped once by the arm that rendered them
+            // (see `about_the_remembered_card`), so it is said as it is.
             BoardError::Card(why) => write!(
                 f,
                 "the card in the socket cannot be used: {why}. Give another with --sd <file>, or \
@@ -356,7 +367,8 @@ impl Board {
 
 /// An error of loading the card the board remembers, which the owner did not name in this run, is
 /// told how to get rid of it, as the file may be long gone from where it was. Another error is
-/// left as it is.
+/// left as it is. The text handed to `BoardError::Card` is the other error's words as its arm
+/// rendered them, name escaped once, and the board's arm says them as they are.
 pub(crate) fn about_the_remembered_card(err: RunError) -> RunError {
     match err {
         RunError::Sd { .. } | RunError::SdSize { .. } | RunError::SdTooSmall { .. } => {

@@ -5,7 +5,7 @@ use crate::atomic_write::{
     create_new_atomically, remove_stale_temps, remove_stale_temps_beside, replace_atomically,
     write_atomically,
 };
-use crate::error::{RunError, say};
+use crate::error::{RunError, say, shown};
 use crate::saveable::{access, check_regular, why_not_replaceable, why_not_saveable};
 use cmm2_core::{
     Cpu, FileKind, MAGIC, MIN_IMAGE_SIZE, NoLayout, PersistentError, PersistentSizeError, Profile,
@@ -171,7 +171,9 @@ enum Backup {
 }
 
 /// The backup for `original`: a copy of it that is already there, or else the first name that
-/// nothing holds. A plain file with other bytes is an older copy, and is left alone. Anything else
+/// nothing holds. A plain file with other bytes is an older copy, and is left alone. A plain file
+/// whose bytes cannot be read is left alone too, and the name the copy goes to is said, because a
+/// silent step past it would leave the settings not where their owner expects them. Anything else
 /// at a name - a link, a directory, a device - is refused, and so is a name that cannot be looked
 /// at: it is not this board's to write through or over.
 fn find_backup(
@@ -179,16 +181,22 @@ fn find_backup(
     original: &[u8],
     read: &impl Fn(&str) -> io::Result<Vec<u8>>,
 ) -> Result<Backup, RunError> {
+    let mut unreadable: Vec<String> = Vec::new();
     for n in 1..=MAX_BACKUPS {
         let backup = backup_name(path, n);
         match std::fs::symlink_metadata(&backup) {
             // The length is compared first, so a file is read only if it could be the same, and
             // that is never more than the file being migrated (itself at most the largest size).
             Ok(held) if held.file_type().is_file() => {
-                if held.len() == original.len() as u64
-                    && read(&backup).is_ok_and(|bytes| bytes == original)
-                {
-                    return Ok(Backup::Kept);
+                if held.len() == original.len() as u64 {
+                    match read(&backup) {
+                        Ok(bytes) if bytes == original => {
+                            say_skipped(&unreadable, &backup);
+                            return Ok(Backup::Kept);
+                        }
+                        Ok(_) => {}
+                        Err(_) => unreadable.push(backup),
+                    }
                 }
             }
             Ok(_) => {
@@ -198,6 +206,7 @@ fn find_backup(
                 });
             }
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                say_skipped(&unreadable, &backup);
                 return Ok(Backup::Free(backup));
             }
             Err(source) => {
@@ -215,8 +224,33 @@ fn find_backup(
     })
 }
 
+/// Says that every name in `unreadable` was there and could not be read, so the copy of the old
+/// settings goes to `backup` instead. The two are the user's to know: the first is a file that was
+/// left exactly as it was, and the second is where their settings are now.
+fn say_skipped(unreadable: &[String], backup: &str) {
+    if unreadable.is_empty() {
+        return;
+    }
+    let which: Vec<String> = unreadable
+        .iter()
+        .map(|name| shown(name).into_owned())
+        .collect();
+    let were = if unreadable.len() == 1 {
+        "copy"
+    } else {
+        "copies"
+    };
+    say(format!(
+        "the {were} at {} cannot be read; the backup goes to {}",
+        which.join(", "),
+        shown(backup)
+    ));
+}
+
 /// Makes sure the raw bytes are kept beside the live file, so that none are ever lost. A name
-/// that is taken between looking and writing is not replaced: the names are looked at again.
+/// that is taken between looking and writing is not replaced: the names are looked at again. Losing
+/// that race every time is refused as a race, not as a cascade with every name in it: nothing that
+/// was written by this board need be there at all.
 fn keep_backup(
     path: &str,
     original: &[u8],
@@ -246,10 +280,9 @@ fn keep_backup(
             }
         }
     }
-    Err(RunError::BackupsFull {
+    Err(RunError::BackupRaceLost {
         path: path.to_string(),
-        first: backup_name(path, 1),
-        last: backup_name(path, MAX_BACKUPS),
+        tries: MAX_BACKUPS,
     })
 }
 
@@ -343,7 +376,14 @@ pub(crate) fn load_sd(sd: &SdSlot, path: &str) -> Result<(), RunError> {
     remove_stale_temps(path);
     if let Some(why) = why_write_protected(path) {
         sd.set_write_protected(true);
-        say(format!("{path}: the card is write-protected because {why}"));
+        // The name of the card is the user's, and the reason is `saveable`'s words, which name a
+        // path when the directory is what stopped the save. Both are escaped at the line they are
+        // said on (see `shown`).
+        say(format!(
+            "{}: the card is write-protected because {}",
+            shown(path),
+            shown(&why)
+        ));
     }
     Ok(())
 }

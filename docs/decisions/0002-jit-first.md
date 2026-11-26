@@ -75,9 +75,21 @@ Building the frame off the CPU thread is independent of this, and waits for a pr
 The first deliverable of issue 74, a design note and a spike, is done. Both are kept locally and
 are not in the repository. The recommendation, from issue 74: a hand-written x86-64 emitter first,
 behind a block IR that does not depend on the host, with the interpreter as the fallback on every
-other host. Cranelift stays an option for aarch64 later. The nine open questions are on issue 74
-and wait for me; I have not answered them, so this record still picks nothing between the two code
-generators. The figures of the study are on that issue and are not copied here.
+other host. Cranelift stays an option for aarch64 later. The nine questions the study left open are
+answered on issue 74 (2026-11-25). They do not change this decision, and they keep the emitter the
+study recommended. The answers that bear on this record: Linux x86-64 is the only host wanted now,
+and nothing built now may rule out Windows x86-64 or an ARM host, so host-specific code stays
+`cfg`-gated and the interpreter stays the fallback on every other host; interrupts are exact, at the
+instruction boundary; translation is synchronous and deterministic, with no background compile
+thread; the JIT lives in a new crate over the core's public API plus three small exports, and the
+forked core stays the oracle; wait states are modelled per region (issue 65), and the
+self-modifying-code granule starts at 256 bytes; the JIT is on by default only after M1 to M3 pass
+their acceptance tests. On floating point the answer goes against the study's recommendation:
+exact-but-slow is not good enough to ship, so native SSE2 floating point (add, subtract, multiply,
+divide, square root, compare, convert) with Arm's exact results - the NaN rules, DN, FZ, the
+rounding modes and the flags - is part of milestone 4, and calling the interpreter's routines is a
+stepping stone inside it. Work starts with M0, the seam and the comparison harness. The figures of
+the study are on that issue and are not copied here.
 
 ## What it costs
 
@@ -100,7 +112,10 @@ output), and none of it is ported yet. For this decision it means:
 - The choice of code generator has to weigh portability. Cranelift covers more hosts than a
   hand-written x86-64 emitter: it would also serve Windows on ARM and Apple Silicon, where an x86-64
   emitter serves x86-64 only. The study recommends the hand-written emitter behind a block IR (see
-  above); the questions on issue 74 are still open, and this record does not pick one.
+  above), and the answers on issue 74 (2026-11-25) keep it: Linux x86-64 is the only host wanted
+  now, Windows x86-64 and the ARM hosts come later, and nothing built now may rule them out. The
+  Windows executable-memory policy (reserve read-write, write the code, protect read-execute) is
+  noted on that issue for the later port, and is not built now.
 - A path with no translation always has to remain, which is the interpreter, for any host the JIT
   does not support.
 - The host differences have to be designed for from the start: how executable memory is obtained

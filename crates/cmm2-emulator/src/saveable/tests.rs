@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{mode, root, scratch};
+use crate::test_support::{HOSTILE_NAME, HOSTILE_SHOWN, in_own_process, mode, root, scratch};
 use std::fs::File;
 use std::os::unix::fs::symlink;
 
@@ -147,4 +147,62 @@ fn a_link_planted_at_the_probe_name_is_never_followed() {
 
     mode(&locked, 0o755);
     assert_eq!(why, None, "the directory of the name is writable");
+}
+
+// What cannot be seen about a directory is said and not refused, and the saying carries the name of
+// the file whose directory it could not read. A process of its own, because what is said goes to
+// standard error, which a test process cannot take from itself.
+#[test]
+fn a_directory_that_cannot_be_read_is_said_with_its_name_escaped() {
+    if root() {
+        // As root a mode bit stops nothing, so the directory reads and nothing is said.
+        return;
+    }
+    let ran = in_own_process(
+        "saveable::tests::a_directory_that_cannot_be_read_is_said_with_its_name_escaped",
+        "",
+        &[],
+        |_| {
+            let dir = scratch("saveable-said");
+            let inside = dir.join(HOSTILE_NAME);
+            std::fs::create_dir(&inside).unwrap();
+            let file = inside.join("card.flash");
+            std::fs::write(&file, "the old settings").unwrap();
+            // Searchable and writable, and not readable: everything the save needs is allowed, and
+            // what cannot be seen about the directory is left for the save itself to say.
+            mode(&inside, 0o300);
+            assert_eq!(why_not_saveable(file.to_str().unwrap()), None);
+            mode(&inside, 0o700);
+            // The child ends with `_exit`, so its own directory is removed here.
+            std::fs::remove_dir_all(&*dir).unwrap();
+        },
+    );
+    let Some(ran) = ran else { return };
+    assert_eq!(
+        ran.ended,
+        crate::test_support::Ended::Exit(0),
+        "{}",
+        ran.stderr
+    );
+    let said = ran.stderr;
+    assert!(
+        !said.contains('\u{1b}'),
+        "the name recoloured the child's error: {said:?}"
+    );
+    let warned: Vec<&str> = said
+        .lines()
+        .filter(|line| line.contains("its directory cannot be read"))
+        .collect();
+    assert_eq!(warned.len(), 1, "one line about it, and no more: {said}");
+    let line = warned[0];
+    assert!(line.starts_with("cmm2-emulator: "), "{line:?}");
+    assert!(
+        line.contains("its directory cannot be read (Permission denied (os error 13))"),
+        "{line:?}"
+    );
+    assert!(
+        line.ends_with("so whether it is append-only is not known"),
+        "{line:?}"
+    );
+    assert!(line.contains(HOSTILE_SHOWN), "the name is not said: {line}");
 }

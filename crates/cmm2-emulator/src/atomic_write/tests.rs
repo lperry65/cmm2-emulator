@@ -1,5 +1,7 @@
 use super::*;
-use crate::test_support::{age, files_in, mode, root, scratch, spawning};
+use crate::test_support::{
+    HOSTILE_NAME, HOSTILE_SHOWN, age, files_in, in_own_process, mode, root, scratch, spawning,
+};
 use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -322,4 +324,60 @@ fn a_hard_link_that_is_refused_is_unsupported_and_a_name_that_is_taken_is_not() 
 
     assert_eq!(refused.kind(), io::ErrorKind::Unsupported);
     assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
+}
+
+// A file that is in its place while its directory could not be synced is said, and the name is the
+// user's to give: one line, and nothing in it a terminal acts on. A process of its own, because
+// what is said goes to standard error, which a test process cannot take from itself.
+#[test]
+fn a_directory_that_could_not_be_synced_is_said_with_its_name_escaped() {
+    if root() {
+        // As root a mode bit stops nothing, so the directory syncs and nothing is said.
+        return;
+    }
+    let ran = in_own_process(
+        "atomic_write::tests::a_directory_that_could_not_be_synced_is_said_with_its_name_escaped",
+        "",
+        &[],
+        |_| {
+            let dir = scratch("atomic-said");
+            let inside = dir.join(HOSTILE_NAME);
+            std::fs::create_dir(&inside).unwrap();
+            let file = inside.join("settings.flash");
+            // Writing and renaming need no read, so the save goes through and only the sync of the
+            // directory fails.
+            mode(&inside, 0o300);
+            write_atomically(file.to_str().unwrap(), b"the settings").unwrap();
+            mode(&inside, 0o700);
+            assert_eq!(std::fs::read(&file).unwrap(), b"the settings");
+            // The child ends with `_exit`, so its own directory is removed here.
+            std::fs::remove_dir_all(&*dir).unwrap();
+        },
+    );
+    let Some(ran) = ran else { return };
+    assert_eq!(
+        ran.ended,
+        crate::test_support::Ended::Exit(0),
+        "{}",
+        ran.stderr
+    );
+    let said = ran.stderr;
+    assert!(
+        !said.contains('\u{1b}'),
+        "the name recoloured the child's error: {said:?}"
+    );
+    let warned: Vec<&str> = said
+        .lines()
+        .filter(|line| line.contains("its directory could not be synced"))
+        .collect();
+    assert_eq!(warned.len(), 1, "one line about it, and no more: {said}");
+    let line = warned[0];
+    assert!(line.starts_with("cmm2-emulator: "), "{line:?}");
+    assert!(
+        line.ends_with(
+            ": written, but its directory could not be synced (Permission denied (os error 13))",
+        ),
+        "{line:?}"
+    );
+    assert!(line.contains(HOSTILE_SHOWN), "the name is not said: {line}");
 }

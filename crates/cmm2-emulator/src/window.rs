@@ -52,6 +52,13 @@ impl WindowError {
         self.advice = Some(advice);
         self
     }
+
+    /// A window error that says `what`, for the tests that hold one of every kind of run error and
+    /// cannot reach `new` from outside this module.
+    #[cfg(test)]
+    pub(crate) fn for_tests(what: &str) -> WindowError {
+        WindowError::new(what)
+    }
 }
 
 impl fmt::Display for WindowError {
