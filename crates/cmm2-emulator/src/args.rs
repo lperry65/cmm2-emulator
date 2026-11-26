@@ -1,5 +1,6 @@
 //! The command line, parsed by hand: the options are few and fixed.
 
+use crate::error::shown;
 use std::fmt;
 
 pub const USAGE: &str = "usage: cmm2-emulator [--firmware <file>] [--run <count>] [--stop-at <address>] [--trace <file>] [--trace-mmio] [--trace-from <count>] [--console] [--on <text> <keys>] [--screenshot <file>] [--window] [--console-keys] [--unpaced] [--flash <file>] [--sd <file> | --no-sd] [--burn <file>] [--rng-seed <number>] | --version | --lookup <address>";
@@ -100,12 +101,20 @@ pub enum ArgError {
 
 impl fmt::Display for ArgError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // An argument echoed back is a name a person reads, not one offered as a command, so the
+        // arms that say one say it through `shown` (see the strategy there): escaped once, here,
+        // from what `parse` handed in raw. The arms that name an option say a word this file
+        // wrote itself, so they have nothing to escape.
         match self {
             ArgError::Usage => {}
-            ArgError::Unknown(arg) => writeln!(f, "cmm2-emulator: unknown argument '{arg}'")?,
-            ArgError::BadCount(arg) => writeln!(f, "cmm2-emulator: bad count '{arg}'")?,
-            ArgError::BadSeed(arg) => writeln!(f, "cmm2-emulator: bad seed '{arg}'")?,
-            ArgError::BadAddress(arg) => writeln!(f, "cmm2-emulator: bad address '{arg}'")?,
+            ArgError::Unknown(arg) => {
+                writeln!(f, "cmm2-emulator: unknown argument '{}'", shown(arg))?
+            }
+            ArgError::BadCount(arg) => writeln!(f, "cmm2-emulator: bad count '{}'", shown(arg))?,
+            ArgError::BadSeed(arg) => writeln!(f, "cmm2-emulator: bad seed '{}'", shown(arg))?,
+            ArgError::BadAddress(arg) => {
+                writeln!(f, "cmm2-emulator: bad address '{}'", shown(arg))?
+            }
             ArgError::BoardOnly(option) => writeln!(
                 f,
                 "cmm2-emulator: {option} is for the board, which --firmware does not use"
@@ -127,7 +136,7 @@ impl fmt::Display for ArgError {
                 f,
                 "cmm2-emulator: --trace-from needs --trace or --trace-mmio"
             )?,
-            ArgError::BadKeys(arg) => writeln!(f, "cmm2-emulator: bad keys '{arg}'")?,
+            ArgError::BadKeys(arg) => writeln!(f, "cmm2-emulator: bad keys '{}'", shown(arg))?,
             ArgError::EmptyName(option) => writeln!(
                 f,
                 "cmm2-emulator: {option} needs a file name, not an empty one"
@@ -336,6 +345,48 @@ mod tests {
         assert_eq!(
             parse_args(&["--firmware", "f.bin"]),
             Ok(Command::Vectors("f.bin".into()))
+        );
+    }
+
+    // An echoed argument is a name a person reads, so `Display` says it through `shown` once.
+    // Before that was so it went to the terminal raw: measured as two escape bytes and a broken
+    // line with the real binary (`a_bad_argument_is_echoed_escaped_and_on_one_line` in
+    // `tests/usage.rs`). This pins the echo of every arm that says an argument back.
+    #[test]
+    fn an_echoed_argument_is_escaped_once() {
+        let hostile = "evil\n\u{1b}[31mRED\u{1b}[0m";
+        let safe = r"evil\n\x1B[31mRED\x1B[0m";
+        let first_line = |err: ArgError| err.to_string().lines().next().unwrap().to_string();
+        assert_eq!(
+            first_line(ArgError::Unknown(hostile.into())),
+            format!("cmm2-emulator: unknown argument '{safe}'")
+        );
+        assert_eq!(
+            first_line(ArgError::BadCount(hostile.into())),
+            format!("cmm2-emulator: bad count '{safe}'")
+        );
+        assert_eq!(
+            first_line(ArgError::BadSeed(hostile.into())),
+            format!("cmm2-emulator: bad seed '{safe}'")
+        );
+        assert_eq!(
+            first_line(ArgError::BadAddress(hostile.into())),
+            format!("cmm2-emulator: bad address '{safe}'")
+        );
+        assert_eq!(
+            first_line(ArgError::BadKeys(hostile.into())),
+            format!("cmm2-emulator: bad keys '{safe}'")
+        );
+        // A backslash is doubled once, never twice: `parse` hands an arm what argv held, so no
+        // argument reaches these arms already escaped.
+        assert_eq!(
+            first_line(ArgError::Unknown(r"back\slash".into())),
+            r"cmm2-emulator: unknown argument 'back\\slash'"
+        );
+        // A name that needs nothing is echoed exactly as it was typed.
+        assert_eq!(
+            first_line(ArgError::Unknown("--bogus".into())),
+            "cmm2-emulator: unknown argument '--bogus'"
         );
     }
 

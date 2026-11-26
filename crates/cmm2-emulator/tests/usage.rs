@@ -46,6 +46,37 @@ fn unknown_argument_is_rejected() {
     );
 }
 
+// A mistyped argument comes back to the reader. It is what they handed in, not a name offered as
+// a command, so the echo is escaped once like every other name a message says. Before that was
+// so, an argument holding a colour change and a line feed put the escape bytes and the extra line
+// feeds on standard error untouched: measured at two raw `ESC` and three line feeds, where a
+// clean argument puts two line feeds (the message's own, and the usage line's).
+#[test]
+fn a_bad_argument_is_echoed_escaped_and_on_one_line() {
+    let arg = "--evil\n\u{1b}[31mRED\u{1b}[0m";
+
+    let output = emulator()
+        .arg(arg)
+        .output()
+        .expect("failed to run cmm2-emulator");
+    let err = stderr(&output);
+
+    assert_eq!(output.status.code(), Some(2), "{err:?}");
+    assert!(output.stdout.is_empty());
+    // One line feed belongs to the message line, one to the usage line, and the echo adds none.
+    assert_eq!(err.matches('\n').count(), 2, "{err:?}");
+    assert_eq!(err.lines().count(), 2, "{err:?}");
+    assert!(
+        !err.contains('\u{1b}'),
+        "the echo recoloured the line: {err:?}"
+    );
+    // The name is still there to read, escaped once: a line feed as `\n`, the escape as `\x1B`.
+    assert_eq!(
+        err,
+        format!("cmm2-emulator: unknown argument '--evil\\n\\x1B[31mRED\\x1B[0m'\n{USAGE}\n")
+    );
+}
+
 #[test]
 fn firmware_prints_vector_table() {
     let path = temp_firmware("valid", 0x2001_FFF0, 0x0800_0021);
@@ -312,8 +343,10 @@ fn bad_console_options_are_usage_errors() {
             "--console with --trace-mmio needs --trace, the screen belongs to the guest",
         ),
         (
+            // The echo of the argument is escaped by `shown`, so the argument's own backslash
+            // reads as two (`a_bad_argument_is_echoed_escaped_and_on_one_line`).
             &["--firmware", "f", "--console", "--on", "a", "\\q"],
-            "bad keys '\\q'",
+            r"bad keys '\\q'",
         ),
         (&["--firmware", "f", "--console", "--on", "a"], ""),
     ];

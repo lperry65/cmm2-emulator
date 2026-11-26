@@ -411,8 +411,17 @@ fn every_variant_with_named_words() -> Vec<(&'static str, RunError)> {
 /// is not sampled here fails that test, and one that is not classified in `says_a_path` stops the
 /// test crate from compiling at all.
 fn every_variant() -> Vec<(&'static str, RunError)> {
+    every_variant_named(HOSTILE)
+}
+
+/// The same samples with `name` planted wherever the plain set plants `HOSTILE`. The escape case
+/// needs a name with control characters in it; `every_command_a_message_offers_names_the_file_
+/// that_exists` needs one the shell would split and read but a terminal could display untouched,
+/// and passes that instead. The `BadLayoutName` sample keeps its plain `b4` either way: its
+/// escaping is pinned by `a_bad_layout_name_escapes_the_value_it_was_handed`, and a
+/// `Says::Nothing` plain sample must carry no name (see its doc).
+fn every_variant_named(name: &str) -> Vec<(&'static str, RunError)> {
     use cmm2_core::{B5, PersistentSizeError};
-    let name = HOSTILE;
     vec![
         (
             "firmware",
@@ -975,6 +984,117 @@ fn the_settings_delete_clause_quotes_the_name_it_offers() {
         "{quoted}"
     );
     assert!(quoted.starts_with("/tmp/it's.flash: "), "{quoted}");
+}
+
+/// The words after which the arm for `err` hands the reader a name to paste as a command.
+/// Exhaustive with no wildcard, like `says_a_path`: a variant added to `RunError` stops the test
+/// crate from compiling until it says whether it offers one. The board's arms quote no name in
+/// command position — they say fixed `<file>` placeholders — so this covers every slot that can
+/// hold one. An arm that quotes the escaped form of a name inside a command without declaring the
+/// clause here is still caught by the token assertion below; declaring it is what pins that the
+/// word after the cue is the name itself.
+fn offers_a_command(err: &RunError) -> &'static [&'static str] {
+    match err {
+        RunError::Settings { .. } => &["deleting "],
+        RunError::V2InRawRun { .. } => &["--flash ", "move "],
+        RunError::Firmware(_) => &[],
+        RunError::Memory(_) => &[],
+        RunError::Cpu(_) => &[],
+        RunError::Trace { .. } => &[],
+        RunError::Write(_) => &[],
+        RunError::Console(_) => &[],
+        RunError::Window(_) => &[],
+        RunError::Frame(_) => &[],
+        RunError::Screenshot { .. } => &[],
+        RunError::Flash { .. } => &[],
+        RunError::FlashSize { .. } => &[],
+        RunError::BackupNotAFile { .. } => &[],
+        RunError::BackupsFull { .. } => &[],
+        RunError::BackupRaceLost { .. } => &[],
+        RunError::BackupNeedsLink { .. } => &[],
+        RunError::NotReadBack { .. } => &[],
+        RunError::NoLayout { .. } => &[],
+        RunError::BoardNoLayout { .. } => &[],
+        RunError::BadLayoutName { .. } => &[],
+        RunError::Sd { .. } => &[],
+        RunError::SdSize { .. } => &[],
+        RunError::SdTooSmall { .. } => &[],
+        RunError::Board(_) => &[],
+        RunError::Fault(_) => &[],
+    }
+}
+
+/// The one shell word that follows the first `prefix` in `said`, as the shell that takes the
+/// pasted line reads it: the single quotes off and every `'\''` closed back into a quote. A bare
+/// word ends at the first character `shell_quoted` would not leave alone.
+fn offered_word(said: &str, prefix: &str) -> String {
+    let at = said
+        .find(prefix)
+        .unwrap_or_else(|| panic!("no {prefix:?} in: {said}"));
+    let rest = &said[at + prefix.len()..];
+    let Some(rest) = rest.strip_prefix('\'') else {
+        let plain = |c: char| c.is_ascii_alphanumeric() || "_-./:@%+=,".contains(c);
+        let word: String = rest.chars().take_while(|c| plain(*c)).collect();
+        assert!(!word.is_empty(), "nothing follows {prefix:?} in: {said}");
+        return word;
+    };
+    let bytes = rest.as_bytes();
+    let mut word: Vec<u8> = Vec::new();
+    let mut i = 0;
+    loop {
+        if i >= bytes.len() {
+            panic!("unclosed quote after {prefix:?} in: {said}");
+        }
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1..i + 4) == Some(b"\\''") {
+                word.push(b'\'');
+                i += 4;
+            } else {
+                break;
+            }
+        } else {
+            word.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(word).expect("the name is UTF-8")
+}
+
+// A name the shell would split and read but a terminal could display untouched: a backslash, a
+// single quote and a space, and no control character. `command_quoted` must quote it raw, so the
+// word a clause offers names the file that exists. Quoting `shown`'s escaped form instead puts a
+// command for a file that does not exist, and the two nets above cannot see that: `HOSTILE` holds
+// control characters, so its command word is the escaped form by design and a clause that always
+// escaped it would pass them. A name free of control characters tells the two apart, which is
+// what this renders. The samples are the plain set with this name planted where it plants
+// `HOSTILE`, so a new variant cannot miss the check without missing the sample list too.
+const SHELL_NAME: &str = r"/tmp/back\slash'q flash";
+
+#[test]
+fn every_command_a_message_offers_names_the_file_that_exists() {
+    // The word a clause that quotes the escaped form would hand over, built here rather than
+    // through `command_quoted`, so the assertion does not ask that function to grade itself.
+    let escaped_token = format!("'{}'", shown(SHELL_NAME).replace('\'', r"'\''"));
+    assert_ne!(escaped_token, format!("'{SHELL_NAME}'"));
+    let mut offering = 0;
+    for (what, err) in every_variant_named(SHELL_NAME) {
+        let said = err.to_string();
+        assert!(
+            !said.contains(&escaped_token),
+            "{what} offers the escaped form, which names no file: {said}"
+        );
+        for prefix in offers_a_command(&err) {
+            offering += 1;
+            assert_eq!(
+                offered_word(&said, prefix),
+                SHELL_NAME,
+                "{what}: the word after {prefix:?} is not the name as it is"
+            );
+        }
+    }
+    // The two declared clauses are three words, and they were checked; a classifier that lost
+    // them would silently check nothing.
+    assert_eq!(offering, 3, "every declared command slot was read");
 }
 
 // The value of `CMM2_BOARD_LAYOUT_FOR_TESTS` can hold anything a file name can, and said raw it
