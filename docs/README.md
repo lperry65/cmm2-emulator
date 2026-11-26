@@ -6,6 +6,9 @@ Project documentation lives here as markdown.
 - [settings-format.md](settings-format.md): the board's settings file, format v2: the header,
   the diff entries, the migration from the old raw file, and the versioning rules.
 - [status.md](status.md): the detailed status: what works, the CPU core, speed and known gaps.
+- [speed.md](speed.md): how fast the interpreter runs today, where the host time goes, the ten
+  things I looked at and what each was worth, which figures I measured and which I estimated, and
+  what real speed needs (issues 15, 16 and 74).
 - [goals.md](goals.md): what the emulator is for and what follows from that.
 - [hardware-map.md](hardware-map.md): the CMM2 Gen 2 hardware as measured and documented.
 - [background.md](background.md): what existed before, the three levels of emulator, and the

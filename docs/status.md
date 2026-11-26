@@ -158,12 +158,14 @@ core has none.
 
 ## Speed
 
-Speed is the main thing that is not done. These are the figures, and which of them I measured:
+Speed is the main thing that is not done. The full profile - how I measured, where the host time
+goes, ten things I looked at and what each was worth, and what I could not measure - is
+[speed.md](speed.md). These are the headline figures, and which of them I measured:
 
 - Measured: the core runs about 54.5 million instructions a second at the prompt (2026-11-13,
   release build; [usb-host.md](usb-host.md) section 12), and about 24 to 25 million in the BASIC
-  interpreter (`FOR i=1 TO 100000:a=a+1:NEXT`, a quiet machine; the working is in my local speed
-  notes, which are not in the repository).
+  interpreter (`FOR i=1 TO 100000:a=a+1:NEXT`, a quiet machine; the working is in
+  [speed.md](speed.md) section 2).
 - Estimated, not measured: the board runs about 220 million instructions a second (zmu's cycle
   estimate, as in [checkpoint-iteration-3.md](checkpoint-iteration-3.md)). By that estimate the
   host is about four times too slow. That "about four times" is an estimate from instruction
@@ -175,12 +177,12 @@ Speed is the main thing that is not done. These are the figures, and which of th
   speed.
 - Pacing: one boot run (200 million instructions, an unpaced `--run` of the first-boot text) took
   about 6 s of CPU time on 2026-11-14, on a loaded machine. That is slower than the 70 to 77
-  million a second that I measured for the boot in my local speed notes, so the two disagree, and I
-  do not know which is right.
+  million a second that I measured for the boot in [speed.md](speed.md) section 2, so the two
+  disagree, and I do not know which is right.
 
 I decided on 2026-11-14 to build an x86-64 JIT directly, with no interim steps, because the
 interim steps (an estimate of about 2.7 to 2.8 times together; two of the five were measured on
-prototypes; the working is in my local speed notes) cannot reach the board's speed. See
+prototypes; the working is in [speed.md](speed.md) section 4.8) cannot reach the board's speed. See
 [decisions/0002-jit-first.md](decisions/0002-jit-first.md) (issue 74).
 
 The JIT study is done (2026-11-18): a design note and a spike exist locally and are not in the
@@ -231,9 +233,11 @@ The open issues at 208c7fb, from `gh issue list --state open --limit 100`:
   `GPIOH_IDR` and `GPIOD_IDR` are read once per ~1 kHz tick by the interrupt path, 37 (or 36)
   times per 8 million instructions, not by the loop (measured in [boot-trace.md](boot-trace.md)
   under "The idle loop at the prompt") - the earlier claim that they appear
-  only as an unconfirmed expectation was wrong. What the issue still lacks is only the speed
-  note - where it belongs is `docs/speed.md` - which exists in my local speed notes, not in the
-  repository).
+  only as an unconfirmed expectation was wrong. Its third point, a note on how much faster
+  peripheral reads need to be, is in [speed.md](speed.md): section 4.7 measures the peripheral
+  models below 0.5 percent of host time in every profile and finds that batching peripheral time
+  would not help yet, and section 5 puts the cost where it is, in the memory path - the cycle
+  model is 6 to 8 times wrong for anything that touches SDRAM, issue 65).
 - Not in an issue: sound (the DAC) and a GDB option (the vendored core has a GDB server, but the
   front end does not start it).
 
