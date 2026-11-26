@@ -7,7 +7,10 @@ use common::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use cmm2_core::{Cpu, FLASH_BASE, FLASH_SIZE, Irqs, PeripheralAccess, Stop, Svd, cmm2_memory};
+use cmm2_core::{
+    Cpu, FLASH_BASE, FLASH_SIZE, Irqs, PeripheralAccess, Stop, Svd, cmm2_memory,
+    cmm2_memory_with_rng_seed,
+};
 
 #[test]
 #[ignore = "needs the real firmware: CMM2_FIRMWARE=<path> cargo test -- --ignored"]
@@ -342,4 +345,71 @@ fn real_firmware_rc6_is_a_known_profile() {
         .expect("CMM2_FIRMWARE_RC6 must be set to the path of CMM2_MMBasic_7.00.00RC6.bin");
     let firmware = cmm2_core::Firmware::load(path).unwrap();
     assert_eq!(firmware.profile(), Some(&cmm2_core::RC6));
+}
+
+/// The heads of the idle loop the firmware runs once the prompt is up. Measured 2026-11-26
+/// (issue 25) by logging the PC instruction by instruction: after the prompt the PC settles
+/// into one repeating chain, and it passes through both heads once per iteration of the
+/// loop. The chain is at different addresses in the two images. See `docs/boot-trace.md`.
+const B5_IDLE_LOOP_HEADS: [u32; 2] = [0x0807_A7EC, 0x0809_A352];
+const RC6_IDLE_LOOP_HEADS: [u32; 2] = [0x0807_8400, 0x0809_8870];
+
+/// Boots to the second prompt and runs `warm_up` more instructions, well past the measured
+/// entry to the idle loop (measured: prompt + 477,320 on b5, prompt + 643,348 on RC6). Then
+/// steps a bounded `window` of instructions and requires each loop head at least `min_hits`
+/// times inside it: the loop turns about every 299 instructions and the longest excursion out
+/// of it measured 473, so a machine sitting in the loop passes with room to spare, while one
+/// that never settles reaches none of the heads. The check is deliberately not a single exact
+/// instruction index: the landing PC one fixed count after the prompt is one PC of ~299, and
+/// any change to the boot path would move that cliff. Fixed instruction counts throughout: no
+/// wall clock, and the RNG is seeded so the run repeats.
+fn settles_in_the_idle_loop(
+    firmware: &cmm2_core::Firmware,
+    warm_up: u64,
+    window: u64,
+    min_hits: u64,
+    heads: &[u32],
+) {
+    let irqs = Irqs::new();
+    let memory = cmm2_memory_with_rng_seed(&irqs, 20_261_126);
+    let console = memory.console();
+    let mut cpu = Cpu::new(firmware, memory, irqs).unwrap();
+    let prompt = boot_to_second_prompt(&mut cpu, &console);
+    let stop = cpu.run(warm_up);
+    assert!(matches!(stop, Stop::InstructionLimit), "{stop:?}");
+    let start = cpu.instruction_count();
+    let mut hits = vec![0u64; heads.len()];
+    for _ in 0..window {
+        cpu.step();
+        let pc = cpu.pc();
+        if let Some(i) = heads.iter().position(|h| *h == pc) {
+            hits[i] += 1;
+        }
+    }
+    for (i, head) in heads.iter().enumerate() {
+        assert!(
+            hits[i] >= min_hits,
+            "head {head:#010x} hit {} times in the {window} instructions from instruction \
+             {start}, fewer than {min_hits} (prompt at {prompt})",
+            hits[i]
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs both firmwares: CMM2_FIRMWARE=<b5 path> CMM2_FIRMWARE_RC6=<rc6 path> \
+             cargo test --release -- --ignored"]
+fn real_firmware_settles_in_the_idle_loop() {
+    // The warm-up ends about 1.5 million instructions past the measured entry to the loop.
+    // Density of the window, measured over the whole 8-million-instruction run on both
+    // images: the shipped window scores 13 and 14 per head (4,000 / ~299 expected ~13.4),
+    // and across 1,500 non-overlapping 4,000-step windows the worst score is exactly 10 -
+    // the floor below. If this goes red while the machine is settled, raise the window to
+    // 8,000 rather than lower the 10: a bigger window keeps the guarantee that three
+    // quarters of it was spent cycling the loop, which lowering the count would weaken.
+    settles_in_the_idle_loop(&firmware(), 2_000_000, 4_000, 10, &B5_IDLE_LOOP_HEADS);
+    let path = std::env::var("CMM2_FIRMWARE_RC6")
+        .expect("CMM2_FIRMWARE_RC6 must be set to the path of CMM2_MMBasic_7.00.00RC6.bin");
+    let rc6 = cmm2_core::Firmware::load(path).unwrap();
+    settles_in_the_idle_loop(&rc6, 2_000_000, 4_000, 10, &RC6_IDLE_LOOP_HEADS);
 }

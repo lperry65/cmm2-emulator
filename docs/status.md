@@ -222,12 +222,18 @@ The open issues at 208c7fb, from `gh issue list --state open --limit 100`:
 - Firmware and end-to-end: 82 (support for firmware versions: 7.00.00b5 and 7.00.00RC6 have
   settings layouts, 8.00.00b2 and any other release do not), 57 (firmware 5.07, the version the
   Gen 2 shipped with), 49 (run Galactic Raiders as an end-to-end test: a run goes on for minutes
-  with no fault, but the hash test is not done), 25 (boot to the MMBasic idle loop: the
-  acceptance is only partly met. No test asserts the idle loop; the tests assert the prompt and
-  commands, in `crates/cmm2-core/tests/console.rs`. `GPIOH_IDR`, `GPIOD_IDR` and `TIM5_CNT`
-  appear in [boot-trace.md](boot-trace.md) only in its iteration-1 sections, as an expectation
-  from an earlier spike that was never confirmed. A speed note exists, in my local speed notes,
-  which are not in the repository).
+  with no fault, but the hash test is not done), 25 (boot to the MMBasic idle loop: the test is
+  in since 2026-11-26. `real_firmware_settles_in_the_idle_loop` in `crates/cmm2-core/tests/boot.rs`
+  runs each image to the prompt, warms up for two million instructions, and requires both idle
+  loop heads (b5 `0x0807A7EC`, RC6 `0x08078400`) repeatedly inside a 4,000-instruction window.
+  [boot-trace.md](boot-trace.md) now has the measured loop: its body polls `USART1_CR1`
+  (toggling `RXNEIE`) and the RTC (`TR`, `DR`, `PRER`, `SSR`) every iteration; `TIM5_CNT`,
+  `GPIOH_IDR` and `GPIOD_IDR` are read once per ~1 kHz tick by the interrupt path, 37 (or 36)
+  times per 8 million instructions, not by the loop (measured in [boot-trace.md](boot-trace.md)
+  under "The idle loop at the prompt") - the earlier claim that they appear
+  only as an unconfirmed expectation was wrong. What the issue still lacks is only the speed
+  note - where it belongs is `docs/speed.md` - which exists in my local speed notes, not in the
+  repository).
 - Not in an issue: sound (the DAC) and a GDB option (the vendored core has a GDB server, but the
   front end does not start it).
 

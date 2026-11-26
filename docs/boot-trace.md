@@ -173,7 +173,8 @@ Maximite 2" was just the factory defaults before the options were saved, not a d
 hardware. The whole path, from power on to the prompt with the scripted answers, is about 600 million
 instructions: the first boot reaches the keyboard question at about 198 million, the date prompt at about 200
 million, the reset at about 201 million, and the second boot reaches the prompt at about 612 million. In a
-release build that is 20 to 30 seconds. After the prompt the firmware sits in an idle polling loop.
+release build that is 20 to 30 seconds. After the prompt the firmware sits in an idle polling loop
+(measured 2026-11-26, issue 25: see "The idle loop at the prompt" below).
 
 ## What happens before it
 
@@ -192,8 +193,10 @@ release build that is 20 to 30 seconds. After the prompt the firmware sits in an
 
 ## SysTick already works
 
-Every 29,000 instructions or so the poll is interrupted by a short burst that reads `GPIOH_IDR`
-and then `GPIOD_IDR`, 95 times each in the 3 million instructions. That is the SysTick handler:
+Every 29,000 instructions or so - an earlier observation; the 2026-11-26 measurement under "The
+idle loop at the prompt" puts the burst at about 214,000 - the poll is interrupted by a short
+burst that reads `GPIOH_IDR` and then `GPIOD_IDR`, 95 times each in the 3 million instructions.
+That is the SysTick handler:
 vector 15 in the table points at `0x2B9`, the handler starts at `0x2B8` in ITCM, it starts exactly 95
 times in the run (the first at instruction 242,500), and each start is followed by the two port
 reads, through a short chain that ends in flash at `0x0809F3A8`. The core delivers it with nothing
@@ -234,6 +237,13 @@ After those, the firmware reaches its idle loops near `0x0807A7EC` and `0x0809A3
 appeared on `USART1_TDR` at that point. The first flash erases are of `0x081E0000` (saved options)
 and `0x08120000` (the program area).
 
+> Confirmed in part on 2026-11-26 (issue 25, see "The idle loop at the prompt" below). The two
+> loop addresses are right for 7.00.00b5 and wrong for 7.00.00RC6, whose loop is elsewhere. The
+> `USART1_CR1.RXNEIE` toggle is real. `TIM5_CNT`, `GPIOH_IDR` and `GPIOD_IDR` are all read, but
+> not tens of millions of times and not by the loop body: each is read 37 times (36 on RC6) per
+> 8 million instructions, once per ~1 kHz tick, from the interrupt path the loop is interrupted
+> by.
+
 ## What this means for the next iteration (historical: written in iteration 1)
 
 This was the plan after the first run. The power controller, the reset and clock controller, the
@@ -248,7 +258,10 @@ above).
   USART1. USART1 is also where the console comes in.
 - The cache maintenance registers need to answer sensibly (size ID reads), and the SVD does not name them.
 - Polling reads of `GPIOH_IDR`, `GPIOD_IDR` and `TIM5_CNT` are going to dominate the idle
-  loops, so the cost of a peripheral read matters (see the speed ticket).
+  loops, so the cost of a peripheral read matters (see the speed ticket). (Corrected 2026-11-26:
+  what dominates the loop is `USART1_CR1` and the RTC reads; the three registers named here are
+  each read 37 times per 8 million instructions by the ~1 kHz tick path, not by the loop. See
+  "The idle loop at the prompt".)
 
 ## The LTDC line interrupt (issue 35)
 
@@ -346,6 +359,91 @@ The other depths, layer 2, blending and the frame timing from PLL3 (issue 58) ar
 colour keying, L8 without the colour table, AL44 and AL88, blending factors the firmware
 does not set, and a window wider than the line the layer fetches (`CFBLL`). `--screenshot <file>` on the emulator writes the frame as a PPM at the end of a
 run.
+
+## The idle loop at the prompt (issue 25, measured 2026-11-26)
+
+I measured both target images with the RNG seeded (`cmm2_memory_with_rng_seed`, seed 20,261,126),
+ran the scripted first-boot dialogue to the second boot's prompt, and then recorded the PC and
+every peripheral access instruction by instruction for 8 million instructions. No wall clock is
+involved and the runs repeat.
+
+**7.00.00b5.** The prompt is seen at instruction 611,000,000 (the harness checks the output in
+1-million-instruction slices, so the prompt itself lands up to a million before that). The
+firmware then runs about 477,000 instructions of post-prompt work - `0x080B9548` appears 12,239
+times with an average of 39 instructions between appearances, never to run again - and at
+instruction **611,477,320** the PC enters the idle loop chain at `0x0809A70A`, which reaches the head
+`0x0807A7EC` six instructions later. The loop turns 25,165 times in the 7,522,680 instructions
+after entry, about 299 instructions an iteration, and it passes through both heads `0x0807A7EC`
+and `0x0809A352` once per iteration. A clean iteration runs the block `0x0807A7EC`-`0x0807A818`
+and `0x0807A8A0`-`0x0807A8A2`, the get-character routine at `0x0809A894` (the one the first-boot
+dialogue used), the block `0x0809A338`-`0x0809A35C` that holds `0x0809A352`, the `USART1_CR1`
+accesses at `0x0809A8BA`-`0x0809A904`, and the RTC read helper at `0x08007DA0`-`0x08007E30`, and
+returns through `0x0809A49C` and `0x0809A70A`. After entry the PC leaves the loop body 56 times,
+never for more than 472 consecutive instructions and always back to the same chain: the SysTick
+path (top at `0x0808B80A`, through the chain described under "SysTick already works") every
+about 214,000 instructions (35 times), one handler at `0x0800D640` (some 470 instructions, once
+reading `GPIOD_IDR` at `0x0809EE9E`) every about 428,000 (18 times), two frame interrupts that
+enter at the LTDC vector stub at `0xF34`, and one 47-instruction departure through the ITCM stub
+at `0xF78` that I did not identify.
+
+**7.00.00RC6.** The same structure at different addresses. The prompt is seen at 594,000,000;
+the post-prompt pass is a 3-instruction inner loop at `0x08098A4C` (48,475 appearances, every
+gap but one exactly 3 instructions, the last at instruction 594,145,496) and a loop at
+`0x080B7CAC` (12,672 appearances, mostly 32 instructions apart); the PC enters the idle
+loop at instruction **594,643,348** at `0x08098C46`; the heads `0x08078400` and `0x08098870` run
+24,525 times each, about 300 instructions an iteration; the handlers are at `0x0808959A` (about
+every 214,000 instructions, 34 times), `0x0800C290` (every about 428,000, 18 times, once reading
+`GPIOD_IDR` at `0x0809D55E`), the same LTDC stub, and one 47-instruction departure through
+`0xF70` (measured, as with b5's `0xF78`). Neither of the two addresses the issue names,
+`0x0807A7EC` and `0x0809A352`, occurs in one instruction of the 8 million on RC6: the loop's
+exact addresses belong to the image.
+
+**What the loop polls** (counts in the 8-million-instruction window, b5 / RC6):
+
+| Access | b5 | RC6 | Rate |
+|---|---|---|---|
+| `USART1_CR1` reads | 50,330 | 49,050 | 2 an iteration |
+| `USART1_CR1` writes | 50,330 | 49,050 | 2 an iteration |
+| `RTC_TR` reads | 25,164 | 24,525 | 1 an iteration |
+| `RTC_DR` reads | 25,164 | 24,525 | 1 an iteration |
+| `RTC_SSR` reads | 25,164 | 24,525 | 1 an iteration |
+| `RTC_PRER` reads | 25,164 | 24,525 | 1 an iteration |
+| `RTC_ISR` reads | 0 | 0 | not touched in the window |
+| `GPIOH_IDR` reads | 37 | 36 | 1 each ~1 kHz tick, not by the loop |
+| `GPIOD_IDR` reads | 55 | 54 | 1 each tick, plus the 18 above |
+| `TIM5_CNT` reads | 37 | 36 | 1 each tick, not by the loop |
+| `TIM5_DIER` reads | 0 | 0 | not touched in the window |
+
+The PCs behind the counts: b5 reads `USART1_CR1` at `0x0809A8BE` and `0x0809A8EE` and writes it
+at `0x0809A8C6` (value `0x2000000D`, `RXNEIE` clear) and `0x0809A8F4` (value `0x2000002D`,
+`RXNEIE` set); RC6 at `0x08098E02`/`0x08098E32` and `0x08098E0A`/`0x08098E38`. The RTC reads
+come from the helper at `0x08007DA0`-`0x08007E30` (b5): `RTC_SSR` at `0x08007DB6`, `RTC_PRER` at
+`0x08007DBA`, `RTC_TR` at `0x08007DBC`, `RTC_DR` at `0x08007DFC`; on RC6 `0x08006A02`,
+`0x08006A06`, `0x08006A08`, `0x08006A48`. The `GPIOH_IDR`, `GPIOD_IDR` and `TIM5_CNT` reads come
+from `0x0809F3C2`, `0x0809F3CA` and `0x0803DAD0` (b5) and `0x0809DA5E`, `0x0809DA66` and
+`0x0803C67C` (RC6), and the extra 18 `GPIOD_IDR` reads from `0x0809EE9E` (b5) and `0x0809D55E`
+(RC6). The `TIM5_CNT` reads sit inside the same excursions as the `GPIOH_IDR` reads: every
+occurrence of `0x0803DAD0` (35 after entry, b5) lies in an excursion that also reads
+`0x0809F3C2`, a 427-430-instruction path; on RC6 the same holds for 34 excursions of 441-444.
+The register counts cover the whole 8-million window while the excursion counts start at the
+loop entry about 477,000 (b5) / 643,000 (RC6) instructions in, which is why the tick shows 37
+reads but 35 post-entry excursions.
+
+So the loop body polls only the serial control register (the `RXNEIE` toggle of the expectation)
+and the RTC: in a clean iteration no GPIO-reading and no timer-reading PC appears. All three
+registers iteration 1 named - `TIM5_CNT`, `GPIOH_IDR` and `GPIOD_IDR` - are read, but once per
+~1 kHz tick from the interrupt path, 37 times (36 on RC6) in 8 million instructions, not "tens
+of millions of times", and not by the loop: the b5 `TIM5_CNT` read at `0x0803DAD0` and the
+`GPIOH_IDR`/`GPIOD_IDR` reads at `0x0809F3C2`/`0x0809F3CA` sit in the same tick excursions, and
+the other 18 `GPIOD_IDR` reads come from the handler at `0x0800D640` (`0x0800C290` on RC6). The
+b5 `USART1_CR1` writes toggle `RXNEIE` (bit 5) in and out each iteration, as the expectation
+said.
+
+`real_firmware_settles_in_the_idle_loop` in `crates/cmm2-core/tests/boot.rs` boots each image to
+the prompt, warms up a fixed 2,000,000 instructions - about 1.5 million past the measured entry -
+and then steps a 4,000-instruction window in which each of that image's two loop heads must
+appear at least 10 times. A machine settled in the loop scores 13 or 14 per head; one that never
+settles scores 0.
 
 ## Where it blocks now
 
