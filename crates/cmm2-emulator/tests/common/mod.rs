@@ -229,6 +229,31 @@ pub fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+// The two counts of raw bytes that say whether a line is clean: the `ESC` bytes and the line
+// feeds in it. A name escaped for display holds neither, so a message about a hostile name has
+// the same counts as one about a plain name. They count bytes, not what a reader may see: text
+// like `\n` as two characters counts nothing.
+pub fn control_counts(bytes: &[u8]) -> (usize, usize) {
+    (
+        bytes.iter().filter(|byte| **byte == 0x1B).count(),
+        bytes.iter().filter(|byte| **byte == b'\n').count(),
+    )
+}
+
+// A refusal as the real binary must say it: this exit status, this one line, and standard error
+// holding no `ESC` byte and exactly one line feed. The whole of standard error is compared, so a
+// second line of any kind, before or after, fails it too.
+pub fn assert_refusal(output: &Output, code: i32, line: &str) {
+    let (escapes, feeds) = control_counts(&output.stderr);
+    let said = stderr(output);
+    assert_eq!(
+        (output.status.code(), escapes, feeds),
+        (Some(code), 0, 1),
+        "exit {code}, no escape byte, one line feed: {said}"
+    );
+    assert_eq!(said, format!("cmm2-emulator: {line}\n"));
+}
+
 // Writes 0x5A to every byte of block 1 of the SD card, which it drives through the GPIO pins
 // the way the firmware does (CMD0, CMD55, ACMD41 and CMD24 over port C and port D), then prints
 // "done\n" on USART1 and ends as `end`. It was assembled with GNU as for a Cortex-M7 (the
