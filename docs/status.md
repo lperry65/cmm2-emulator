@@ -224,22 +224,23 @@ The open issues at 208c7fb, from `gh issue list --state open --limit 100`:
 - Firmware and end-to-end: 82 (support for firmware versions: 7.00.00b5 and 7.00.00RC6 have
   settings layouts, 8.00.00b2 and any other release do not), 57 (firmware 5.07, the version the
   Gen 2 shipped with), 49 (run Galactic Raiders as an end-to-end test: a run goes on for minutes
-  with no fault, but the hash test is not done), 25 (boot to the MMBasic idle loop: the test is
-  in since 2026-11-26. `real_firmware_settles_in_the_idle_loop` in `crates/cmm2-core/tests/boot.rs`
-  runs each image to the prompt, warms up for two million instructions, and requires both idle
-  loop heads (b5 `0x0807A7EC`, RC6 `0x08078400`) repeatedly inside a 4,000-instruction window.
-  [boot-trace.md](boot-trace.md) now has the measured loop: its body polls `USART1_CR1`
-  (toggling `RXNEIE`) and the RTC (`TR`, `DR`, `PRER`, `SSR`) every iteration; `TIM5_CNT`,
-  `GPIOH_IDR` and `GPIOD_IDR` are read once per ~1 kHz tick by the interrupt path, 37 (or 36)
-  times per 8 million instructions, not by the loop (measured in [boot-trace.md](boot-trace.md)
-  under "The idle loop at the prompt") - the earlier claim that they appear
-  only as an unconfirmed expectation was wrong. Its third point, a note on how much faster
-  peripheral reads need to be, is in [speed.md](speed.md): section 4.7 measures the peripheral
-  models below 0.5 percent of host time in every profile and finds that batching peripheral time
-  would not help yet, and section 5 puts the cost where it is, in the memory path - the cycle
-  model is 6 to 8 times wrong for anything that touches SDRAM, issue 65).
+  with no fault, but the hash test is not done).
 - Not in an issue: sound (the DAC) and a GDB option (the vendored core has a GDB server, but the
   front end does not start it).
+
+Issue 25 (boot to the MMBasic idle loop) closed on 2026-11-26, and measuring it corrected this
+document and [boot-trace.md](boot-trace.md). The test is `real_firmware_settles_in_the_idle_loop`
+in `crates/cmm2-core/tests/boot.rs`: it boots each image to the prompt, warms up two million
+instructions, and requires each of that image's two loop heads at least 10 times in a
+4,000-instruction window. The loop is per-image - b5 enters at instruction 611,477,320 at
+`0x0807A7EC` and `0x0809A352`, RC6 at 594,643,348 at `0x08078400` and `0x08098870`, and neither
+image's heads occur in the other. Its body polls `USART1_CR1` (toggling `RXNEIE`) and the RTC once
+per iteration; `TIM5_CNT`, `GPIOH_IDR` and `GPIOD_IDR` are read once per ~1 kHz tick by the
+interrupt path, 37 (or 36) times per 8 million instructions, **not** by the loop, which is what the
+issue and both documents had said. The tables are in [boot-trace.md](boot-trace.md) under "The idle
+loop at the prompt". Its third point - how much faster peripheral reads need to be - is answered in
+[speed.md](speed.md) section 4.7: the peripheral models are below 0.5 percent of host time in every
+profile, so the cost to chase is the memory path, issue 65.
 
 ## Target
 
